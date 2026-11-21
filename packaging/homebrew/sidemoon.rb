@@ -3,7 +3,8 @@ cask "sidemoon" do
   version "1.0.0"
   sha256 "1f283ee73df7a75253cd98d3f3ec6ed4a1c8bde2cdab9236e596db64e6747e73"
 
-  url "https://www.sidemoon.app/downloads/Sidemoon-#{version}.dmg"
+  url "https://github.com/EdonZo/sidemoon/releases/download/v#{version}/Sidemoon-#{version}.dmg",
+      verified: "github.com/EdonZo/sidemoon/"
   name "Sidemoon"
   desc "Floating companion that sends what is on your screen to a Claude Code session"
   homepage "https://www.sidemoon.app/"

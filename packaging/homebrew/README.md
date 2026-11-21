@@ -1,6 +1,6 @@
 # Homebrew cask
 
-`sidemoon.rb` is the cask for the notarized Sidemoon DMG served from sidemoon.app. It is not published
+`sidemoon.rb` is the cask for the notarized Sidemoon DMG attached to each GitHub release. It is not published
 in a tap yet, so `brew install sidemoon` does not work today.
 
 ## For each release
