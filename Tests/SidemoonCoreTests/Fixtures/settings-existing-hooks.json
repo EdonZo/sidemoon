@@ -1,0 +1,14 @@
+{
+  "model": "opus",
+  "permissions": {"allow": ["Bash(git status)"], "deny": []},
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "afplay /System/Library/Sounds/Glass.aiff"}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh", "timeout": 30}]}
+    ]
+  },
+  "cleanupPeriodDays": 1.50,
+  "statusLine": {"type": "command", "command": "echo \"hi\" é"}
+}

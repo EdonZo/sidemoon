@@ -1,0 +1,521 @@
+import CoreGraphics
+import Foundation
+
+/// The visual system: warm paper-and-ink neutrals, one accent ("signal") that only ever means
+/// live or needs-you, two typographic voices (content, and a small uppercase mono readout),
+/// hairlines instead of boxes, fast small motion.
+public enum Design {
+
+    /// The user's size setting. Every size token below is multiplied by it, so text and layout grow
+    /// together and stay sharp. Only written on the main thread, by the companion model.
+    nonisolated(unsafe) public static var zoom: CGFloat = 1
+
+    public enum Zoom {
+        public static let minimum: Double = 0.8
+        public static let maximum: Double = 1.6
+        public static let step: Double = 0.1
+        public static let standard: Double = 1
+    }
+
+    /// An sRGB colour with alpha, written as 0xRRGGBBAA.
+    public struct Hex: Sendable, Equatable {
+        public let value: UInt32
+        public init(_ value: UInt32) { self.value = value }
+        public var red: Double { Double((value >> 24) & 0xFF) / 255 }
+        public var green: Double { Double((value >> 16) & 0xFF) / 255 }
+        public var blue: Double { Double((value >> 8) & 0xFF) / 255 }
+        public var alpha: Double { Double(value & 0xFF) / 255 }
+    }
+
+    /// A colour that adapts to appearance. `contrast` values apply when Increase Contrast is on.
+    public struct Tone: Sendable, Equatable {
+        public let light: Hex, dark: Hex
+        public let lightContrast: Hex?, darkContrast: Hex?
+        public init(light: UInt32, dark: UInt32, lightContrast: UInt32? = nil, darkContrast: UInt32? = nil) {
+            self.light = Hex(light)
+            self.dark = Hex(dark)
+            self.lightContrast = lightContrast.map(Hex.init)
+            self.darkContrast = darkContrast.map(Hex.init)
+        }
+    }
+
+    /// The look. Paper is always light and Terminal always dark; Mono follows the system's appearance.
+    public enum Theme: String, CaseIterable, Sendable {
+        case paper, terminal, mono
+
+        public var title: String {
+            switch self {
+            case .paper: return "Paper"
+            case .terminal: return "Terminal"
+            case .mono: return "Mono"
+            }
+        }
+        /// Terminal sets all its text in a monospaced face.
+        public var isMonospaced: Bool { self == .terminal }
+        public var isAlwaysDark: Bool { self == .terminal }
+        /// Paper is a white page whatever the system setting.
+        public var isAlwaysLight: Bool { self == .paper }
+    }
+
+    /// The user's theme. Only written on the main thread, by the companion model.
+    nonisolated(unsafe) public static var theme: Theme = .paper
+    /// The user's window size choice. Only written on the main thread, by the companion model.
+    nonisolated(unsafe) public static var isLarge = false
+    /// A window size the user dragged out, replacing the regular and large sizes. Only written on the main
+    /// thread, by the companion model.
+    nonisolated(unsafe) public static var customBubbleSize: CGSize?
+
+    public enum Colors {
+        private static func pick(_ paper: Tone, _ terminal: Tone, _ mono: Tone) -> Tone {
+            switch Design.theme {
+            case .paper: return paper
+            case .terminal: return terminal
+            case .mono: return mono
+            }
+        }
+        /// One value for both appearances.
+        private static func fixed(_ value: UInt32) -> Tone { Tone(light: value, dark: value) }
+
+        /// Bubble base.
+        public static var paper: Tone { pick(Tone(light: 0xFFFFFFFF, dark: 0x1F1A17FF), fixed(0x1F2128FF), Tone(light: 0xFFFFFFFF, dark: 0x000000FF)) }
+        /// Code blocks and inline code.
+        public static var paper2: Tone {
+            pick(Tone(light: 0x6B4A2A14, dark: 0xF4ECDF12, lightContrast: 0x6B4A2A26, darkContrast: 0xF4ECDF29),
+                 fixed(0xFFFFFF12), Tone(light: 0x0000000F, dark: 0xFFFFFF1F))
+        }
+        public static var ink: Tone { pick(Tone(light: 0x2A211CFF, dark: 0xF4ECDFFF), fixed(0xE4E6EBFF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF)) }
+        /// Secondary text.
+        public static var mute: Tone {
+            pick(Tone(light: 0x7A6C5FFF, dark: 0xA39788FF, lightContrast: 0x54483DFF, darkContrast: 0xC9BDAEFF),
+                 fixed(0x8E94A6FF), Tone(light: 0x5A5A5AFF, dark: 0xA6A6A6FF))
+        }
+        /// Hairlines.
+        public static var line: Tone {
+            pick(Tone(light: 0x2A211C1A, dark: 0xF4ECDF1F, lightContrast: 0x2A211C4D, darkContrast: 0xF4ECDF4D),
+                 fixed(0xFFFFFF21), Tone(light: 0x00000033, dark: 0xFFFFFF40))
+        }
+        /// Bubble fill laid over the blur.
+        public static var surface: Tone {
+            pick(Tone(light: 0xFFFFFFF5, dark: 0x1F1A17EB, lightContrast: 0xFFFFFFFF, darkContrast: 0x1F1A17FF),
+                 fixed(0x1F2128F5), Tone(light: 0xFFFFFFF7, dark: 0x000000F7))
+        }
+        /// The one accent: live, new reply, countdown. Mono has none; it uses ink.
+        public static var signal: Tone {
+            pick(Tone(light: 0xC2305AFF, dark: 0xFF7D9CFF, lightContrast: 0x9E1F45FF, darkContrast: 0xFFA3B8FF),
+                 fixed(0xA9B1F7FF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF))
+        }
+        /// Selection and focus wash.
+        public static var signalSoft: Tone { pick(Tone(light: 0xC2305A29, dark: 0xFF7D9C33), fixed(0xA9B1F733), Tone(light: 0x00000026, dark: 0xFFFFFF33)) }
+        /// The card behind what the user sent. Paper tints it with the accent; the others keep it quiet.
+        public static var sent: Tone { pick(Tone(light: 0xC2305A21, dark: 0xFF7D9C1F), fixed(0xFFFFFF12), Tone(light: 0x0000000F, dark: 0xFFFFFF1F)) }
+        public static var error: Tone { pick(Tone(light: 0xD92D20FF, dark: 0xFF6B5EFF), fixed(0xFF7A70FF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF)) }
+        /// Inner top highlight on the bubble.
+        public static var highlight: Tone { pick(Tone(light: 0xFFFFFF66, dark: 0xFFFFFF14), fixed(0xFFFFFF14), Tone(light: 0xFFFFFF00, dark: 0xFFFFFF00)) }
+
+        /// The lens: translucent over the blurred desktop behind it.
+        public static var mascotBody: Tone {
+            // Paper: the plum night of the app icon, so the mark stands out on a white page and on any desktop.
+            pick(Tone(light: 0x3A2150F2, dark: 0x3A2150F2, lightContrast: 0x2B1B3DFF, darkContrast: 0x2B1B3DFF),
+                 fixed(0x1F2128D9), Tone(light: 0xFFFFFFEB, dark: 0x000000EB))
+        }
+        public static var mascotEdge: Tone { pick(fixed(0xFF7D9C66), fixed(0xFFFFFF33), Tone(light: 0x00000059, dark: 0xFFFFFF66)) }
+        /// The orbit, the centre point and the resting dot.
+        public static var mascotMark: Tone { pick(fixed(0xFBEFEAFF), fixed(0xE4E6EBFF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF)) }
+        /// The orbit, the moon and the glow: the icon's pink on Paper, the theme's own accent elsewhere.
+        public static var mascotAccent: Tone { pick(fixed(0xFF7D9CFF), fixed(0xA9B1F7FF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF)) }
+        /// The bar shown on a problem, light enough to read on the plum.
+        public static var mascotProblem: Tone { pick(fixed(0xFF9A8AFF), fixed(0xFF7A70FF), Tone(light: 0x000000FF, dark: 0xFFFFFFFF)) }
+        public static var mascotShadow: Tone { Tone(light: 0x0D0D0D21, dark: 0x00000073) }
+    }
+
+    public enum TypeScale {
+        public static var label: CGFloat { 10.5 * Design.zoom }
+        public static var labelTracking: CGFloat { 0.5 * Design.zoom }
+        public static var body: CGFloat { 14 * Design.zoom }
+        public static var bodyLineSpacing: CGFloat { 4 * Design.zoom }
+        public static var small: CGFloat { 12 * Design.zoom }
+        public static var h1: CGFloat { 17 * Design.zoom }
+        public static var h2: CGFloat { 15 * Design.zoom }
+        public static var code: CGFloat { 12 * Design.zoom }
+        public static var codeLineSpacing: CGFloat { 3 * Design.zoom }
+        public static var inlineCode: CGFloat { 12.5 * Design.zoom }
+        public static var table: CGFloat { 12.5 * Design.zoom }
+        public static var keycap: CGFloat { 11 * Design.zoom }
+        public static var headingTracking: CGFloat { -0.2 * Design.zoom }
+    }
+
+    public enum Space {
+        public static var xxs: CGFloat { 2 * Design.zoom }
+        public static var xs: CGFloat { 4 * Design.zoom }
+        public static var s: CGFloat { 6 * Design.zoom }
+        public static var m: CGFloat { 8 * Design.zoom }
+        public static var l: CGFloat { 12 * Design.zoom }
+        public static var xl: CGFloat { 16 * Design.zoom }
+        public static var xxl: CGFloat { 24 * Design.zoom }
+        public static var bubbleHorizontal: CGFloat { 14 * Design.zoom }
+        public static var bubbleVertical: CGFloat { 12 * Design.zoom }
+    }
+
+    public enum Radius {
+        public static var inlineCode: CGFloat { 4 * Design.zoom }
+        public static var control: CGFloat { 6 * Design.zoom }
+        public static var card: CGFloat { 10 * Design.zoom }
+        public static var panel: CGFloat { 14 * Design.zoom }
+    }
+
+    public enum Motion {
+        public static let quick: TimeInterval = 0.12
+        public static let fast: TimeInterval = 0.20
+        public static let base: TimeInterval = 0.32
+        public static let slow: TimeInterval = 0.48
+        /// Control points of the ease-out curve.
+        public static let easeOut: (Double, Double, Double, Double) = (0.16, 1, 0.3, 1)
+        public static let pressScale: CGFloat = 0.97
+        public static let press: TimeInterval = 0.11
+        /// One left-right drift of the pupil while waiting.
+        public static let waitingDrift: TimeInterval = 1.6
+        public static let reducedMotionFade: TimeInterval = 0.15
+        /// One pass of the working dots.
+        public static let workingCycle: TimeInterval = 1.2
+    }
+
+    /// Bubble structure.
+    public enum Bubble {
+        public static var width: CGFloat { Design.customBubbleSize?.width ?? (Design.isLarge ? 640 : 400) * Design.zoom }
+        /// The smallest and largest window a drag can make.
+        public static let customMinimum = CGSize(width: 300, height: 220)
+        public static let customMaximum = CGSize(width: 1800, height: 1600)
+        /// The corner grip that resizes the window.
+        public static var gripSize: CGFloat { 16 * Design.zoom }
+        /// The outline of the composer while it has the keyboard.
+        public static var focusRing: CGFloat { 1.5 * Design.zoom }
+        public static var minHeight: CGFloat { 150 * Design.zoom }
+        public static var maxHeight: CGFloat { (Design.isLarge ? 900 : 560) * Design.zoom }
+        /// The bubble never takes more than this share of the visible screen height.
+        public static var maxScreenFraction: CGFloat { Design.isLarge ? 0.85 : 0.6 }
+        public static var headerHeight: CGFloat { 32 * Design.zoom }
+        public static var pillHeight: CGFloat { 22 * Design.zoom }
+        public static var iconSize: CGFloat { 13 * Design.zoom }
+        public static var hairline: CGFloat { 1 * Design.zoom }
+        public static var countdownBarHeight: CGFloat { 2 * Design.zoom }
+        public static var keycapHeight: CGFloat { 22 * Design.zoom }
+        public static var buttonHeight: CGFloat { 28 * Design.zoom }
+        public static var errorDot: CGFloat { 6 * Design.zoom }
+        /// Space between entries of the thread.
+        public static var entrySpacing: CGFloat { 16 * Design.zoom }
+        public static var entryPadding: CGFloat { 10 * Design.zoom }
+        public static var chipIcon: CGFloat { 10 * Design.zoom }
+        public static var chipMaxWidth: CGFloat { 180 * Design.zoom }
+        public static var sendButton: CGFloat { 24 * Design.zoom }
+        public static var dropOutline: CGFloat { 2 * Design.zoom }
+        /// Width of the label column in the settings.
+        public static var settingsLabel: CGFloat { 76 * Design.zoom }
+        /// The three dots shown while the session works on its answer.
+        public static let workingDots = 3
+        public static var workingDot: CGFloat { 4 * Design.zoom }
+        public static var workingDotGap: CGFloat { 3 * Design.zoom }
+        public static let workingDotMinOpacity: Double = 0.25
+    }
+
+    /// The setup window.
+    public enum Setup {
+        public static var width: CGFloat { 560 * Design.zoom }
+        /// The window never takes more than this share of the visible screen height; the rest scrolls.
+        public static let maxScreenFraction: CGFloat = 0.9
+        public static var padding: CGFloat { 28 * Design.zoom }
+        /// Space between steps.
+        public static var stepSpacing: CGFloat { 22 * Design.zoom }
+        /// The column holding each step's number and status mark.
+        public static var markColumn: CGFloat { 26 * Design.zoom }
+        public static var mark: CGFloat { 20 * Design.zoom }
+        public static var markStroke: CGFloat { 1.25 * Design.zoom }
+        public static var markIcon: CGFloat { 9 * Design.zoom }
+        public static var title: CGFloat { 22 * Design.zoom }
+    }
+
+    /// Rendered Markdown.
+    public enum Prose {
+        public static var paragraphSpacing: CGFloat { 8 * Design.zoom }
+        public static var h1Before: CGFloat { 14 * Design.zoom }
+        public static var h1After: CGFloat { 6 * Design.zoom }
+        public static var h2Before: CGFloat { 12 * Design.zoom }
+        public static var h2After: CGFloat { 4 * Design.zoom }
+        public static var listItemSpacing: CGFloat { 4 * Design.zoom }
+        public static var listIndent: CGFloat { 16 * Design.zoom }
+        public static var bulletSize: CGFloat { 4 * Design.zoom }
+        public static var numberColumn: CGFloat { 18 * Design.zoom }
+        public static var numberGap: CGFloat { 6 * Design.zoom }
+        public static var codePaddingVertical: CGFloat { 10 * Design.zoom }
+        public static var codePaddingHorizontal: CGFloat { 12 * Design.zoom }
+        public static var quoteBar: CGFloat { 2 * Design.zoom }
+        public static var quoteIndent: CGFloat { 12 * Design.zoom }
+        public static var tableCellVertical: CGFloat { 6 * Design.zoom }
+        /// A table column is as wide as its longest cell, up to this; longer cells wrap.
+        public static var tableColumnMax: CGFloat { 200 * Design.zoom }
+        public static var tableColumnMin: CGFloat { 28 * Design.zoom }
+        /// The narrowest a column is squeezed to when the table has to fit the bubble.
+        public static var tableColumnWrapMin: CGFloat { 72 * Design.zoom }
+        /// Space between columns.
+        public static var tableColumnGap: CGFloat { 14 * Design.zoom }
+        /// Added to a measured column so its text never wraps by a hair.
+        public static var tableColumnSlack: CGFloat { 4 * Design.zoom }
+        public static var tableCellHorizontal: CGFloat { 10 * Design.zoom }
+        public static var ruleSpacing: CGFloat { 12 * Design.zoom }
+        public static var linkUnderlineOffset: CGFloat { 3 * Design.zoom }
+    }
+
+    /// The mascot: a glass lens holding a fine-line mark. A solid centre point is the user; a small dot
+    /// on a hairline orbit is the companion that tags along. Drawn on a 64-unit grid, origin top-left, y down.
+    public enum Mascot {
+        public static let grid: CGFloat = 64
+        /// Drawn size inside the mascot panel, leaving room for the shadow.
+        public static var drawnSize: CGFloat { 54 * Design.zoom }
+        public static let center = CGPoint(x: 32, y: 32)
+        /// The glass disc everything sits in.
+        public static let discRadius: CGFloat = 26
+        public static let edgeStroke: CGFloat = 1
+        /// The orbit: a hairline circle, in points so it stays fine at any size.
+        public static let orbitRadius: CGFloat = 14
+        public static let orbitStroke: CGFloat = 1
+        public static let orbitStrokeActive: CGFloat = 1.75
+        public static let orbitStrokeResting: CGFloat = 1.5
+        public static let orbitTrackOpacity: Double = 0.18
+        /// The centre point: the user and their work.
+        public static let coreRadius: CGFloat = 4.5
+        public static let coreRadiusCapturing: CGFloat = 2.5
+        /// The centre becomes a short bar when something went wrong.
+        public static let coreProblem = CGSize(width: 10, height: 2.5)
+        /// The companion: a small dot on the orbit.
+        public static let satelliteRadius: CGFloat = 2.75
+        public static let satelliteRadiusReply: CGFloat = 3.5
+        /// Where the satellite rests, in degrees clockwise from three o'clock.
+        public static let restAngle: Double = -45
+        /// Seconds per orbit while sending and while waiting for the answer.
+        public static let sendingPeriod: TimeInterval = 0.9
+        public static let waitingPeriod: TimeInterval = 1.8
+        /// The orbit swells once when a reply lands.
+        public static let replyPulseScale: CGFloat = 1.14
+        /// Viewfinder brackets while capturing: dash and gap as fractions of a quarter circumference.
+        public static let bracketDash: CGFloat = 0.6
+        public static let bracketGap: CGFloat = 0.4
+        public static let shadowRadius: CGFloat = 5
+        public static let shadowOffsetY: CGFloat = 1.6
+        public static let reducedMotionWaitingOpacity: Double = 0.5
+        /// Under the pointer the lens lifts a little, lights its edge, and the dot takes one lap while a shine crosses.
+        public static let hoverScale: CGFloat = 1.07
+        /// The badge that counts sessions with something waiting for the user.
+        public static var badgeSize: CGFloat { 17 * Design.zoom }
+        public static var badgeText: CGFloat { 10 * Design.zoom }
+        public static let badgeRing: CGFloat = 1.5
+        public static let badgePulseScale: CGFloat = 1.14
+        public static let badgePulseDuration: TimeInterval = 0.9
+        /// Counts above this show as this number and a plus.
+        public static let badgeMaxCount = 9
+        public static let hoverLapDuration: TimeInterval = 0.85
+        public static let hoverGlowRadius: CGFloat = 6
+        public static let hoverGlowOpacity: Double = 0.55
+        public static let shineDuration: TimeInterval = 0.75
+        /// The shine band: its width as a fraction of the disc, its peak opacity and its tilt in degrees.
+        public static let shineWidth: CGFloat = 0.42
+        public static let shineOpacity: Double = 0.6
+        public static let shineTilt: Double = 24
+        /// A wash of the accent inside the lens, so the mark is never plain black on white.
+        public static let tintOpacity: Double = 0.3
+    }
+
+    public enum Copy {
+        public static func openFile(_ path: String) -> String { "Open \(path)" }
+        public static func showInFinder(_ path: String) -> String { "Show \(path) in Finder" }
+        public static let showInFinderTitle = "Show in Finder"
+        public static func earlierMessages(_ count: Int) -> String {
+            count == 1 ? "Show 1 earlier message" : "Show earlier messages (\(count))"
+        }
+        public static let retry = "Retry"
+        public static let resizeHelp = "Drag to resize. Double-click to go back to the automatic size."
+        public static let windowCustom = "Custom"
+        public static let retryHelp = "Send this message again"
+        public static let menuSettings = "Settings…"
+        public static let menuEdit = "Edit"
+        /// Edit menu titles with the key each answers to.
+        public static let menuEditItems: [(String, String)] = [("Undo", "z"), ("Cut", "x"), ("Copy", "c"), ("Paste", "v"), ("Select All", "a")]
+        public static let menuRedo = "Redo"
+        public static func waitingBadge(_ count: Int) -> String { count == 1 ? "1 session is waiting for you" : "\(count) sessions are waiting for you" }
+        public static let notConnectedTitle = "Not connected to Claude Code yet"
+        public static let setupPendingTitle = "Setup is not finished"
+        public static let setupPendingAdvice = "Screen capture is not allowed yet, so screenshots cannot be sent. Open Setup to finish."
+        public static let notConnectedAdvice = "You can send to a session, but its answers will not come back here until you connect."
+        public static let menuRetryEngine = "Retry Engine"
+        public static var menuQuit: String { "Quit \(CompanionConstants.App.name)" }
+        public static func menuHotKeyTaken(_ key: String) -> String { "\(key) is taken by another app" }
+        public static let stateReady = "Ready"
+        public static let stateCapturing = "Capturing"
+        public static let stateNote = "Add a note"
+        public static let stateSending = "Sending"
+        public static let stateWaiting = "Waiting"
+        public static let stateNewReply = "New reply"
+        public static let stateProblem = "Problem"
+        public static let noSession = "Choose session"
+        public static let empty = "Nothing yet."
+        public static let emptyNoSession = "Choose the session that should see your screen."
+        public static func emptyHint(session: String) -> String { "show \(session) what you see." }
+        public static let notePlaceholder = "Add a note, or let it send"
+        public static let askPlaceholder = "Ask or reply"
+        public static let regionNotePlaceholder = "Add a note, then Return to pick the region"
+        public static let you = "You"
+        public static let sending = "Sending"
+        public static let working = "Working"
+        public static let queued = "Waiting its turn"
+        public static let cancel = "Cancel"
+        public static let remove = "Take it back"
+        public static let sendTo = "Send to"
+        public static let noSessions = "No sessions yet. Start Claude Code and it will show up here."
+        public static let needsChannel = "Open with sidemoon-claude"
+        public static let needsYou = "Needs you"
+        public static let ended = "Ended"
+        public static let showEnded = "Show ended"
+        public static let startup = "Startup"
+        public static let history = "History"
+        public static let clearHistory = "Clear conversations"
+        public static let clearHistoryHelp = "Remove the saved conversations from this Mac. The sessions themselves are not touched."
+        public static var interruptedByRestart: String { "\(CompanionConstants.App.name) was restarted before this went out" }
+        public static let openAtLogin = "Open at login"
+        public static let openAtLoginHelp = "Start \(CompanionConstants.App.name) when you log in to your Mac"
+        public static var openAtLoginChoice: String { "Open \(CompanionConstants.App.name) when I log in" }
+        public static let hideEnded = "Hide ended"
+        public static let shortReplies = "Short replies"
+        public static let shortRepliesHelp = "Ask the session to answer each message briefly, like in conversation"
+        public static let size = "Size"
+        public static let settings = "Settings"
+        public static let theme = "Theme"
+        public static let window = "Window"
+        public static let windowRegular = "Regular"
+        public static let windowLarge = "Large"
+        public static let replies = "Replies"
+        public static let sessions = "Sessions"
+        public static let shortcuts = "Shortcuts"
+        public static let done = "Done"
+        public static let settingsHelp = "Settings: theme, size, window"
+        public static let enlargeHelp = "Larger window"
+        public static let shrinkHelp = "Smaller window"
+        public static let minimizeHelp = "Minimize to the mascot"
+        public static let smaller = "Smaller"
+        public static let larger = "Larger"
+        public static let actualSize = "Actual size"
+        public static let notDelivered = "Not delivered"
+        public static let sendHelp = "Send (Return)"
+        public static let dropHere = "Drop to send"
+        public static func sendsIn(_ seconds: Int) -> String { "Sends in \(seconds)" }
+        public static let returnSends = "Return sends · Esc cancels"
+        public static let copy = "Copy"
+        public static let copied = "Copied"
+        public static let dismiss = "Dismiss"
+        public static let copyHelp = "Copy the reply"
+        public static let captureHelp = "Capture a region and send"
+        public static let sessionHelp = "Choose which session gets your captures"
+        public static let keycaps = ["⌃", "⌥", "A"]
+        public static let shortcutActiveWindow = "Send the active window"
+        public static let shortcutRegion = "Send a region"
+        public static let shortcutRegionNote = "Send a region with a note"
+        public static let setup = "Setup"
+        public static let openSetup = "Open setup"
+        public static let setupMenuItem = "Setup…"
+        public static let updates = "Updates"
+        public static let checkAutomatically = "Check automatically"
+        public static var checkAutomaticallyHelp: String { "Let \(CompanionConstants.App.name) look for a new version every day" }
+        public static let checkNow = "Check now"
+        public static let menuCheckForUpdates = "Check for Updates…"
+        public static let app = "App"
+        public static let quitHelp = "Close the companion. Your conversations are saved first."
+        public static let menuNoSessions = "No live sessions. Start Claude Code, or open Setup to connect it."
+
+        /// The setup window. Plain sentences that say what each button changes.
+        public enum Setup {
+            public static let windowTitle = "Set up Sidemoon"
+            public static let heading = "Set up Sidemoon"
+            public static let intro = "Sidemoon sends what is on your screen to Claude Code and shows the answer beside your work. "
+                + "These steps get it ready. Each one says what it changes on your Mac."
+            public static let optional = "Optional"
+            public static let stateChecking = "Checking"
+            public static let stateDone = "Done"
+            public static let stateNotDone = "Not yet"
+            public static let stateProblem = "Needs attention"
+
+            public static let claudeTitle = "Claude Code"
+            public static let claudeChecking = "Looking for Claude Code…"
+            public static func claudeFound(_ path: String) -> String { "Found at \(path)." }
+            public static let claudeMissing = "Claude Code is not installed, or Sidemoon cannot find it. Install it, then come back "
+                + "here. The other steps work without it."
+            public static func claudeOutsideReach(_ path: String, places: [String]) -> String {
+                "Found at \(path), but Sidemoon only starts Claude Code from \(places.joined(separator: ", ")). "
+                    + "Sending to a session running in the background may fail until it is in one of those places."
+            }
+            public static let getClaude = "Get Claude Code"
+
+            public static let connectTitle = "Connect to Claude Code"
+            public static func connectExplain(_ file: String) -> String {
+                "Connect adds a few lines to \(file), so Claude Code tells Sidemoon when a session starts, answers or ends. "
+                    + "A backup copy of that file is saved next to it first. Nothing else in it changes."
+            }
+            public static func connected(_ file: String) -> String {
+                "Connected through \(file). Disconnect removes only Sidemoon's lines, after another backup."
+            }
+            public static let connectIncomplete = "Only partly connected. Repair adds what is missing, after a backup."
+            public static func connectOtherCopy(_ path: String) -> String {
+                "Connected to another copy of Sidemoon at \(path). Repair switches it to this app, after a backup."
+            }
+            public static func connectMissingCopy(_ path: String) -> String {
+                "Connected to a copy of Sidemoon that is no longer there (\(path)), so nothing arrives. "
+                    + "Repair switches it to this app, after a backup."
+            }
+            public static func connectUnreadable(_ file: String, reason: String) -> String {
+                "\(file) could not be read, so Sidemoon left it alone. Fix the file, then check again. (\(reason))"
+            }
+            public static let connect = "Connect"
+            public static let repair = "Repair"
+            public static let disconnect = "Disconnect"
+            public static func backupSaved(_ path: String) -> String { "Backup saved at \(path)." }
+
+            public static let captureTitle = "Allow screen capture"
+            public static let captureExplain = "Lets Sidemoon take the screenshots you ask for, and nothing else. "
+                + "macOS asks you to turn on Sidemoon under Screen Recording in System Settings."
+            public static let captureGranted = "Allowed."
+            public static let capturePending = "Once Sidemoon is turned on in System Settings, relaunch it. "
+                + "macOS only applies the change after a restart."
+            public static let capturePendingQuit = "Once Sidemoon is turned on in System Settings, quit it and open it again. "
+                + "macOS only applies the change after a restart."
+            public static let allow = "Allow"
+            public static let openSystemSettings = "Open System Settings"
+            public static let relaunch = "Relaunch"
+
+            public static let terminalTitle = "Terminal sessions"
+            public static let terminalWhy = "Sessions you start in a terminal can only receive messages from Sidemoon when "
+                + "you start them with sidemoon-claude instead of claude."
+            public static func terminalChanges(_ launcher: String, config: String) -> String {
+                "Install adds the sidemoon-claude command at \(launcher) and a small settings file at \(config)."
+            }
+            public static let terminalPreview = "This relies on a research-preview option of Claude Code, which may change."
+            public static let terminalInstalled = "Installed. Start terminal sessions with:"
+            public static let terminalConfigOutdated = "sidemoon-claude is installed, but its settings point to another copy of "
+                + "Sidemoon. Repair points them at this app."
+            public static func terminalForeign(_ path: String) -> String {
+                "A different file is already at \(path). Sidemoon will not replace it. Move or rename it, then try again."
+            }
+            public static func notOnPath(_ directory: String, launcher: String) -> String {
+                "\(directory) is not on your shell's PATH, so type the full path: \(launcher)"
+            }
+            public static let install = "Install"
+
+            public static func helperMissing(_ path: String) -> String {
+                "A part of Sidemoon is missing (\(path)). Download Sidemoon again."
+            }
+            public static let helperTranslocated = "Move Sidemoon to your Applications folder and open it from there first. "
+                + "macOS is running it from a temporary copy that goes away."
+            public static func failed(_ reason: String) -> String { "That did not work: \(reason)" }
+
+            public static let readyTitle = "Ready"
+            public static let readyExplain = "Use these shortcuts in any app. Click the companion to read the answers. "
+                + "You can open this window again from the companion's right-click menu."
+            public static let start = "Start"
+        }
+    }
+}
