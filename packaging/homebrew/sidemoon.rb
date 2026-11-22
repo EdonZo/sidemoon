@@ -1,7 +1,7 @@
 # Not published in a tap yet (see README.md in this folder). Update version and sha256 with each release.
 cask "sidemoon" do
-  version "1.0.1"
-  sha256 "634cc0dd710a3031a74a7b6909851e2f8a73d237a7eb86e6aea07a0cea076c4a"
+  version "1.0.2"
+  sha256 "aa9ad27eae2c1bb99757d493489eb23bdcaa3f4aad59395f144d92dead4de5bb"
 
   url "https://github.com/EdonZo/sidemoon/releases/download/v#{version}/Sidemoon-#{version}.dmg",
       verified: "github.com/EdonZo/sidemoon/"

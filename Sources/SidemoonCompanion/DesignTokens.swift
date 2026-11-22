@@ -462,10 +462,10 @@ public enum Design {
                 switch blocker {
                 case .homeFolder:
                     why = "It was started in your home folder, and Claude Code only opens a session there from a terminal. "
-                        + "Reopen it in a terminal with the command below, then try again."
+                        + "Open it in Terminal with the button below and carry on there."
                 case .untrustedFolder:
                     why = "Claude Code has not been told it may work in this session's folder. Reopen the session in a terminal "
-                        + "with the command below and answer yes when it asks, then try again."
+                        + "with the button below and answer yes when it asks, then try again."
                 case .noTranscript:
                     why = "It stopped before it finished its first answer, so there is no conversation to pick up. "
                         + "Choose another session, or start a new one."
@@ -482,9 +482,21 @@ public enum Design {
             /// A terminal session started with plain `claude`: the channel that reaches it is not loaded.
             public static let noChannelTitle = "This session was started without sidemoon-claude"
             public static let noChannelAdvice = "Sidemoon can only reach a terminal session that was started with sidemoon-claude. "
-                + "Reopen it with the command below, then pick it again."
+                + "Reopen it with the button below, then pick it again."
             /// The short reason such a session is greyed out in the session list.
             public static let noChannelReason = "Started without sidemoon-claude"
+
+            /// Sidemoon's connection to the session was confirmed, but Claude Code never took the message in: it
+            /// runs the session in a process that does not pass on what the connection sends.
+            public static let notPickedUpTitle = "Claude Code did not pick up the message"
+            public static let notPickedUpWhy = "It moved this session to the background, where the Sidemoon connection is not passed on."
+            public static func notPickedUpAdvice(retryGoesInBackground: Bool) -> String {
+                notPickedUpWhy + " " + (retryGoesInBackground
+                    ? "Retry sends it the way Sidemoon reaches background sessions: it restarts the session with your message."
+                    : "Nothing else reaches it while it runs there. Reopen it with the button below, then pick it again.")
+            }
+            /// The short reason such a session is greyed out in the session list.
+            public static let notPickedUpReason = "Sidemoon connection not passed on"
 
             /// The short reason a session is greyed out in the session list.
             public static func reason(_ blocker: ResumeBlocker) -> String {
@@ -497,6 +509,9 @@ public enum Design {
             }
 
             public static let copyCommand = "Copy the command"
+            public static let openInTerminal = "Open in Terminal"
+            public static let openedInTerminal = "Opened"
+            public static let openInTerminalHelp = "Opens the Terminal app and reopens this session there. Nothing to type."
             public static let installCommand = "Install the terminal command"
             public static let installCommandNote = "The command is not installed yet. Setup installs it in one click."
             public static let chooseAnother = "Choose another session"

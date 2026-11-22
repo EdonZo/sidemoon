@@ -52,11 +52,14 @@ public final class ChannelServer: @unchecked Sendable {
 
     private func engineLoop() {
         let env = ProcessInfo.processInfo.environment
+        // Read once: the parent's command line does not change while this helper runs.
+        let role = ChannelRole.ofParent()
         while true {
             if let fd = try? UnixSocket.connect(path: socketPath, timeout: Constants.Timeouts.socketSend) {
                 let conn = LineConnection(fd: fd)
                 var hello: [String: Any] = ["op": Constants.Ops.channelHello, "claudePid": Int(getppid()),
-                                            "cwd": FileManager.default.currentDirectoryPath]
+                                            "cwd": FileManager.default.currentDirectoryPath,
+                                            Constants.Channel.roleKey: role.rawValue]
                 if let sid = env[Constants.Channel.sessionIdEnv] { hello["envSessionId"] = sid }
                 if conn.writeJSON(hello) {
                     while let msg = conn.readJSON() {

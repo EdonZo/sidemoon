@@ -73,7 +73,7 @@ Sidemoon has no Dock icon and no menu bar; the floating companion (the mascot an
 
 **Delivering a message.** How a message reaches a session depends on how the session was started:
 
-- **Terminal sessions started with `sidemoon-claude`.** The launcher runs `claude --mcp-config <config> --dangerously-load-development-channels server:sidemoon`, which loads Sidemoon as a channel: an MCP server that can push messages into the running session. Channels are a research preview in Claude Code and may change.
+- **Terminal sessions started with `sidemoon-claude`.** The launcher runs `claude --mcp-config <config> --dangerously-load-development-channels server:sidemoon`, which loads Sidemoon as a channel: an MCP server that can push messages into the running session. Channels are a research preview in Claude Code and may change. When Claude Code moves such a session to the background, the process that then hosts it loads Sidemoon without the channel flag, and Claude Code ignores what it pushes. The helper checks its parent's command line and tells the engine, so such a session is not shown as connected; if a message is still not taken in within 20 seconds, the send fails and Retry uses the background route.
 - **Background sessions (`claude --bg`).** Sidemoon stops the session and resumes it with the message using `claude --resume <id> --bg "<message>"`, then checks that the same session continued rather than a copy. Stopping a session ends any background shells or agents it had running; when that happens, the message tells the session so.
 - **Ended sessions.** Sidemoon resumes them headlessly with `claude -p --resume <id>` and shows the answer.
 
@@ -81,7 +81,7 @@ A terminal session started with plain `claude` cannot be reached. Chats in the C
 
 **Sessions Sidemoon cannot send to.** Claude Code refuses to resume some background sessions, and Sidemoon checks for these before it stops anything:
 
-- A background session that was started in your home folder. Claude Code only trusts the home folder in an interactive terminal.
+- A running background session that was started in your home folder, once Claude Code on your Mac has refused to reopen one ("the home directory is trusted one session at a time"). Some Macs never refuse; Sidemoon remembers a refusal and forgets it when Claude Code reopens a home-folder session again.
 - A running session that is stuck before its first answer, or one whose login has expired.
 
 Sidemoon shows these greyed out, with the reason. To use one anyway, reopen it in a terminal with the launcher, which connects it through the channel instead:

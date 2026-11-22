@@ -39,6 +39,11 @@ enum E2E {
     /// What a scratch project lets a session run without asking: the busy scenario's long turn. (Claude Code
     /// blocks a long foreground `sleep`, so the long turn pings the loopback address instead.)
     static let allowedTools = ["Bash(ping:*)", "Bash(ping *)"]
+    /// A shell between Claude Code and the helper, for a helper whose parent's command line misleads it. The
+    /// command is not a single simple command, so the shell does not replace itself with the helper.
+    static let shell = "/bin/sh"
+    static let shellCommandFlag = "-c"
+    static var runHelperThenExit: String { "\"$0\" \(Constants.Channel.subcommand); exit $?" }
     static let longTurnSeconds = 40
     static var longTurnCommand: String { "ping -c \(longTurnSeconds) -i 1 127.0.0.1" }
 
@@ -148,6 +153,25 @@ enum ClaudeCLI {
         } else {
             FileManager.default.createFile(atPath: path, contents: line)
         }
+    }
+}
+
+/// The hook events the test engine applies for one session, with when they arrived.
+final class HookLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: [(name: String, at: Date)] = []
+
+    init(_ engine: CompanionEngine, sessionId: String) {
+        engine.subscribe { [weak self] s in
+            guard let self, s.id == sessionId, let name = s.lastEventName, let at = s.lastEventAt else { return }
+            lock.withLock { if seen.last?.at != at { seen.append((name, at)) } }
+        }
+    }
+
+    /// "Name +seconds" for each event after `start`.
+    func since(_ start: Date) -> String {
+        let after = lock.withLock { seen.filter { $0.at >= start } }
+        return after.isEmpty ? "none" : after.map { "\($0.name) +\(String(format: "%.1f", $0.at.timeIntervalSince(start)))s" }.joined(separator: ", ")
     }
 }
 
@@ -325,7 +349,15 @@ final class Fixture {
         return pty
     }
 
+    /// Stands in for a refused home-folder resume seen earlier on this Mac (Claude Code here reopens them), so the
+    /// scenarios can check what Sidemoon does where Claude Code refuses. Only the test engine's own support
+    /// folder is written; cleanup forgets it. The list greys such sessions from the next `claude agents` reading.
+    func rememberHomeFolderRefusal() {
+        SharedEngine.engine.engine.registry.homeFolderResume(refused: true)
+    }
+
     func cleanup() async {
+        SharedEngine.engine.engine.registry.homeFolderResume(refused: false)
         for short in backgroundSessions { await stopBackground(short) }
         backgroundSessions = []
         for pty in terminals { await pty.end() }

@@ -45,6 +45,10 @@ public struct Session: Sendable, Equatable, Codable {
     /// Short id that `claude stop` takes (background sessions only).
     public var agentId: String?
     public var channelConnected = false
+    /// Sidemoon's helper runs in the process that hosts this session, but Claude Code does not pass on what it
+    /// sends: it was not loaded as a channel, or a delivery through it was not picked up. Never set together with
+    /// `channelConnected`.
+    public var channelDropped = false
     /// What would make Claude Code refuse to reopen this background session, when something is known to:
     /// seen before sending (its folder, its transcript) or learned from a refused resume. Nil when nothing is.
     public var blocker: ResumeBlocker?
@@ -61,7 +65,7 @@ public struct Session: Sendable, Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, cwd, transcriptPath, scratchpadDir, name, state, lastReply, lastEventName, lastEventAt, pid, agentId,
-             channelConnected, routes, blocker
+             channelConnected, channelDropped, routes, blocker
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -79,6 +83,7 @@ public struct Session: Sendable, Equatable, Codable {
         try c.encodeIfPresent(pid, forKey: .pid)
         try c.encodeIfPresent(agentId, forKey: .agentId)
         try c.encode(channelConnected, forKey: .channelConnected)
+        try c.encode(channelDropped, forKey: .channelDropped)
         try c.encode(routes, forKey: .routes)
         try c.encodeIfPresent(blocker, forKey: .blocker)
     }
@@ -98,6 +103,7 @@ public struct Session: Sendable, Equatable, Codable {
         pid = try c.decodeIfPresent(Int32.self, forKey: .pid)
         agentId = try c.decodeIfPresent(String.self, forKey: .agentId)
         channelConnected = try c.decodeIfPresent(Bool.self, forKey: .channelConnected) ?? false
+        channelDropped = try c.decodeIfPresent(Bool.self, forKey: .channelDropped) ?? false
         blocker = try c.decodeIfPresent(ResumeBlocker.self, forKey: .blocker)
     }
 }

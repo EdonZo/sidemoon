@@ -15,6 +15,10 @@ struct BubbleActions {
     /// Puts text on the clipboard (a command to paste in a terminal).
     var copyText: (String) -> Void = { _ in }
     var openURL: (URL) -> Void = { _ in }
+    /// Opens a report, filled in, for the user to send.
+    var sendFeedback: (FeedbackRoute) -> Void = { _ in }
+    /// Opens the Terminal app with this session reopened through the launcher (session id, its folder).
+    var openInTerminal: (String?, String?) -> Void = { _, _ in }
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -79,7 +83,7 @@ struct BubbleView: View {
                         Color.clear.frame(height: 0).id(BubbleView.topID)
                         Group {
                             if model.isShowingSettings {
-                                SettingsView(model: model, openSetup: actions.openSetup)
+                                SettingsView(model: model, openSetup: actions.openSetup, sendFeedback: actions.sendFeedback)
                             } else if model.isPickingSession {
                                 SessionPicker(model: model) { model.closeSessionList() }
                             } else {
@@ -329,7 +333,6 @@ struct BubbleView: View {
                             .foregroundStyle(Color.ink)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    if remedies.contains(.copyResumeCommand) { CommandText(text: model.resumeCommand) }
                     if remedies.contains(.installTerminalCommand) {
                         Text(copy.installCommandNote)
                             .font(.proseSmall)
@@ -391,15 +394,15 @@ struct BubbleView: View {
         ForEach(Array(actionable.enumerated()), id: \.element) { index, remedy in
             switch remedy {
             case .copyResumeCommand:
-                cardButton(commandCopied ? Design.Copy.copied : copy.copyCommand, primary: index == 0) {
-                    actions.copyText(model.resumeCommand)
+                cardButton(commandCopied ? copy.openedInTerminal : copy.openInTerminal, primary: index == 0) {
+                    actions.openInTerminal(model.targetId, model.target?.cwd)
                     commandCopied = true
                     Task { @MainActor in
                         try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
                         commandCopied = false
                     }
                 }
-                .help(copy.commandHelp)
+                .help(copy.openInTerminalHelp)
             case .installTerminalCommand:
                 cardButton(copy.installCommand, primary: index == 0) {
                     actions.openSetup()
@@ -888,6 +891,7 @@ struct SessionPicker: View {
 struct SettingsView: View {
     @Bindable var model: CompanionModel
     var openSetup: () -> Void = {}
+    var sendFeedback: (FeedbackRoute) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Design.Space.xl) {
@@ -974,6 +978,12 @@ struct SettingsView: View {
                 shortcut(CompanionConstants.HotKeys.captureWithNote, Design.Copy.shortcutRegionNote)
             }
             Rectangle().fill(Color.line).frame(height: Design.Bubble.hairline)
+            row(Design.Copy.Feedback.title) {
+                choice(Design.Copy.Feedback.onGitHub, selected: false) { sendFeedback(.gitHub) }
+                    .help(Design.Copy.Feedback.onGitHubHelp)
+                choice(Design.Copy.Feedback.byEmail, selected: false) { sendFeedback(.email) }
+                    .help(Design.Copy.Feedback.byEmailHelp)
+            }
             // The normal terminate path, so applicationWillTerminate saves the conversations first.
             row(Design.Copy.app) {
                 choice(Design.Copy.menuQuit, selected: false) { NSApp.terminate(nil) }
@@ -1081,6 +1091,8 @@ struct SessionRowView: View {
             ReadoutText(Design.Copy.Unreachable.reason(blocker))
         } else if unread {
             ReadoutText(Design.Copy.stateNewReply, color: .signal)
+        } else if row.reachability == .channelDropped {
+            ReadoutText(Design.Copy.Unreachable.notPickedUpReason)
         } else if !row.reachable && !row.ended {
             ReadoutText(Design.Copy.Unreachable.noChannelReason)
         } else {

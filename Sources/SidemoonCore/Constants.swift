@@ -39,6 +39,10 @@ public enum Constants {
         /// Where the CLI was installed by hand before it shipped inside the app.
         public static var legacyCLIPath: String { (userBinDirectory as NSString).appendingPathComponent(cliExecutableName) }
         public static let socketName = "engine.sock"
+        /// Present while this Mac's Claude Code has been seen refusing to reopen a background session in the
+        /// home folder; removed when it later reopens one.
+        public static let homeFolderRefusalName = "home-folder-refused"
+        public static var homeFolderRefusalPath: String { supportDirectory.appendingPathComponent(homeFolderRefusalName).path }
         public static var socketPath: String { supportDirectory.appendingPathComponent(socketName).path }
 
         /// Default Claude Code user settings file (the installer only touches it when asked).
@@ -68,6 +72,7 @@ public enum Constants {
     public enum Permissions {
         public static let directory: mode_t = 0o700
         public static let socket: mode_t = 0o600
+        public static let stateFile: Int16 = 0o600
         public static let imageFile: Int16 = 0o600
     }
 
@@ -119,6 +124,10 @@ public enum Constants {
         public static let headlessRun: TimeInterval = 300
         public static let channelReconnect: TimeInterval = 2
         public static let channelDeliveryAck: TimeInterval = 5
+        /// After the channel helper confirmed a delivery: how long an idle session has to show it took the
+        /// message in (the delivery marker in its transcript) before the send fails as not picked up. A session
+        /// in the middle of a turn, or waiting on a prompt, gets this long again once it is idle.
+        public static let channelPickupWait: TimeInterval = 20
         /// Budget for reading the login shell's environment once at startup.
         public static let loginEnvironment: TimeInterval = 10
         /// Grace period after terminating a login shell that overran its budget.
@@ -175,6 +184,14 @@ public enum Constants {
         public static let channelLaunchFlags = ["--mcp-config", "--dangerously-load-development-channels"]
         /// The value that follows the channel flag: the channel server's name.
         public static var channelLaunchValue: String { "server:\(Channel.serverName)" }
+        /// The flag that loads approved channels; the Sidemoon channel counts when its value names it.
+        public static let channelsFlag = "--channels"
+        /// What joins a flag to its value in the one-argument form (`--flag=value`).
+        public static let flagValueSeparator: Character = "="
+        /// What separates several channel names given as one value.
+        public static let channelListSeparators: Set<Character> = [",", " "]
+        /// Arguments that start a flag (a channel flag's values run until the next one).
+        public static let flagPrefix = "-"
     }
 
     /// Claude Code's own words when `claude --resume <id> --bg` refuses to reopen a session, matched in
@@ -225,6 +242,9 @@ public enum Constants {
         public static let defaultProtocolVersion = "2025-06-18"
         public static let sessionIdEnv = "CLAUDE_CODE_SESSION_ID"
         public static let deliveryIdMetaKey = "sidemoon_id"
+        /// The `channel.hello` field that says whether the Claude Code process that started the helper loads it
+        /// as a channel (a `ChannelRole` raw value). Helpers before 1.0.2 leave it out, which reads as unknown.
+        public static let roleKey = "channelRole"
         public static let instructions = """
             Messages from Sidemoon arrive as <channel source="sidemoon">. They are typed by the user in the \
             Sidemoon companion while they follow your guidance, so treat them as the user's own messages and answer \
