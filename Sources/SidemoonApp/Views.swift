@@ -573,18 +573,38 @@ struct GuideCard: View {
                 .buttonStyle(PressStyle())
                 .help(g.dismiss)
             }
-            VStack(alignment: .leading, spacing: Design.Space.m) {
-                step(1, g.stepPick, done: progress.pickedSession) {
-                    if !progress.pickedSession {
+            if progress.sentCapture {
+                VStack(alignment: .leading, spacing: Design.Space.m) {
+                    step(1, g.stepPick, done: progress.pickedSession) { EmptyView() }
+                    step(2, g.stepSend, done: progress.sentCapture) {
+                        HStack(spacing: Design.Space.xs) {
+                            ForEach(CompanionConstants.Guide.shortcut.symbols, id: \.self) { Keycap($0) }
+                        }
+                    }
+                    step(3, g.stepReply, done: progress.replied) { EmptyView() }
+                }
+            } else {
+                // Until the first capture has gone out, the guide is one thing: the shortcut, drawn large.
+                VStack(alignment: .leading, spacing: Design.Space.m) {
+                    HStack(spacing: Design.Space.s) {
+                        ForEach(CompanionConstants.Guide.shortcut.symbols, id: \.self) { HeroKeycap($0) }
+                    }
+                    Text(g.heroTitle)
+                        .font(.text(Design.Guide.heroTitle, weight: .semibold))
+                        .foregroundStyle(Color.ink)
+                    if model.targetId == nil {
+                        Text(g.heroNoSession)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
                         smallButton(g.pickButton) { model.openSessionList() }
+                    } else {
+                        Text(g.heroBody(session: model.targetTitle, seconds: Int(CompanionConstants.Timing.noteGracePeriod)))
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                step(2, g.stepSend, done: progress.sentCapture) {
-                    HStack(spacing: Design.Space.xs) {
-                        ForEach(CompanionConstants.Guide.shortcut.symbols, id: \.self) { Keycap($0) }
-                    }
-                }
-                step(3, g.stepReply, done: progress.replied) { EmptyView() }
             }
             if progress.isComplete {
                 Button(action: model.dismissGuide) {
@@ -1107,6 +1127,24 @@ struct SessionRowView: View {
 }
 
 /// One key of a shortcut, drawn as a small keycap.
+/// A key of the shortcut, drawn large: the accent on the letter, as on the website.
+struct HeroKeycap: View {
+    let key: String
+    init(_ key: String) { self.key = key }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Design.Guide.heroKeycapRadius, style: .continuous)
+        let isLetter = key == CompanionConstants.Guide.shortcut.key.uppercased()
+        Text(key)
+            .font(.system(size: Design.Guide.heroKeycapText, weight: .semibold, design: .rounded))
+            .foregroundStyle(isLetter ? Color.paper : Color.ink)
+            .frame(minWidth: Design.Guide.heroKeycap, minHeight: Design.Guide.heroKeycap)
+            .background(shape.fill(isLetter ? Color.signal : Color.paper))
+            .background(shape.fill(Color.line).offset(y: Design.Space.xs))
+            .overlay(shape.strokeBorder(isLetter ? Color.signal : Color.line, lineWidth: Design.Bubble.hairline))
+    }
+}
+
 struct Keycap: View {
     let key: String
     init(_ key: String) { self.key = key }
