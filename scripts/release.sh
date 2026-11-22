@@ -21,6 +21,17 @@ PRINT_PLIST_FLAG=--print-info-plist
 UNIVERSAL_FLAGS="--arch arm64 --arch x86_64"
 APPLICATIONS_LINK=/Applications
 DMG_FORMAT=UDZO
+# The disk image opens as a window that shows what to do: the app on the left, an arrow, Applications on
+# the right. The picture (regular and retina in one file) is drawn to these numbers.
+DMG_WORK_FORMAT=UDRW
+DMG_BACKGROUND=Resources/dmg-background.tiff
+DMG_BACKGROUND_DIR=.background
+DMG_WINDOW_ORIGIN="200, 120"
+DMG_WINDOW_CORNER="800, 528"
+DMG_ICON_SIZE=112
+DMG_TEXT_SIZE=13
+DMG_APP_POSITION="150, 180"
+DMG_LINK_POSITION="450, 180"
 DMG_EXTENSION=dmg
 ZIP_EXTENSION=zip
 CHECKSUM_BITS=256
@@ -83,7 +94,38 @@ STAGING="$WORK/staging"
 mkdir -p "$STAGING"
 ditto "$APP" "$STAGING/$NAME.app"
 ln -s "$APPLICATIONS_LINK" "$STAGING/$(basename "$APPLICATIONS_LINK")"
-hdiutil create -volname "$NAME" -srcfolder "$STAGING" -format "$DMG_FORMAT" -ov "$DMG"
+mkdir "$STAGING/$DMG_BACKGROUND_DIR"
+cp "$ROOT/$DMG_BACKGROUND" "$STAGING/$DMG_BACKGROUND_DIR/"
+# A writable image first: Finder stores the window's layout inside it, then it is compressed.
+LAYOUT_DMG="$WORK/layout.$DMG_EXTENSION"
+hdiutil create -volname "$NAME" -srcfolder "$STAGING" -format "$DMG_WORK_FORMAT" -ov "$LAYOUT_DMG"
+MOUNT=$(hdiutil attach "$LAYOUT_DMG" -readwrite -noverify -noautoopen | sed -n 's|.*\(/Volumes/.*\)$|\1|p' | tail -1)
+[ -d "$MOUNT" ] || fail "could not mount the disk image to lay it out"
+# Without the layout the image still works; it only loses the picture and the arranged icons.
+osascript <<LAYOUT || echo "release: Finder did not lay out the disk image; continuing with the plain window" >&2
+tell application "Finder"
+    tell disk "$(basename "$MOUNT")"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {$DMG_WINDOW_ORIGIN, $DMG_WINDOW_CORNER}
+        set viewOptions to the icon view options of container window
+        set arrangement of viewOptions to not arranged
+        set icon size of viewOptions to $DMG_ICON_SIZE
+        set text size of viewOptions to $DMG_TEXT_SIZE
+        set background picture of viewOptions to file "$DMG_BACKGROUND_DIR:$(basename "$DMG_BACKGROUND")"
+        set position of item "$NAME.app" of container window to {$DMG_APP_POSITION}
+        set position of item "$(basename "$APPLICATIONS_LINK")" of container window to {$DMG_LINK_POSITION}
+        update without registering applications
+        delay 2
+        close
+    end tell
+end tell
+LAYOUT
+sync
+hdiutil detach "$MOUNT" -quiet || hdiutil detach "$MOUNT" -force -quiet
+hdiutil convert "$LAYOUT_DMG" -format "$DMG_FORMAT" -ov -o "$DMG"
 codesign --force --sign "$IDENTITY" --timestamp "$DMG"
 notarize "$DMG"
 xcrun stapler staple "$DMG"

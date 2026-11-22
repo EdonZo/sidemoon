@@ -274,6 +274,16 @@ public final class Engine: @unchecked Sendable {
         // Stopping a session that is waiting on a permission prompt would discard that prompt.
         guard current.state != .needsInput else { return fail("the session is waiting on a prompt in its own window; answer it there first") }
         guard let cwd = current.cwd ?? a.cwd else { return fail("the session's working directory is unknown") }
+        // Claude Code would refuse to reopen it once stopped, and the session would be left stopped: leave it be.
+        // A session that is already stopped is not stopped here, so Claude Code's own answer is safe to wait for;
+        // it reopens a stopped session that never answered.
+        let answered = a.isRunning ? registry.hasAnswered(s.id, transcriptHint: current.transcriptPath ?? a.transcriptPath) : nil
+        if let blocker = ResumeCheck.blocker(cwd: cwd, home: registry.home, answered: answered) {
+            registry.setBlocker(sessionId: s.id, blocker)
+            var r = SendResult.failure(.cannotResume(blocker, messageSaved: false), sessionId: s.id, route: .background)
+            r.detail = "checked before stopping the session: \(blocker.description) (\(cwd))"
+            return r
+        }
 
         let imagePath: String?, filePaths: [String]
         switch stage(image, files, for: current) {
@@ -285,6 +295,7 @@ public final class Engine: @unchecked Sendable {
         if a.isRunning, a.status == Constants.ClaudeCLI.busyStatus { prompt += "\n\n" + Constants.ClaudeCLI.backgroundWorkNote }
 
         // 1. Stop it: resuming a running session forks a copy instead of continuing it.
+        let stoppedFirst = a.isRunning
         if a.isRunning {
             let r = runner.run([Constants.ClaudeCLI.stopCommand, a.agentId], cwd: nil, stdin: nil, timeout: Constants.Timeouts.cliCommand)
             guard r.status == 0 else { return fail("`claude stop \(a.agentId)` failed: \(r.stderrText.prefix(300))") }
@@ -306,7 +317,17 @@ public final class Engine: @unchecked Sendable {
         let output = r.stdoutText + r.stderrText
         guard r.status == 0 else {
             registry.cancelWait(token)
-            return fail("resume exited \(r.status): \(output.prefix(300))")
+            let said = "resume exited \(r.status): \(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Constants.Limits.failureDetailCharacters))"
+            // Claude Code's own reason, for the cases the checks above cannot see.
+            if let refusal = ResumeCheck.classify(output) {
+                registry.setBlocker(sessionId: s.id, refusal.blocker)
+                var failed = SendResult.failure(.cannotResume(refusal.blocker, messageSaved: refusal.messageSaved,
+                                                              stoppedFirst: stoppedFirst),
+                                                sessionId: s.id, route: .background)
+                failed.detail = said
+                return failed
+            }
+            return fail(said)
         }
 
         // 3. Verify the same session continued; a fork is an error, never a success.

@@ -454,3 +454,98 @@ private struct Rig {
         #expect(Set(CompanionConstants.Defaults.savedKeys).count == CompanionConstants.Defaults.savedKeys.count)
     }
 }
+
+// MARK: Where the app runs from
+
+@MainActor
+private final class FakeMover: AppMover {
+    var writable: Set<String> = []
+    var failure: Error?
+    var copies: [(String, String)] = []
+    var relaunches: [String] = []
+    func isWritable(_ folder: String) -> Bool { writable.contains(folder) }
+    func copy(bundle: String, to destination: String) throws -> String {
+        if let failure { throw failure }
+        copies.append((bundle, destination))
+        return destination
+    }
+    func relaunch(at path: String) { relaunches.append(path) }
+}
+
+@MainActor
+@Suite struct AppLocationTests {
+    @Test func decidesFromThePath() {
+        func at(_ path: String) -> AppLocation { AppLocator.locate(bundlePath: path, home: home) }
+        #expect(at("/Applications/Sidemoon.app") == .applications)
+        #expect(at("/Applications/Utilities/Sidemoon.app") == .applications)
+        #expect(at("\(home)/Applications/Sidemoon.app") == .applications)
+        #expect(at("/Volumes/Sidemoon/Sidemoon.app") == .diskImage("/Volumes/Sidemoon/Sidemoon.app"))
+        #expect(at("/private/var/folders/x/AppTranslocation/123/d/Sidemoon.app") == .translocated)
+        #expect(at("\(home)/Downloads/Sidemoon.app") == .elsewhere("\(home)/Downloads/Sidemoon.app"))
+        // Builds of the source are never offered a move.
+        #expect(at("\(home)/src/sidemoon/dist/Sidemoon.app") == .development)
+        #expect(at("\(home)/src/sidemoon/.build/debug/Sidemoon.app") == .development)
+        #expect(at("\(home)/src/sidemoon/.build/debug/SidemoonApp") == .development)
+        // A folder that only starts like Applications is not it.
+        #expect(at("/ApplicationsOld/Sidemoon.app") == .elsewhere("/ApplicationsOld/Sidemoon.app"))
+    }
+
+    @Test func onlyCopiesOutsideApplicationsAreOfferedTheMove() {
+        #expect(AppLocation.diskImage("/Volumes/x").offersMove)
+        #expect(AppLocation.translocated.offersMove)
+        #expect(AppLocation.elsewhere("/x").offersMove)
+        #expect(!AppLocation.applications.offersMove && AppLocation.applications.maySetUp)
+        #expect(!AppLocation.development.offersMove && AppLocation.development.maySetUp)
+        #expect(!AppLocation.diskImage("/Volumes/x").maySetUp)
+    }
+
+    @Test func movesToTheSharedFolderElseTheUsersOwn() {
+        let mover = FakeMover()
+        let bundle = "/Volumes/Sidemoon/Sidemoon.app"
+        mover.writable = ["/Applications", "\(home)/Applications"]
+        #expect(MoveToApplications.move(bundlePath: bundle, home: home, mover: mover) == .relaunching("/Applications/Sidemoon.app"))
+        #expect(mover.relaunches == ["/Applications/Sidemoon.app"])
+        mover.writable = ["\(home)/Applications"]
+        #expect(MoveToApplications.destination(bundlePath: bundle, home: home, mover: mover) == "\(home)/Applications/Sidemoon.app")
+    }
+
+    @Test func aMoveThatCannotHappenSaysWhyAndRelaunchesNothing() {
+        let mover = FakeMover()
+        let bundle = "/Volumes/Sidemoon/Sidemoon.app"
+        #expect(MoveToApplications.move(bundlePath: bundle, home: home, mover: mover) == .failed(Design.Copy.Move.noWritableFolder))
+        mover.writable = ["/Applications"]
+        mover.failure = ShapeError()
+        guard case let .failed(reason) = MoveToApplications.move(bundlePath: bundle, home: home, mover: mover) else {
+            Issue.record("expected a failure"); return
+        }
+        #expect(reason.contains("not JSON"))
+        #expect(mover.relaunches.isEmpty)
+    }
+
+    @Test func aCopyOutsideApplicationsChangesNothingOutsideItself() {
+        let rig = Rig()
+        let model = SetupModel(helper: .found("/Volumes/Sidemoon/Sidemoon.app/Contents/Helpers/sidemoon"), paths: paths,
+                               finder: FakeFinder(result: usualLookup), hooks: rig.hooks, files: rig.files,
+                               permission: rig.permission, relauncher: rig.relauncher, defaults: rig.defaults,
+                               location: .diskImage("/Volumes/Sidemoon/Sidemoon.app"))
+        #expect(model.needsMove)
+        #expect(!model.canConnect)
+        #expect(!model.canInstallLauncher)
+        #expect(model.connectionDetail == Design.Copy.Setup.moveFirst)
+        #expect(model.terminalDetail == Design.Copy.Setup.moveFirst)
+        model.connect()
+        model.installLauncher()
+        #expect(rig.hooks.installs.isEmpty)
+        #expect(rig.files.writes.isEmpty)
+    }
+
+    @Test func theResumeCommandFollowsTheLauncherCommand() async {
+        let onPath = Rig().model()
+        await onPath.refresh()
+        #expect(onPath.launcherResumeCommand == "sidemoon-claude --resume")
+        let offPath = Rig().model(lookup: ClaudeLookup(enginePath: nil, loginShellPath: nil, pathEntries: ["/usr/bin"]))
+        await offPath.refresh()
+        #expect(offPath.launcherResumeCommand == "~/.local/bin/sidemoon-claude --resume")
+        #expect(Design.Copy.Setup.terminalInstalled.contains("Terminal app"))
+    }
+}

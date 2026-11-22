@@ -45,6 +45,9 @@ public struct Session: Sendable, Equatable, Codable {
     /// Short id that `claude stop` takes (background sessions only).
     public var agentId: String?
     public var channelConnected = false
+    /// What would make Claude Code refuse to reopen this background session, when something is known to:
+    /// seen before sending (its folder, its transcript) or learned from a refused resume. Nil when nothing is.
+    public var blocker: ResumeBlocker?
     /// Routes that are available right now, in preference order.
     public var routes: [Route] {
         var r: [Route] = []
@@ -58,7 +61,7 @@ public struct Session: Sendable, Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, cwd, transcriptPath, scratchpadDir, name, state, lastReply, lastEventName, lastEventAt, pid, agentId,
-             channelConnected, routes
+             channelConnected, routes, blocker
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -77,6 +80,7 @@ public struct Session: Sendable, Equatable, Codable {
         try c.encodeIfPresent(agentId, forKey: .agentId)
         try c.encode(channelConnected, forKey: .channelConnected)
         try c.encode(routes, forKey: .routes)
+        try c.encodeIfPresent(blocker, forKey: .blocker)
     }
 
     public init(from decoder: Decoder) throws {
@@ -94,6 +98,7 @@ public struct Session: Sendable, Equatable, Codable {
         pid = try c.decodeIfPresent(Int32.self, forKey: .pid)
         agentId = try c.decodeIfPresent(String.self, forKey: .agentId)
         channelConnected = try c.decodeIfPresent(Bool.self, forKey: .channelConnected) ?? false
+        blocker = try c.decodeIfPresent(ResumeBlocker.self, forKey: .blocker)
     }
 }
 

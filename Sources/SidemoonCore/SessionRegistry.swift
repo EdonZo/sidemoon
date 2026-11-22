@@ -14,6 +14,11 @@ public final class SessionRegistry: @unchecked Sendable {
     private var stopWaiters: [UUID: StopWaiter] = [:]
     private let replyReader: @Sendable (HookEvent) -> String?
     private let turnProbe: @Sendable (AgentInfo) -> Bool?
+    private let answerProbe: @Sendable (_ sessionId: String, _ transcriptHint: String?) -> Bool?
+    /// Sessions known to have finished an answer. A transcript only grows, so this never has to be undone.
+    private var answered: Set<String> = []
+    /// The user's home folder, where Claude Code will not reopen a background session.
+    public let home: String
 
     private final class StopWaiter: @unchecked Sendable {
         let sessionId: String
@@ -26,17 +31,31 @@ public final class SessionRegistry: @unchecked Sendable {
         }
     }
 
-    /// - Parameter turnProbe: whether a session's last turn is still going, read from its transcript.
+    /// - Parameters:
+    ///   - turnProbe: whether a session's last turn is still going, read from its transcript.
+    ///   - answerProbe: whether a session has finished an answer yet, read from its transcript (nil: cannot tell).
     public init(replyReader: @escaping @Sendable (HookEvent) -> String? = { TranscriptReader.reply(for: $0) },
                 turnProbe: @escaping @Sendable (AgentInfo) -> Bool? = { agent in
                     agent.transcriptPath.flatMap(TranscriptReader.turnIsOpen(transcriptPath:))
-                }) {
+                },
+                answerProbe: @escaping @Sendable (String, String?) -> Bool? = { TranscriptReader.sessionHasAnswered($0, hint: $1) },
+                home: String = FileManager.default.homeDirectoryForCurrentUser.path) {
         self.replyReader = replyReader
         self.turnProbe = turnProbe
+        self.answerProbe = answerProbe
+        self.home = home
     }
 
     /// Whether this session is in the middle of a turn right now.
     public func isMidTurn(_ agent: AgentInfo) -> Bool { agent.isMidTurn(turnIsOpen: turnProbe) }
+
+    /// Whether the session has finished an answer: remembered once it has, else read from its transcript.
+    public func hasAnswered(_ sessionId: String, transcriptHint: String?) -> Bool? {
+        if lock.withLock({ answered.contains(sessionId) }) { return true }
+        let result = answerProbe(sessionId, transcriptHint)
+        if result == true { lock.withLock { _ = answered.insert(sessionId) } }
+        return result
+    }
 
     // MARK: Reading
 
@@ -97,6 +116,9 @@ public final class SessionRegistry: @unchecked Sendable {
             s.scratchpadDir = e.scratchpadDir ?? s.scratchpadDir
             s.lastEventName = e.eventName
             s.lastEventAt = e.receivedAt
+            // The session ran somewhere just now, so what a refused resume taught no longer holds. The home
+            // folder is a fact about the session and is checked again on the next listing.
+            if s.blocker != .homeFolder { s.blocker = nil }
             if let pid = e.claudePid {
                 s.pid = pid
                 if e.eventName == Constants.HookEvents.sessionEnd {
@@ -111,7 +133,10 @@ public final class SessionRegistry: @unchecked Sendable {
             case Constants.HookEvents.sessionStart: s.state = .idle
             case Constants.HookEvents.userPromptSubmit: s.state = .working
             case Constants.HookEvents.stop:
-                s.state = .idle
+                // A session that ends right after its answer sends Stop and SessionEnd together, and the end
+                // can be applied first (reading the reply for Stop takes a moment). Ended stays ended; a
+                // session that is resumed says so with SessionStart before its next Stop.
+                if s.state != .ended { s.state = .idle }
                 s.lastReply = fullReply
                 s.lastReplyAt = e.receivedAt
             case Constants.HookEvents.notification:
@@ -145,6 +170,11 @@ public final class SessionRegistry: @unchecked Sendable {
         var changed: [Session] = []
         // Read from the transcripts before taking the lock: it is file work.
         let midTurn = Set(agents.filter(isMidTurn).map(\.sessionId))
+        let hints = lock.withLock { agents.map { sessions[$0.sessionId]?.transcriptPath } }
+        var answeredNow: [String: Bool] = [:]
+        for (a, hint) in zip(agents, hints) where a.kind == SessionKind.background.rawValue && !midTurn.contains(a.sessionId) {
+            answeredNow[a.sessionId] = hasAnswered(a.sessionId, transcriptHint: hint ?? a.transcriptPath)
+        }
         lock.withLock {
             for a in agents {
                 var s = sessions[a.sessionId] ?? Session(id: a.sessionId)
@@ -166,6 +196,17 @@ public final class SessionRegistry: @unchecked Sendable {
                     else if s.state != .ended && s.state != .needsInput { s.state = .idle }
                 } else if s.state == .working || s.state == .needsInput {
                     s.state = .idle
+                }
+                if s.kind == .background {
+                    // A session still on its first turn has not answered yet, and is not blocked for that.
+                    // Only a running session is stopped before it is resumed, so only there does a missing
+                    // answer matter beforehand: Claude Code reopens a stopped session that never answered.
+                    let answered = s.state == .working || !a.isRunning ? nil : answeredNow[a.sessionId] ?? nil
+                    if let seen = ResumeCheck.blocker(cwd: s.cwd ?? a.cwd, home: home, answered: answered) {
+                        s.blocker = seen
+                    } else if s.blocker == .homeFolder || s.blocker == .noTranscript {
+                        s.blocker = nil
+                    }
                 }
                 if s != before {
                     sessions[a.sessionId] = s
@@ -189,6 +230,17 @@ public final class SessionRegistry: @unchecked Sendable {
             guard s.channelConnected != connected else { return nil }
             s.channelConnected = connected
             if connected, s.kind == .unknown { s.kind = .interactive }
+            sessions[sessionId] = s
+            return s
+        }
+        if let s { emit(s) }
+    }
+
+    /// Records what a refused resume said about the session, so the session list can show it.
+    public func setBlocker(sessionId: String, _ blocker: ResumeBlocker?) {
+        let s: Session? = lock.withLock {
+            guard var s = sessions[sessionId], s.blocker != blocker else { return nil }
+            s.blocker = blocker
             sessions[sessionId] = s
             return s
         }

@@ -78,6 +78,11 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
     case background(String)
     case headless(String)
     case replyTimeout
+    /// Claude Code will not reopen this background session, so the message cannot reach it this way.
+    /// `messageSaved`: Claude Code kept the message and delivers it the next time the session starts.
+    /// `stoppedFirst`: Sidemoon had already stopped the running session when Claude Code refused, so it is
+    /// left stopped (the cases the checks before stopping cannot see).
+    case cannotResume(ResumeBlocker, messageSaved: Bool, stoppedFirst: Bool = false)
 
     public var description: String {
         switch self {
@@ -93,7 +98,66 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
         case let .background(m): return "background route failed: \(m)"
         case let .headless(m): return "headless route failed: \(m)"
         case .replyTimeout: return "delivered, but no reply arrived before the timeout"
+        case let .cannotResume(b, saved, stopped):
+            return "cannot resume: \(b.description)" + (saved ? "; claude code saved the message for the session's next start" : "")
+                + (stopped ? "; sidemoon had stopped the running session before the resume was refused" : "")
         }
+    }
+}
+
+/// Why Claude Code will not reopen a background session with `claude --resume <id> --bg`.
+public enum ResumeBlocker: String, Sendable, Codable, CaseIterable, CustomStringConvertible {
+    /// It runs in the home folder, which Claude Code only trusts for one interactive session at a time.
+    case homeFolder
+    /// It runs in a folder Claude Code has not been told to trust.
+    case untrustedFolder
+    /// It stopped before its first answer finished, so there is no conversation to reopen.
+    case noTranscript
+    /// The Claude login it runs under is missing or expired.
+    case loginNeeded
+
+    public var description: String {
+        switch self {
+        case .homeFolder: return "the session's working directory is the home folder"
+        case .untrustedFolder: return "the session's working directory is not trusted"
+        case .noTranscript: return "the session has no finished answer to resume from"
+        case .loginNeeded: return "claude code needs a login"
+        }
+    }
+}
+
+/// The checks made before a background session is stopped, and the reading of a refused resume.
+public enum ResumeCheck {
+    /// The same folder, however it is written (a trailing slash, `..`, a symbolic link).
+    public static func isHomeFolder(_ cwd: String, home: String) -> Bool {
+        func normal(_ p: String) -> String {
+            var s = URL(fileURLWithPath: p).standardizedFileURL.resolvingSymlinksInPath().path
+            while s.count > 1, s.hasSuffix("/") { s.removeLast() }
+            return s
+        }
+        return normal(cwd) == normal(home)
+    }
+
+    /// What would make a resume fail, from what can be seen without trying. `answered` is whether the
+    /// session has finished an answer (nil: unknown, which never blocks).
+    public static func blocker(cwd: String?, home: String, answered: Bool?) -> ResumeBlocker? {
+        if let cwd, isHomeFolder(cwd, home: home) { return .homeFolder }
+        if answered == false { return .noTranscript }
+        return nil
+    }
+
+    /// Reads Claude Code's output from a resume that exited with an error. Nil when it says nothing known.
+    public static func classify(_ output: String) -> (blocker: ResumeBlocker, messageSaved: Bool)? {
+        let text = output.lowercased()
+        func says(_ phrases: [String]) -> Bool { phrases.contains { text.contains($0) } }
+        let r = Constants.ResumeRefusal.self
+        let blocker: ResumeBlocker
+        if says(r.homeFolderPhrases) { blocker = .homeFolder }
+        else if says(r.noTranscriptPhrases) { blocker = .noTranscript }
+        else if says(r.loginPhrases) { blocker = .loginNeeded }
+        else if says(r.untrustedFolderPhrases) { blocker = .untrustedFolder }
+        else { return nil }
+        return (blocker, says(r.messageSavedPhrases))
     }
 }
 

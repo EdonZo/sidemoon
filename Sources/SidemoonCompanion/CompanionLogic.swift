@@ -18,9 +18,16 @@ public enum CompanionError: Equatable, Sendable {
     case captureFailed(String)
     case noActiveWindow
     case delivery(String)
+    /// Claude Code will not reopen the session. `stoppedFirst`: Sidemoon had already stopped it when Claude Code
+    /// refused. `detail` is the technical reason, kept for bug reports.
+    case cannotReach(ResumeBlocker, messageSaved: Bool, stoppedFirst: Bool = false, detail: String?)
+    /// A terminal session started with plain `claude`, without Sidemoon's channel: nothing can reach it.
+    case needsLauncher
 
     public var title: String {
         switch self {
+        case let .cannotReach(blocker, _, _, _): return Design.Copy.Unreachable.title(blocker)
+        case .needsLauncher: return Design.Copy.Unreachable.noChannelTitle
         case .noTarget: return "No session chosen"
         case .engineConflict: return "Another Sidemoon engine is running"
         case .engineFailed: return "The Sidemoon engine could not start"
@@ -38,6 +45,9 @@ public enum CompanionError: Equatable, Sendable {
 
     public var advice: String {
         switch self {
+        case let .cannotReach(blocker, saved, stopped, _):
+            return Design.Copy.Unreachable.advice(blocker, messageSaved: saved, stoppedFirst: stopped)
+        case .needsLauncher: return Design.Copy.Unreachable.noChannelAdvice
         case .noTarget:
             return "Open the menu and choose which Claude Code session should get your screenshots."
         case .engineConflict:
@@ -68,9 +78,37 @@ public enum CompanionError: Equatable, Sendable {
         }
     }
 
+    /// What the user can do about it, shown as buttons under the advice. Empty for most errors.
+    public var remedies: [Remedy] {
+        if self == .needsLauncher { return [.copyResumeCommand, .chooseAnotherSession] }
+        guard case let .cannotReach(blocker, _, _, _) = self else { return [] }
+        switch blocker {
+        case .homeFolder, .untrustedFolder: return [.copyResumeCommand, .chooseAnotherSession]
+        case .loginNeeded: return [.runLogin, .copyResumeCommand, .chooseAnotherSession]
+        case .noTranscript: return [.chooseAnotherSession]
+        }
+    }
+
+    /// Whether sending the same message again could work. Not when Claude Code refused the session: it
+    /// would refuse again until the user does something about it.
+    public var canRetry: Bool {
+        if case .cannotReach = self { return false }
+        if self == .needsLauncher { return false }
+        return true
+    }
+
+    /// The technical reason behind the plain words, for a bug report; nil when there is nothing more to say.
+    public var detail: String? {
+        if case let .cannotReach(_, _, _, detail) = self { return detail }
+        return nil
+    }
+
     /// Maps an engine result to a companion error. Only called for failed results.
     public static func from(_ result: SendResult) -> CompanionError {
         switch result.failure {
+        case let .cannotResume(blocker, saved, stopped)?:
+            return .cannotReach(blocker, messageSaved: saved, stoppedFirst: stopped,
+                                detail: [result.error, result.detail].compactMap { $0 }.joined(separator: "\n"))
         case .busy?: return .busy
         case .noRoute?: return .noRoute
         case .noScratchpad?: return .noScratchpad
@@ -80,6 +118,36 @@ public enum CompanionError: Equatable, Sendable {
         default: return .delivery(result.error ?? "The engine did not say why.")
         }
     }
+}
+
+/// A next step offered with an error.
+public enum Remedy: Equatable, Sendable, Hashable {
+    /// Copy the command that reopens a session in a terminal, through Sidemoon's channel.
+    case copyResumeCommand
+    /// That command is not installed yet: open Setup, whose terminal step installs it.
+    case installTerminalCommand
+    case chooseAnotherSession
+    /// Words only: sign in again from the session's terminal.
+    case runLogin
+}
+
+/// The "Try it" guide: three things to do once, each ticked when the user has really done it.
+public struct GuideProgress: Equatable, Sendable {
+    /// Chose the session to talk to.
+    public var pickedSession: Bool
+    /// Sent a screenshot that was delivered.
+    public var sentCapture: Bool
+    /// Typed a reply to a session that had answered, and it was delivered.
+    public var replied: Bool
+
+    public init(pickedSession: Bool = false, sentCapture: Bool = false, replied: Bool = false) {
+        self.pickedSession = pickedSession
+        self.sentCapture = sentCapture
+        self.replied = replied
+    }
+
+    public var isComplete: Bool { pickedSession && sentCapture && replied }
+    public var doneCount: Int { [pickedSession, sentCapture, replied].filter { $0 }.count }
 }
 
 // MARK: - Status state machine
@@ -251,10 +319,17 @@ public struct SessionRow: Identifiable, Equatable, Sendable {
     public let title: String
     public let folder: String?
     public let stateText: String
-    /// Whether a message can get to it at all. A busy session still counts: messages wait for it.
-    public let reachable: Bool
+    /// Whether a message can get to it at all, and if not, why.
+    public let reachability: Reachability
     public let ended: Bool
     public let state: SessionState
+    /// Whether a message can get to it at all. A busy session still counts: messages wait for it.
+    public var reachable: Bool { reachability == .reachable }
+    /// Why Claude Code would refuse it; nil when nothing is known to stand in the way.
+    public var blocker: ResumeBlocker? {
+        if case let .blocked(b) = reachability { return b }
+        return nil
+    }
 
     /// Single-line text for an NSMenuItem.
     public var menuTitle: String {
@@ -263,6 +338,15 @@ public struct SessionRow: Identifiable, Equatable, Sendable {
         parts.append(stateText)
         return parts.joined(separator: "  ·  ")
     }
+}
+
+/// Whether a session can be sent to.
+public enum Reachability: Equatable, Sendable {
+    case reachable
+    /// A terminal session started without Sidemoon's channel (plain `claude`, not `sidemoon-claude`).
+    case needsChannel
+    /// A background session Claude Code would not reopen.
+    case blocked(ResumeBlocker)
 }
 
 public enum SessionList {
@@ -290,7 +374,21 @@ public enum SessionList {
 
     /// Whether a message can get to the session at all: over a route open now, or by waiting for a
     /// background session to finish its turn. Only a terminal session started without the channel cannot.
-    public static func isReachable(_ s: Session) -> Bool { !s.routes.isEmpty || s.kind == .background }
+    public static func isReachable(_ s: Session) -> Bool { reachability(s) == .reachable }
+
+    /// The channel reaches a session wherever it runs; a background session is out of reach when Claude Code
+    /// would refuse to reopen it.
+    public static func reachability(_ s: Session) -> Reachability {
+        if s.channelConnected { return .reachable }
+        if s.kind == .background, let blocker = s.blocker { return .blocked(blocker) }
+        return !s.routes.isEmpty || s.kind == .background ? .reachable : .needsChannel
+    }
+
+    /// The session to talk to when none is chosen: the most recently active one that can be reached.
+    public static func defaultTarget(_ sessions: [Session]) -> String? {
+        rows(sessions, showEnded: true).first { $0.reachable && !$0.ended }?.id
+            ?? rows(sessions, showEnded: true).first { $0.reachable }?.id
+    }
 
     /// Picker rows: ended sessions hidden unless asked for, most recently active first.
     public static func rows(_ sessions: [Session], showEnded: Bool) -> [SessionRow] {
@@ -302,7 +400,7 @@ public enum SessionList {
             }
             .map { s in
                 SessionRow(id: s.id, title: displayName(s), folder: folderName(s), stateText: stateText(s.state),
-                           reachable: isReachable(s), ended: s.state == .ended, state: s.state)
+                           reachability: reachability(s), ended: s.state == .ended, state: s.state)
             }
     }
 }

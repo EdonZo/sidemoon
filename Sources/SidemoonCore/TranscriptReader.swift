@@ -98,6 +98,87 @@ public enum TranscriptReader {
         return nil
     }
 
+    /// Whether the session has finished at least one real answer: an assistant message that ended its turn
+    /// and is not an error Claude Code wrote in place of one (a failed login, for example).
+    ///
+    /// False when there is no transcript at that path. Only the two ends of the file are read; nil when it is
+    /// longer than both and neither holds an answer, so a long session is never mistaken for an empty one.
+    public static func hasFinishedAnswer(transcriptPath path: String) -> Bool? {
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let h = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? h.close() }
+        guard let size = try? h.seekToEnd() else { return nil }
+        let limit = Constants.Limits.answerProbeBytes
+        try? h.seek(toOffset: 0)
+        guard let head = try? h.read(upToCount: limit) else { return size == 0 ? false : nil }
+        var headLines = head.split(separator: UInt8(ascii: "\n"))
+        // The last line of a cut head is a fragment.
+        if size > UInt64(limit), !headLines.isEmpty { headLines.removeLast() }
+        if headLines.contains(where: isFinishedAnswer) { return true }
+        if size <= UInt64(limit) { return false }
+        guard let tail = readTailData(path, limit: limit) else { return nil }
+        var tailLines = tail.split(separator: UInt8(ascii: "\n"))
+        if !tailLines.isEmpty { tailLines.removeFirst() }
+        if tailLines.contains(where: isFinishedAnswer) { return true }
+        // Both ends together covered the whole file.
+        return size <= UInt64(2 * limit) ? false : nil
+    }
+
+    private static func isFinishedAnswer(_ line: Data.SubSequence) -> Bool {
+        let t = Constants.Transcript.self
+        guard line.range(of: t.messageHint) != nil,
+              let record = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              record["type"] as? String == t.assistantType,
+              record["isSidechain"] as? Bool != true,
+              record[t.apiErrorKey] as? Bool != true,
+              let message = record["message"] as? [String: Any],
+              message["model"] as? String != t.syntheticModel,
+              let stop = message["stop_reason"] as? String else { return false }
+        return t.turnEndingStopReasons.contains(stop)
+    }
+
+    /// The session's transcript: at `hint` when it is there, else wherever Claude Code filed it under its
+    /// projects folder (the folder name is derived from the working directory, which can be spelled differently).
+    /// `.missing` only when Claude Code is seen keeping this session's project here (the folder for its working
+    /// directory exists) and no transcript for the session is anywhere under it. `.unknown` otherwise: the
+    /// projects folder cannot be read, or Claude Code keeps its files somewhere else (`CLAUDE_CONFIG_DIR`).
+    public enum Location: Equatable, Sendable {
+        case found(String)
+        case missing
+        case unknown
+    }
+
+    /// - Parameter hint: where the transcript should be for the session's working directory, from a hook or
+    ///   derived from the working directory (`AgentInfo.transcriptPath`). Its folder is the project folder.
+    public static func locate(sessionId: String, hint: String?,
+                              projects: String = Constants.Paths.claudeProjectsDirectory) -> Location {
+        let fm = FileManager.default
+        if let hint, fm.fileExists(atPath: hint) { return .found(hint) }
+        guard let folders = try? fm.contentsOfDirectory(atPath: projects) else { return .unknown }
+        let name = "\(sessionId).\(Constants.Paths.transcriptExtension)"
+        for folder in folders {
+            let candidate = "\(projects)/\(folder)/\(name)"
+            if fm.fileExists(atPath: candidate) { return .found(candidate) }
+        }
+        // Sure only when the project folder is here, directly under this projects folder, without the transcript.
+        guard let hint else { return .unknown }
+        let projectFolder = URL(fileURLWithPath: hint).deletingLastPathComponent().standardizedFileURL
+        guard projectFolder.deletingLastPathComponent().path == URL(fileURLWithPath: projects).standardizedFileURL.path
+        else { return .unknown }
+        var isDirectory: ObjCBool = false
+        return fm.fileExists(atPath: projectFolder.path, isDirectory: &isDirectory) && isDirectory.boolValue ? .missing : .unknown
+    }
+
+    /// Whether a session has finished an answer, wherever its transcript is (nil: cannot tell).
+    public static func sessionHasAnswered(_ sessionId: String, hint: String?,
+                                          projects: String = Constants.Paths.claudeProjectsDirectory) -> Bool? {
+        switch locate(sessionId: sessionId, hint: hint, projects: projects) {
+        case let .found(path): return hasFinishedAnswer(transcriptPath: path)
+        case .missing: return false
+        case .unknown: return nil
+        }
+    }
+
     /// True when `needle` occurs in the transcript tail.
     public static func contains(_ path: String, _ needle: String) -> Bool {
         guard let data = readTailData(path) else { return false }

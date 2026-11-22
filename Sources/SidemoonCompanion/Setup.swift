@@ -121,6 +121,99 @@ public enum HelperLocator {
     }
 }
 
+// MARK: Where the app runs from
+
+/// Where this copy of Sidemoon is running from, which decides whether it may change anything outside itself.
+public enum AppLocation: Equatable, Sendable {
+    /// Inside /Applications or ~/Applications: where it belongs.
+    case applications
+    /// A build of the source (a bare executable, or a bundle in a build folder): never offered a move.
+    case development
+    /// Straight from a mounted disk image, which goes away when it is ejected.
+    case diskImage(String)
+    /// macOS runs it from a temporary, read-only copy of where it was downloaded.
+    case translocated
+    /// Anywhere else: Downloads, the desktop, a folder of its own.
+    case elsewhere(String)
+
+    /// The move to the Applications folder is offered.
+    public var offersMove: Bool {
+        switch self {
+        case .diskImage, .translocated, .elsewhere: return true
+        case .applications, .development: return false
+        }
+    }
+
+    /// Whether this copy may write Claude Code's settings, the terminal command, or a login item: all of them would
+    /// point at this copy, and a copy outside the Applications folder is likely to disappear.
+    public var maySetUp: Bool { !offersMove }
+}
+
+public enum AppLocator {
+    /// Decides from the bundle's path alone. Symbolic links are followed first, so a link into /Applications is
+    /// judged by where it really points.
+    public static func locate(bundlePath: String, home: String) -> AppLocation {
+        let a = CompanionConstants.App.self
+        let path = URL(fileURLWithPath: bundlePath).resolvingSymlinksInPath().standardizedFileURL.path
+        guard (path as NSString).pathExtension == a.bundleExtension else { return .development }
+        if path.contains(a.translocationMarker) { return .translocated }
+        let components = (path as NSString).pathComponents
+        if components.contains(where: a.developmentFolders.contains) { return .development }
+        let folders = MoveToApplications.destinations(home: home).map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        if folders.contains(where: { path.hasPrefix($0 + "/") }) { return .applications }
+        if path.hasPrefix(a.volumesFolder + "/") { return .diskImage(path) }
+        return .elsewhere(path)
+    }
+}
+
+/// Copies and relaunches the app in its new place. A protocol so the decision around it is tested without either.
+@MainActor
+public protocol AppMover {
+    func isWritable(_ folder: String) -> Bool
+    /// Copies the bundle to `destination`, replacing what is there, and returns the new bundle's path.
+    func copy(bundle: String, to destination: String) throws -> String
+    /// Opens the copy at `path` once this process has quit, then quits.
+    func relaunch(at path: String)
+}
+
+public enum MoveToApplications {
+    /// Tried in this order: the shared Applications folder, then the user's own.
+    public static func destinations(home: String) -> [String] {
+        [CompanionConstants.App.applicationsFolder, (home as NSString).appendingPathComponent(CompanionConstants.App.applicationsFolderName)]
+    }
+
+    /// Where the bundle goes: the first Applications folder that can be written to, under the bundle's own name, so
+    /// an older Sidemoon already there is replaced. Nil when neither folder can be written to.
+    @MainActor
+    public static func destination(bundlePath: String, home: String, mover: AppMover) -> String? {
+        let name = (bundlePath as NSString).lastPathComponent
+        guard let folder = destinations(home: home).first(where: mover.isWritable) else { return nil }
+        return (folder as NSString).appendingPathComponent(name)
+    }
+
+    public enum Outcome: Equatable, Sendable {
+        case relaunching(String)
+        case failed(String)
+    }
+
+    /// Copies the bundle into Applications and relaunches it from there. On failure nothing is relaunched and the
+    /// reason is returned in plain words.
+    @MainActor
+    @discardableResult
+    public static func move(bundlePath: String, home: String, mover: AppMover) -> Outcome {
+        guard let target = destination(bundlePath: bundlePath, home: home, mover: mover) else {
+            return .failed(Design.Copy.Move.noWritableFolder)
+        }
+        do {
+            let copied = try mover.copy(bundle: bundlePath, to: target)
+            mover.relaunch(at: copied)
+            return .relaunching(copied)
+        } catch {
+            return .failed(Design.Copy.Move.failed("\(error)"))
+        }
+    }
+}
+
 // MARK: The launcher
 
 public enum LauncherScript {
@@ -273,6 +366,10 @@ public final class SetupModel {
 
     public let helper: HelperLocation
     public let paths: SetupPaths
+    /// Where this copy runs from. Outside the Applications folder nothing is changed outside the app; the steps that
+    /// would change something point to the move instead.
+    public let location: AppLocation
+    public var needsMove: Bool { location.offersMove }
 
     @ObservationIgnored private let finder: ClaudeFinder
     @ObservationIgnored private let hooks: HooksService
@@ -283,9 +380,11 @@ public final class SetupModel {
     @ObservationIgnored private var lookupInFlight = false
 
     public init(helper: HelperLocation, paths: SetupPaths, finder: ClaudeFinder, hooks: HooksService, files: SetupFiles,
-                permission: ScreenCapturePermission, relauncher: AppRelauncher, defaults: UserDefaults = .standard) {
+                permission: ScreenCapturePermission, relauncher: AppRelauncher, defaults: UserDefaults = .standard,
+                location: AppLocation = .applications) {
         self.helper = helper
         self.paths = paths
+        self.location = location
         self.finder = finder
         self.hooks = hooks
         self.files = files
@@ -403,6 +502,7 @@ public final class SetupModel {
 
     /// Connect, Repair or nothing: what the main button of step 2 does.
     public var canConnect: Bool {
+        guard !needsMove else { return false }
         switch connection {
         case .notConnected, .incomplete, .otherCopy, .missingCopy: return true
         default: return false
@@ -419,7 +519,7 @@ public final class SetupModel {
     /// Connect and screen capture are what the companion needs; terminal sessions are optional.
     public var requiredStepsDone: Bool { connectionState == .done && captureState == .done }
 
-    public var canInstallLauncher: Bool { terminal == .notInstalled || terminal == .configOutdated }
+    public var canInstallLauncher: Bool { !needsMove && (terminal == .notInstalled || terminal == .configOutdated) }
     public var canRelaunch: Bool { relauncher.canRelaunch }
 
     // MARK: Words for the current state
@@ -432,6 +532,9 @@ public final class SetupModel {
     public var launcherCommand: String {
         launcherOnPath ? (paths.launcher as NSString).lastPathComponent : launcherDisplayPath
     }
+
+    /// The same command, picking an existing session to reopen.
+    public var launcherResumeCommand: String { "\(launcherCommand) \(Constants.ClaudeCLI.resumeFlag)" }
 
     public var claudeDetail: String {
         let c = Design.Copy.Setup.self
@@ -447,6 +550,7 @@ public final class SetupModel {
 
     public var connectionDetail: String {
         let c = Design.Copy.Setup.self
+        if needsMove, connection != .connected { return c.moveFirst }
         switch connection {
         case .notConnected: return c.connectExplain(settingsDisplayPath)
         case .connected: return c.connected(settingsDisplayPath)
@@ -469,6 +573,7 @@ public final class SetupModel {
 
     public var terminalDetail: String {
         let c = Design.Copy.Setup.self
+        if needsMove, terminal != .installed { return c.moveFirst }
         switch terminal {
         case .notInstalled: return c.terminalChanges(launcherDisplayPath, config: configDisplayPath)
         case .installed: return c.terminalInstalled
@@ -497,7 +602,7 @@ public final class SetupModel {
     /// Connect, or Repair: installs the hooks for this app's helper. The installer backs the file up first and
     /// replaces only Sidemoon's own entries.
     public func connect() {
-        guard canConnect, let helperPath = helper.path else { return }
+        guard canConnect, !needsMove, let helperPath = helper.path else { return }
         do {
             let outcome = try hooks.install(helper: helperPath)
             connectionFeedback = outcome.backupPath.map { SetupFeedback(Design.Copy.Setup.backupSaved(paths.display($0))) }
@@ -546,7 +651,7 @@ public final class SetupModel {
     /// Writes the channel config (Sidemoon's own file, always brought up to date) and the launcher. A different
     /// file already at the launcher's path is never replaced.
     public func installLauncher() {
-        guard let helperPath = helper.path else { return }
+        guard !needsMove, let helperPath = helper.path else { return }
         if files.exists(paths.launcher), !LauncherScript.matches(files.read(paths.launcher), expected: launcherContent) {
             terminalFeedback = SetupFeedback(Design.Copy.Setup.terminalForeign(launcherDisplayPath), isProblem: true)
             refreshLocal()

@@ -16,11 +16,14 @@ final class FakeRunner: ClaudeRunner, @unchecked Sendable {
     private let lock = NSLock()
     var agentsJSON: String
     var resumeOutput: String
+    /// The exit status of `claude --resume`; Claude Code exits 1 when it refuses.
+    var resumeStatus: Int32
     private(set) var calls: [[String]] = []
 
-    init(agentsJSON: String, resumeOutput: String = "") {
+    init(agentsJSON: String, resumeOutput: String = "", resumeStatus: Int32 = 0) {
         self.agentsJSON = agentsJSON
         self.resumeOutput = resumeOutput
+        self.resumeStatus = resumeStatus
     }
 
     func run(_ args: [String], cwd: String?, stdin: Data?, timeout: TimeInterval) -> ProcessResult {
@@ -34,13 +37,14 @@ final class FakeRunner: ClaudeRunner, @unchecked Sendable {
         case Constants.ClaudeCLI.resumeFlag: out = resumeOutput
         default: out = ""
         }
-        return ProcessResult(status: 0, stdout: Data(out.utf8), stderr: Data(), timedOut: false)
+        let status = args.first == Constants.ClaudeCLI.resumeFlag ? resumeStatus : 0
+        return ProcessResult(status: status, stdout: Data(out.utf8), stderr: Data(), timedOut: false)
     }
     var recorded: [[String]] { lock.withLock { calls } }
 }
 
-private func agents(status: String, state: String, running: Bool = true) -> String {
-    #"[{"id":"0b8e8a52",\#(running ? #""pid":2147483000,"# : "")"sessionId":"\#(sid)","kind":"background","name":"t","cwd":"/tmp/proj","status":"\#(status)","state":"\#(state)"}]"#
+func agents(status: String, state: String, running: Bool = true, cwd: String = "/tmp/proj") -> String {
+    #"[{"id":"0b8e8a52",\#(running ? #""pid":2147483000,"# : "")"sessionId":"\#(sid)","kind":"background","name":"t","cwd":"\#(cwd)","status":"\#(status)","state":"\#(state)"}]"#
 }
 
 @Suite struct HookEventTests {
@@ -60,7 +64,7 @@ private func agents(status: String, state: String, running: Bool = true) -> Stri
 
 @Suite struct RegistryTests {
     @Test func stateFollowsHooks() {
-        let r = SessionRegistry(replyReader: { _ in nil })
+        let r = SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true })
         r.apply(hook("SessionStart"))
         #expect(r.session(sid)?.state == .idle)
         r.apply(hook("UserPromptSubmit"))
@@ -77,7 +81,7 @@ private func agents(status: String, state: String, running: Bool = true) -> Stri
     }
 
     @Test func pidBindingFollowsClearInSameProcess() {
-        let r = SessionRegistry(replyReader: { _ in nil })
+        let r = SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true })
         r.apply(hook("SessionStart", sid, pid: 10))
         r.apply(hook("SessionStart", other, pid: 11))
         #expect(r.sessionId(forPid: 10) == sid)
@@ -87,7 +91,7 @@ private func agents(status: String, state: String, running: Bool = true) -> Stri
     }
 
     @Test func stopWaiterSeesLaterStopOnlyAndEmitsChanges() {
-        let r = SessionRegistry(replyReader: { _ in nil })
+        let r = SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true })
         let seen = LockedCount()
         r.subscribe { _ in seen.add() }
         let token = r.expectStop(sessionId: sid)
@@ -102,7 +106,7 @@ private func agents(status: String, state: String, running: Bool = true) -> Stri
     }
 
     @Test func agentsSeedBackgroundSessions() throws {
-        let r = SessionRegistry(replyReader: { _ in nil })
+        let r = SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true })
         r.applyAgents(try #require(AgentInfo.parseList(Data(agents(status: "busy", state: "working").utf8))))
         #expect(r.session(sid)?.kind == .background)
         #expect(r.session(sid)?.state == .working)
@@ -136,7 +140,7 @@ final class LockedCount: @unchecked Sendable {
 @Suite struct DeliveryTests {
     private func engine(_ runner: FakeRunner, state: String) -> Engine {
         let e = Engine(socketPath: "/tmp/unused-\(UUID().uuidString).sock", runner: runner,
-                       registry: SessionRegistry(replyReader: { _ in nil }))
+                       registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true }))
         e.refreshAgents()
         if state == "working" { e.registry.apply(hook("UserPromptSubmit")) }
         return e
@@ -206,7 +210,7 @@ final class LockedCount: @unchecked Sendable {
         let runner = FakeRunner(agentsJSON: agents(status: "busy", state: "working"),
                                 resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = Engine(socketPath: "/tmp/unused-\(UUID().uuidString).sock", runner: runner,
-                       registry: SessionRegistry(replyReader: { _ in nil }, turnProbe: { _ in false }))
+                       registry: SessionRegistry(replyReader: { _ in nil }, turnProbe: { _ in false }, answerProbe: { _, _ in true }))
         e.refreshAgents()
         #expect(e.registry.session(sid)?.state == .idle)
         // The resumed process shows up running again.

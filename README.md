@@ -79,6 +79,17 @@ Sidemoon has no Dock icon and no menu bar; the floating companion (the mascot an
 
 A terminal session started with plain `claude` cannot be reached. Chats in the Claude desktop app are not supported.
 
+**Sessions Sidemoon cannot send to.** Claude Code refuses to resume some background sessions, and Sidemoon checks for these before it stops anything:
+
+- A background session that was started in your home folder. Claude Code only trusts the home folder in an interactive terminal.
+- A running session that is stuck before its first answer, or one whose login has expired.
+
+Sidemoon shows these greyed out, with the reason. To use one anyway, reopen it in a terminal with the launcher, which connects it through the channel instead:
+
+```sh
+~/.local/bin/sidemoon-claude --resume
+```
+
 **Images and files.** For live sessions, the capture and any dropped files are copied into that session's scratchpad folder (under `/tmp/claude-<uid>/`) so Claude Code can read them without a permission prompt. Files up to 50 MB can be sent; folders cannot.
 
 ## Privacy
@@ -113,7 +124,8 @@ A terminal session started with plain `claude` cannot be reached. Chats in the C
 
 ```sh
 swift build                 # debug build of the library, the app binary and the CLI
-swift test                  # unit and end-to-end tests
+swift test                  # unit tests (the end-to-end scenarios are skipped)
+scripts/e2e.sh              # end-to-end scenarios against real Claude Code sessions
 scripts/build-app.sh        # Sidemoon.app in dist/
 ```
 
@@ -125,6 +137,12 @@ The code is split into:
 - `Sources/SidemoonApp` — the AppKit and SwiftUI app.
 
 Tests do not touch your real `~/.claude/settings.json` or the Screen Recording permission.
+
+### End-to-end tests
+
+`scripts/e2e.sh` runs every scenario against real, throwaway Claude Code sessions: an idle and a busy background session, one in your home folder, one stopped before it answered, an ended one, a terminal session started with the channel, a screenshot and a dropped file, Retry after a failed send, and whether the session list tells the truth. `scripts/e2e.sh --list` lists them and `scripts/e2e.sh <name>` runs one. It prints PASS or FAIL for each, with what was seen when one fails.
+
+It uses a little Claude usage (the `haiku` model and one-line prompts). It runs beside your own Sidemoon: its engine has its own socket in a scratch folder (`SIDEMOON_SUPPORT_DIR`, used only by these tests), its sessions are named `sidemoon-e2e-…` and only ever get messages from it, and it never sends to, stops or resumes a session it did not start. When it ends, even on failure or Control-C, it stops and removes every session it started (including the one in your home folder), and deletes its scratch folders and the data Claude Code kept for them. The interactive scenarios answer Claude Code's "local development" channel question and its folder trust question themselves.
 
 ## Contributing
 

@@ -12,6 +12,17 @@ public struct ThreadEntry: Identifiable, Equatable, Sendable, Codable {
         case delivered
         /// Not delivered; the text says why in plain words.
         case failed(String)
+        /// Not delivered, and sending it again as it is would fail the same way (Claude Code refused the
+        /// session), so it is not offered again. The text says why in plain words.
+        case refused(String)
+
+        /// Why it did not go out, for either kind of failure.
+        public var failureReason: String? {
+            switch self {
+            case let .failed(reason), let .refused(reason): return reason
+            case .sending, .queued, .delivered: return nil
+            }
+        }
     }
 
     public let id: UUID
@@ -104,7 +115,7 @@ public struct Threads: Equatable, Sendable, Codable {
             for index in entries[session]!.indices {
                 switch entries[session]![index].delivery {
                 case .sending, .queued: entries[session]![index].delivery = .failed(reason)
-                case .delivered, .failed: break
+                case .delivered, .failed, .refused: break
                 }
             }
         }

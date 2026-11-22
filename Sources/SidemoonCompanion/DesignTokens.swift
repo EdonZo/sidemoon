@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import SidemoonCore
 
 /// The visual system: warm paper-and-ink neutrals, one accent ("signal") that only ever means
 /// live or needs-you, two typographic voices (content, and a small uppercase mono readout),
@@ -215,6 +216,21 @@ public enum Design {
         public static var workingDot: CGFloat { 4 * Design.zoom }
         public static var workingDotGap: CGFloat { 3 * Design.zoom }
         public static let workingDotMinOpacity: Double = 0.25
+        /// A session that cannot be reached is drawn this faint in the session list.
+        public static let unreachableOpacity: Double = 0.6
+    }
+
+    /// The window offering to move Sidemoon into Applications.
+    public enum Move {
+        public static var width: CGFloat { 440 * Design.zoom }
+    }
+
+    /// The "Try it" guide.
+    public enum Guide {
+        public static let steps = 3
+        /// The circle that holds a step's number or its tick.
+        public static var mark: CGFloat { 18 * Design.zoom }
+        public static var markIcon: CGFloat { 9 * Design.zoom }
     }
 
     /// The setup window.
@@ -303,6 +319,9 @@ public enum Design {
         public static let reducedMotionWaitingOpacity: Double = 0.5
         /// Under the pointer the lens lifts a little, lights its edge, and the dot takes one lap while a shine crosses.
         public static let hoverScale: CGFloat = 1.07
+        /// After Setup, and when Sidemoon is opened again, the lens swells and glows a few times so the eye finds it.
+        public static let attentionPulses = 3
+        public static let attentionPulseDuration: TimeInterval = 0.45
         /// The badge that counts sessions with something waiting for the user.
         public static var badgeSize: CGFloat { 17 * Design.zoom }
         public static var badgeText: CGFloat { 10 * Design.zoom }
@@ -369,7 +388,6 @@ public enum Design {
         public static let remove = "Take it back"
         public static let sendTo = "Send to"
         public static let noSessions = "No sessions yet. Start Claude Code and it will show up here."
-        public static let needsChannel = "Open with sidemoon-claude"
         public static let needsYou = "Needs you"
         public static let ended = "Ended"
         public static let showEnded = "Show ended"
@@ -427,6 +445,89 @@ public enum Design {
         public static let app = "App"
         public static let quitHelp = "Close the companion. Your conversations are saved first."
         public static let menuNoSessions = "No live sessions. Start Claude Code, or open Setup to connect it."
+
+        /// A session Claude Code will not reopen: what happened, in plain words, and what to do.
+        public enum Unreachable {
+            public static func title(_ blocker: ResumeBlocker) -> String {
+                switch blocker {
+                case .homeFolder: return "This session cannot be reached from here"
+                case .untrustedFolder: return "This session's folder is not trusted yet"
+                case .noTranscript: return "This session never answered"
+                case .loginNeeded: return "This session needs a login"
+                }
+            }
+
+            public static func advice(_ blocker: ResumeBlocker, messageSaved: Bool, stoppedFirst: Bool = false) -> String {
+                let why: String
+                switch blocker {
+                case .homeFolder:
+                    why = "It was started in your home folder, and Claude Code only opens a session there from a terminal. "
+                        + "Reopen it in a terminal with the command below, then try again."
+                case .untrustedFolder:
+                    why = "Claude Code has not been told it may work in this session's folder. Reopen the session in a terminal "
+                        + "with the command below and answer yes when it asks, then try again."
+                case .noTranscript:
+                    why = "It stopped before it finished its first answer, so there is no conversation to pick up. "
+                        + "Choose another session, or start a new one."
+                case .loginNeeded:
+                    why = "Claude Code is signed out, or its sign-in has expired, so the session cannot answer until you sign in again."
+                }
+                return [why, stoppedFirst ? stoppedNote : nil, messageSaved ? savedNote : nil].compactMap { $0 }.joined(separator: " ")
+            }
+
+            public static let savedNote = "Claude Code kept your message and will pass it on the next time this session starts."
+            /// Claude Code refused only after Sidemoon had stopped the running session to deliver the message.
+            public static let stoppedNote = "Sidemoon had already stopped it; it starts again when you reopen it."
+
+            /// A terminal session started with plain `claude`: the channel that reaches it is not loaded.
+            public static let noChannelTitle = "This session was started without sidemoon-claude"
+            public static let noChannelAdvice = "Sidemoon can only reach a terminal session that was started with sidemoon-claude. "
+                + "Reopen it with the command below, then pick it again."
+            /// The short reason such a session is greyed out in the session list.
+            public static let noChannelReason = "Started without sidemoon-claude"
+
+            /// The short reason a session is greyed out in the session list.
+            public static func reason(_ blocker: ResumeBlocker) -> String {
+                switch blocker {
+                case .homeFolder: return "Started in your home folder"
+                case .untrustedFolder: return "Folder not trusted yet"
+                case .noTranscript: return "Never answered"
+                case .loginNeeded: return "Needs a login"
+                }
+            }
+
+            public static let copyCommand = "Copy the command"
+            public static let installCommand = "Install the terminal command"
+            public static let installCommandNote = "The command is not installed yet. Setup installs it in one click."
+            public static let chooseAnother = "Choose another session"
+            public static let runLogin = "Type /login in that session's terminal, then try again."
+            public static let details = "Details"
+            public static let hideDetails = "Hide details"
+            public static let commandHelp = "Paste this in a terminal and pick the session from the list"
+        }
+
+        /// The "Try it" guide shown in the bubble once Setup is finished.
+        public enum Guide {
+            public static let heading = "Try it"
+            public static let stepPick = "Pick the session to talk to"
+            public static let stepSend = "Send the window you are looking at"
+            public static let stepReply = "Read the answer here and reply"
+            public static let pickButton = "Choose session"
+            public static let testMessageButton = "Send a test message"
+            public static let video = "Watch the 45-second video"
+            public static let terminalNote = "A session you start in a terminal needs sidemoon-claude. Setup installs it."
+            public static let dismiss = "Hide guide"
+            public static let doneHeading = "You are all set"
+            public static let doneButton = "Close guide"
+            public static let stepDone = "Done"
+            public static func progress(_ done: Int) -> String { "\(done) of \(Design.Guide.steps)" }
+        }
+
+        public static let guide = "Guide"
+        public static let showGuide = "Show guide"
+        public static func emptyThread(session: String) -> String { "Nothing with \(session) yet." }
+        public static let emptyShortcut = "sends the window you are looking at."
+        public static let emptyOrType = "Or type a question below."
 
         /// The setup window. Plain sentences that say what each button changes.
         public enum Setup {
@@ -494,7 +595,15 @@ public enum Design {
                 "Install adds the sidemoon-claude command at \(launcher) and a small settings file at \(config)."
             }
             public static let terminalPreview = "This relies on a research-preview option of Claude Code, which may change."
-            public static let terminalInstalled = "Installed. Start terminal sessions with:"
+            public static let terminalInstalled = "Installed. In the Terminal app, type this where you would normally type claude:"
+            public static let terminalResume = "To reopen a session you already have, type this and pick it from the list:"
+            /// Shown in place of a step that would change something, while Sidemoon runs from outside Applications.
+            public static let moveFirst = "Move Sidemoon to your Applications folder first. This copy runs from a place that "
+                + "can go away, and what this step sets up would point at it."
+            public static let moveButton = "Move to Applications"
+            public static let openAtLoginAfterMove = "Opening at login can be turned on once Sidemoon is in your Applications folder."
+            public static let whereItSits = "Sidemoon is the small round companion at the edge of your screen. "
+                + "After Start it opens beside it with a short guide."
             public static let terminalConfigOutdated = "sidemoon-claude is installed, but its settings point to another copy of "
                 + "Sidemoon. Repair points them at this app."
             public static func terminalForeign(_ path: String) -> String {
@@ -517,5 +626,24 @@ public enum Design {
                 + "You can open this window again from the companion's right-click menu."
             public static let start = "Start"
         }
+
+        /// The window that offers to move Sidemoon into the Applications folder.
+        public enum Move {
+            public static let windowTitle = "Move Sidemoon"
+            public static let heading = "Move Sidemoon to Applications?"
+            public static let explain = "Sidemoon is running from where it was downloaded. Kept in your Applications folder, it is "
+                + "still there after the disk image is ejected, you can find it with Spotlight, and macOS keeps the permissions "
+                + "you give it."
+            public static let move = "Move to Applications"
+            public static let notNow = "Not now"
+            public static let notNowNote = "Until it is moved, Sidemoon will not connect to Claude Code or open at login."
+            public static let noWritableFolder = "Neither Applications folder can be written to. Drag Sidemoon into "
+                + "Applications in the Finder instead."
+            public static func failed(_ reason: String) -> String { "The move did not work: \(reason)" }
+        }
+
+        public static let recording = "Recording"
+        public static let visibleInRecordings = "Show Sidemoon in screen recordings and screen sharing"
+        public static let visibleInRecordingsNote = "Off by default, so the companion never ends up in the screenshots it sends."
     }
 }

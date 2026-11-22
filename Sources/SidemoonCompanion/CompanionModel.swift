@@ -61,6 +61,84 @@ public final class CompanionModel {
     public func checkForUpdates() { updater?.checkForUpdates() }
     /// The user has not pressed Start in Setup yet. Set by the app.
     public var setupPending = false
+    /// The `sidemoon-claude` command from Setup's terminal step is installed. Set by the app.
+    public var terminalCommandInstalled = true
+
+    /// What reopens a session in a terminal through Sidemoon's channel, ready to paste.
+    public var resumeCommand: String {
+        let paths = SetupPaths.standard
+        return "\(paths.display(paths.launcher)) \(Constants.ClaudeCLI.resumeFlag)"
+    }
+
+    /// The next steps offered with an error. The resume command is only offered once it is installed;
+    /// before that, the way to install it is.
+    public func remedies(for error: CompanionError) -> [Remedy] {
+        error.remedies.map { $0 == .copyResumeCommand && !terminalCommandInstalled ? .installTerminalCommand : $0 }
+    }
+
+    // MARK: Guide
+
+    /// The "Try it" guide's three steps, ticked as the user does them.
+    public private(set) var guide = GuideProgress()
+    /// The guide is open: not yet finished or hidden, or asked for again from the settings.
+    public private(set) var isGuideOpen: Bool
+    /// Asked for from the settings, so it shows even while Setup is unfinished.
+    @ObservationIgnored private var guideRequested = false
+
+    /// Shown once Setup is finished, and whenever asked for.
+    public var showsGuide: Bool { isGuideOpen && (guideRequested || (!setupPending && !needsConnection)) }
+
+    /// Opens the guide again from the settings, with its steps to do again.
+    public func showGuide() {
+        guide = GuideProgress(pickedSession: targetId != nil && !targetIsAutomatic)
+        isGuideOpen = true
+        guideRequested = true
+        closeSettings()
+        closeSessionList()
+    }
+
+    /// Setup's Start was pressed: open beside the mascot with the guide showing, and draw the eye to the mascot.
+    public func presentAfterSetup() {
+        isGuideOpen = true
+        guideRequested = true
+        closeSettings()
+        closeSessionList()
+        openBubble()
+        requestAttention()
+    }
+
+    /// Goes up each time the mascot should pulse so the eye finds it.
+    public private(set) var attentionRequests = 0
+    public func requestAttention() { attentionRequests += 1 }
+
+    /// The panels show up in screen recordings and screen sharing. Off by default, so the companion never ends up
+    /// in the captures it sends.
+    public var visibleInRecordings: Bool {
+        didSet { defaults.set(visibleInRecordings, forKey: CompanionConstants.Defaults.visibleInRecordings) }
+    }
+
+    /// Hides the guide; it stays hidden until asked for.
+    public func dismissGuide() {
+        isGuideOpen = false
+        guideRequested = false
+        defaults.set(true, forKey: CompanionConstants.Defaults.guideClosed)
+    }
+
+    private func tickGuide(_ change: (inout GuideProgress) -> Void) {
+        var next = guide
+        change(&next)
+        guard next != guide else { return }
+        guide = next
+        // Finished: it stays on screen to show so, and does not open by itself again.
+        if guide.isComplete { defaults.set(true, forKey: CompanionConstants.Defaults.guideClosed) }
+    }
+
+    /// The guide's button: a short, harmless message to the chosen session, to see an answer come back.
+    public func sendTestMessage() async {
+        guard preflight() else { return }
+        let text = CompanionConstants.Guide.testMessage
+        await deliver(to: targetId, text: text, shown: text, imagePath: nil, files: [], attachments: [])
+    }
     /// True while the note field is showing (the second hotkey).
     public private(set) var isEditingNote = false
     public var noteDraft = "" {
@@ -212,7 +290,7 @@ public final class CompanionModel {
 
     /// Enters the highlighted session: it becomes the target and its thread comes back.
     public func enterHighlightedSession() {
-        if let id = highlightedSession { selectTarget(id) }
+        if let id = highlightedSession { pickSession(id) }
         closeSessionList()
     }
 
@@ -293,6 +371,12 @@ public final class CompanionModel {
     @ObservationIgnored private var activeSends: Set<String> = []
     /// The files that were held when the last hold was resolved.
     @ObservationIgnored private var resolvedFiles: [URL] = []
+    /// The session the user chose, as saved. The target can differ from it while Sidemoon picks one by itself.
+    @ObservationIgnored private var savedTarget: String?
+    /// The target was picked by Sidemoon, not by the user, and is not saved.
+    @ObservationIgnored private var targetIsAutomatic = false
+    /// The user chose a session or sent something in this run, so Sidemoon no longer picks one by itself.
+    @ObservationIgnored private var userHasActed = false
 
     public init(engine: CompanionEngine, capture: CaptureProvider, windowCapture: CaptureProvider? = nil,
                 store: CaptureStore = CaptureStore(), defaults: UserDefaults = .standard,
@@ -308,7 +392,12 @@ public final class CompanionModel {
         self.store = store
         self.defaults = defaults
         self.sleeper = sleeper
-        self.targetId = defaults.string(forKey: CompanionConstants.Defaults.targetSession)
+        let savedChoice = defaults.string(forKey: CompanionConstants.Defaults.targetSession)
+        self.targetId = savedChoice
+        self.savedTarget = savedChoice
+        self.isGuideOpen = !defaults.bool(forKey: CompanionConstants.Defaults.guideClosed)
+        self.visibleInRecordings = defaults.bool(forKey: CompanionConstants.Defaults.visibleInRecordings)
+        self.guide = GuideProgress(pickedSession: savedChoice != nil)
         self.showEnded = defaults.object(forKey: CompanionConstants.Defaults.showEndedSessions) as? Bool
             ?? CompanionConstants.Defaults.showEndedByDefault
         self.shortReplies = defaults.object(forKey: CompanionConstants.Defaults.shortReplies) as? Bool
@@ -388,6 +477,7 @@ public final class CompanionModel {
 
     private func reloadSessions() {
         sessions = engine.sessions()
+        chooseDefaultTarget()
         for s in sessions { if let r = s.lastReply { threads.appendReply(r, to: s.id, stamp: s.lastReplyAt) } }
         if let t = target {
             knownTargetReply = t.lastReply
@@ -399,6 +489,7 @@ public final class CompanionModel {
     /// One registry change, already on the main actor.
     func apply(_ session: Session) {
         if let i = sessions.firstIndex(where: { $0.id == session.id }) { sessions[i] = session } else { sessions.append(session) }
+        chooseDefaultTarget()
         // Every session's replies are kept, so its thread is there when the user switches to it.
         if let reply = session.lastReply {
             let before = threads.thread(for: session.id).count
@@ -426,13 +517,60 @@ public final class CompanionModel {
 
     // MARK: Target
 
+    /// Until the user chooses or sends, the target is the saved choice when it can be reached, else the most
+    /// recently active session that can. A pick of Sidemoon's own is not saved, so the user's choice comes
+    /// back as soon as that session shows up again.
+    private func chooseDefaultTarget() {
+        guard !userHasActed else { return }
+        let all = SessionList.rows(sessions, showEnded: true)
+        func reachable(_ id: String?) -> Bool { all.contains { $0.id == id && $0.reachable } }
+        if let saved = savedTarget, reachable(saved) {
+            if targetId != saved { switchTarget(to: saved, automatic: false) }
+            return
+        }
+        // Nothing listed yet, or already on a session that can be reached.
+        guard !all.isEmpty, !reachable(targetId), let pick = SessionList.defaultTarget(sessions), pick != targetId else { return }
+        switchTarget(to: pick, automatic: true)
+    }
+
+    /// The user's choice from the session list. A session Claude Code would refuse, or a terminal session started
+    /// without sidemoon-claude, does not become the target: the reason and what to do about it are shown instead.
+    public func pickSession(_ id: String) {
+        switch SessionList.rows(sessions, showEnded: true).first(where: { $0.id == id })?.reachability {
+        case let .blocked(blocker)?:
+            closeSessionList()
+            status.handle(.failed(.cannotReach(blocker, messageSaved: false, detail: nil)))
+        case .needsChannel?:
+            closeSessionList()
+            status.handle(.failed(.needsLauncher))
+        case .reachable?, nil:
+            selectTarget(id)
+        }
+    }
+
     public func selectTarget(_ id: String) {
+        userHasActed = true
+        tickGuide { $0.pickedSession = true }
+        if id == targetId, targetIsAutomatic {
+            // Choosing the session Sidemoon picked makes it the user's choice.
+            targetIsAutomatic = false
+            savedTarget = id
+            defaults.set(id, forKey: CompanionConstants.Defaults.targetSession)
+        }
         guard id != targetId else { return }
+        switchTarget(to: id, automatic: false)
+    }
+
+    private func switchTarget(to id: String, automatic: Bool) {
         // A capture held for the old target is never sent to the new one.
         discardHeldCapture()
         targetId = id
+        targetIsAutomatic = automatic
         unreadSessions.remove(id)
-        defaults.set(id, forKey: CompanionConstants.Defaults.targetSession)
+        if !automatic {
+            savedTarget = id
+            defaults.set(id, forKey: CompanionConstants.Defaults.targetSession)
+        }
         let s = target
         knownTargetReply = s?.lastReply
         knownTargetState = s?.state
@@ -492,6 +630,8 @@ public final class CompanionModel {
     /// Checks that a send could go anywhere before asking the user to drag a region.
     @discardableResult
     func preflight() -> Bool {
+        // Whatever happens next, the user is at work with the target they see: Sidemoon stops picking one.
+        userHasActed = true
         // One screenshot at a time: show what is in flight instead of starting another.
         // A capture being taken or waiting for its note keeps its turn. A message still on its way to
         // some session does not block anything: every session has its own lane.
@@ -638,8 +778,16 @@ public final class CompanionModel {
     public func send(imageAt url: URL, note: String?) async {
         defer { store.remove(url) }
         let typed = note.flatMap { $0.isEmpty ? nil : $0 }
-        await deliver(to: targetId, text: typed ?? CompanionConstants.Messages.defaultCaptureText, shown: typed ?? "", imagePath: url.path,
-                      files: [], attachments: [CompanionConstants.Messages.captureAttachmentName])
+        let sent = await deliver(to: targetId, text: typed ?? CompanionConstants.Messages.defaultCaptureText, shown: typed ?? "",
+                                 imagePath: url.path, files: [], attachments: [CompanionConstants.Messages.captureAttachmentName])
+        if sent { tickGuide { $0.sentCapture = true } }
+    }
+
+    /// A typed message to a session that has answered before is a reply: the guide's last step.
+    private func deliverTyped(to session: String?, _ text: String) async {
+        let isReply = threads.thread(for: session).contains { $0.role == .session }
+        let sent = await deliver(to: session, text: text, shown: text, imagePath: nil, files: [], attachments: [])
+        if sent, isReply { tickGuide { $0.replied = true } }
     }
 
     /// Sends a typed question or reply to the target and waits for its answer.
@@ -648,13 +796,13 @@ public final class CompanionModel {
         guard let session = targetId, let entry = threads.thread(for: session).first(where: { $0.id == id }),
               entry.canRetry, preflight() else { return }
         threads.remove(entry: id, in: session)
-        await deliver(to: session, text: entry.text, shown: entry.text, imagePath: nil, files: [], attachments: [])
+        await deliverTyped(to: session, entry.text)
     }
 
     public func sendMessage(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, preflight() else { return }
-        await deliver(to: targetId, text: trimmed, shown: trimmed, imagePath: nil, files: [], attachments: [])
+        await deliverTyped(to: targetId, trimmed)
     }
 
     /// Sends what is typed in the composer. The text is only cleared once the send has started, so a
@@ -664,7 +812,7 @@ public final class CompanionModel {
         guard !text.isEmpty, preflight() else { return }
         noteDraft = ""
         let session = targetId
-        Task { await deliver(to: session, text: text, shown: text, imagePath: nil, files: [], attachments: []) }
+        Task { await deliverTyped(to: session, text) }
     }
 
     /// Files dropped on the companion. They wait in the note window like an active-window capture:
@@ -712,11 +860,13 @@ public final class CompanionModel {
 
     /// One send to the target: recorded in the thread, delivered off the main thread, reply awaited.
     /// `shown` is what the thread displays, which is empty when only the default message went along.
+    /// Returns whether the message was delivered.
+    @discardableResult
     private func deliver(to session: String?, text: String, shown: String, imagePath: String?, files: [URL],
-                         attachments: [String]) async {
+                         attachments: [String]) async -> Bool {
         // The session this message is for was fixed by the caller: the user may switch to another one
         // while it travels, or even before this runs.
-        guard let targetId = session else { status.handle(.failed(.noTarget)); return }
+        guard let targetId = session else { status.handle(.failed(.noTarget)); return false }
         status.handle(.sendBegan)
         let entry = threads.append(ThreadEntry(role: .you, text: shown, attachments: attachments, delivery: .sending), to: targetId)
         inFlight[targetId, default: 0] += 1
@@ -755,13 +905,15 @@ public final class CompanionModel {
         } else {
             // A reply that is merely late still means the message arrived.
             let error = CompanionError.from(result)
-            threads.setDelivery(error == .replyTimeout ? .delivered : .failed(error.title), entry: entry, in: targetId)
+            let failed: ThreadEntry.Delivery = error.canRetry ? .failed(error.title) : .refused(error.title)
+            threads.setDelivery(error == .replyTimeout ? .delivered : failed, entry: entry, in: targetId)
         }
         sessions = engine.sessions()
         // The user moved to another session meanwhile: its thread has the outcome, and it is marked.
+        let delivered = result.ok || CompanionError.from(result) == .replyTimeout
         guard targetId == self.targetId else {
             unreadSessions.insert(targetId)
-            return
+            return delivered
         }
         if result.ok {
             if let reply = result.reply {
@@ -776,5 +928,6 @@ public final class CompanionModel {
         }
         // Another message to this session is still on its way.
         if (inFlight[targetId] ?? 0) > 1, !status.activity.isBusy, currentError == nil { status.activity = .sending }
+        return delivered
     }
 }

@@ -83,7 +83,8 @@ struct MascotView: View {
 
     var body: some View {
         let state = MascotState(model)
-        MascotFigure(state: state, countdown: model.noteCountdown, hovering: hover?.isHovering ?? false)
+        MascotFigure(state: state, countdown: model.noteCountdown, hovering: hover?.isHovering ?? false,
+                     attention: model.attentionRequests)
             // The badge sits on the lens's own corner; the panel around it is only clear room.
             .overlay(alignment: .topTrailing) {
                 if model.waitingCount > 0, !model.isExpanded { MascotBadge(count: model.waitingCount) }
@@ -100,7 +101,11 @@ struct MascotFigure: View {
     let state: MascotState
     let countdown: NoteCountdown?
     var hovering = false
+    /// Goes up when the mascot should pulse a few times so the eye finds it.
+    var attention = 0
     var side: CGFloat = Design.Mascot.drawnSize
+    /// Lit as under the pointer, for one beat of an attention pulse.
+    @State private var glowing = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pulse = 0
     /// Extra degrees the resting dot has travelled: one lap per hover.
@@ -120,10 +125,10 @@ struct MascotFigure: View {
                 .overlay(Circle().fill(RadialGradient(colors: [accent.opacity(m.tintOpacity), accent.opacity(m.tintOpacity / 4)],
                                                       center: .bottomTrailing, startRadius: 0, endRadius: disc)))
                 .overlay(shineBand(disc: disc).clipShape(Circle()))
-                .overlay(Circle().strokeBorder(hovering ? accent : Color(Design.Colors.mascotEdge), lineWidth: m.edgeStroke))
+                .overlay(Circle().strokeBorder(lit ? accent : Color(Design.Colors.mascotEdge), lineWidth: m.edgeStroke))
                 .frame(width: disc, height: disc)
                 .shadow(color: Color(Design.Colors.mascotShadow), radius: m.shadowRadius, y: m.shadowOffsetY)
-                .shadow(color: accent.opacity(hovering ? m.hoverGlowOpacity : 0), radius: m.hoverGlowRadius)
+                .shadow(color: accent.opacity(lit ? m.hoverGlowOpacity : 0), radius: m.hoverGlowRadius)
             orbit(u: u)
                 .keyframeAnimator(initialValue: CGFloat(1), trigger: pulse) { content, scale in
                     content.scaleEffect(scale)
@@ -137,8 +142,9 @@ struct MascotFigure: View {
             satellite(u: u)
         }
         .frame(width: side, height: side)
-        .scaleEffect(hovering && !reduceMotion ? m.hoverScale : 1)
-        .animation(.spring(duration: Design.Motion.base, bounce: 0.35), value: hovering)
+        .scaleEffect(lit && !reduceMotion ? m.hoverScale : 1)
+        .animation(.spring(duration: Design.Motion.base, bounce: 0.35), value: lit)
+        .onChange(of: attention) { pulseForAttention() }
         .onChange(of: state) { old, new in
             if new == .reply, old != .reply, !reduceMotion { pulse += 1 }
         }
@@ -147,6 +153,21 @@ struct MascotFigure: View {
             withAnimation(.easeInOut(duration: m.hoverLapDuration)) { hoverLap += 360 }
             shine = -1
             withAnimation(.easeOut(duration: m.shineDuration)) { shine = 1 }
+        }
+    }
+
+    private var lit: Bool { hovering || glowing }
+
+    /// Lights the lens and lets it go a few times in a row.
+    private func pulseForAttention() {
+        let m = Design.Mascot.self
+        Task { @MainActor in
+            for _ in 0..<m.attentionPulses {
+                withAnimation(.easeOut(duration: m.attentionPulseDuration)) { glowing = true }
+                try? await Task.sleep(for: .seconds(m.attentionPulseDuration))
+                withAnimation(.easeIn(duration: m.attentionPulseDuration)) { glowing = false }
+                try? await Task.sleep(for: .seconds(m.attentionPulseDuration))
+            }
         }
     }
 

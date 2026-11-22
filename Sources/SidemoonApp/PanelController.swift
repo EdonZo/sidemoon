@@ -25,7 +25,7 @@ final class CompanionPanel: NSPanel {
         hasShadow = true
         isMovable = false
         isReleasedWhenClosed = false
-        // Keep the companion out of the user's own screenshots.
+        // Keep the companion out of the user's own screenshots, unless the user asks otherwise (see `applySharing`).
         sharingType = .none
     }
 
@@ -238,6 +238,7 @@ final class PanelController {
         bubble.contentView = bubbleHost
 
         applyTheme()
+        applySharing()
         mascot.setFrame(restoredMascotFrame(), display: false)
         mascot.orderFrontRegardless()
         observeModel()
@@ -330,8 +331,10 @@ final class PanelController {
             _ = model.theme
             _ = model.isLarge
             _ = model.bubbleSize
+            _ = model.visibleInRecordings
         } onChange: { [weak self] in
             Task { @MainActor in
+                self?.applySharing()
                 self?.applyZoom()
                 self?.applyTheme()
                 if let self { self.setBubbleHeight(self.contentHeight) }
@@ -342,6 +345,31 @@ final class PanelController {
     }
 
     private var appliedZoom = Design.zoom
+
+    /// Hidden from screen recordings and screen sharing by default; shown, read-only, when the user turns it on.
+    private func applySharing() {
+        let sharing: NSWindow.SharingType = model.visibleInRecordings ? .readOnly : .none
+        for panel in [mascot, bubble] where panel.sharingType != sharing { panel.sharingType = sharing }
+    }
+
+    /// Brings the mascot back onto a screen the user can see (a display may have gone, or it was dragged off),
+    /// in front, with the bubble open beside it.
+    func reveal() {
+        let margin = CompanionConstants.Layout.edgeMargin
+        let frames = screenFrames
+        let onScreen = frames.contains { $0.intersects(mascot.frame) }
+        let main = NSScreen.main?.visibleFrame ?? mascot.frame
+        let target = onScreen
+            ? EdgeSnap.snapped(mascot.frame, in: visibleFrame(for: mascot.frame), margin: margin)
+            : EdgeSnap.defaultFrame(size: CompanionConstants.Layout.mascotSize, visible: main, margin: margin)
+        mascot.setFrame(target, display: true)
+        defaults.set(Double(target.minX), forKey: CompanionConstants.Defaults.mascotOriginX)
+        defaults.set(Double(target.minY), forKey: CompanionConstants.Defaults.mascotOriginY)
+        mascot.orderFrontRegardless()
+        model.openBubble()
+        placeBubble(mascotFrame: target)
+        bubble.orderFrontRegardless()
+    }
 
     /// A theme that is always dark or always light draws its panels that way whatever the system setting.
     func applyTheme() {

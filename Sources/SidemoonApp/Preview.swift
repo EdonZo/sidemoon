@@ -36,15 +36,48 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
         ]
     }()
 
+    /// Sessions Claude Code would not reopen, next to ones that are fine, for the greyed rows of the picker.
+    static let withUnreachable: [Session] = {
+        func make(_ suffix: String, _ name: String, _ cwd: String, _ blocker: ResumeBlocker?, age: TimeInterval) -> Session {
+            var s = Session(id: "00000000-0000-4000-8000-0000000001\(suffix)")
+            s.name = name
+            s.cwd = cwd
+            s.kind = .background
+            s.blocker = blocker
+            s.lastEventAt = Date().addingTimeInterval(-age)
+            return s
+        }
+        return [
+            session,
+            make("02", "api-server", "/Users/me/Projects/api-server", nil, age: 30),
+            make("03", "quick question", "/Users/me", .homeFolder, age: 60),
+            make("04", "billing-service", "/Users/me/Projects/billing-service", .loginNeeded, age: 90),
+            make("05", "design-notes", "/Users/me/Projects/design-notes", .noTranscript, age: 120),
+        ]
+    }()
+
     private let list: [Session]
-    init(sessions: [Session]) { list = sessions }
+    private let delay: TimeInterval
+    private let failure: DeliveryError?
+    /// `failure`: every send fails this way at once, with Claude Code's words as the detail.
+    init(sessions: [Session], delay: TimeInterval = PreviewEngine.answerDelay, failure: DeliveryError? = nil) {
+        list = sessions
+        self.delay = delay
+        self.failure = failure
+    }
 
     func start() throws -> EngineStartOutcome { .running }
     func stop() {}
     func sessions() -> [Session] { list }
     func subscribe(_ handler: @escaping @Sendable (Session) -> Void) {}
     func send(_ request: SendRequest) -> SendResult {
-        Thread.sleep(forTimeInterval: PreviewEngine.answerDelay)
+        if let failure {
+            var r = SendResult(ok: false, sessionId: request.session, route: .background, reply: nil,
+                               error: failure.description, detail: Preview.refusalDetail)
+            r.failure = failure
+            return r
+        }
+        Thread.sleep(forTimeInterval: delay)
         return SendResult(ok: true, sessionId: request.session, route: .channel, reply: "Team.", error: nil, detail: nil)
     }
 }
@@ -241,6 +274,7 @@ enum Preview {
                          dark: dark, to: dir.appendingPathComponent("setup-\(variant.rawValue)-\(suffix).png"))
             }
         }
+        renderReachability(to: dir)
         // Terminal is always dark, whatever the system.
         let theme = Design.theme
         Design.theme = .terminal
@@ -251,11 +285,108 @@ enum Preview {
         Design.theme = theme
     }
 
+    // MARK: Sessions that cannot be reached, and the guide
+
+    /// What Claude Code said, as the Details of a refused send show it.
+    nonisolated static let refusalDetail = "resume exited 1: Workspace not trusted. The home directory is trusted one session at a time."
+
+    /// The error cards, the greyed picker rows, the guide (fresh, half done, done) and the empty conversation,
+    /// in each theme. Paper is drawn light, Terminal dark, Mono both.
+    private static func renderReachability(to dir: URL) {
+        let looks: [(Design.Theme, Bool)] = [(.paper, false), (.terminal, true), (.mono, false), (.mono, true)]
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(directory: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        let session = PreviewEngine.session.id
+
+        /// A model on its own settings, so a preview never writes to the app's.
+        func model(_ engine: PreviewEngine, theme: Design.Theme, guide: Bool = false) -> CompanionModel {
+            let defaults = UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard
+            let m = CompanionModel(engine: engine, capture: ScreencaptureProvider(), store: scratch, defaults: defaults)
+            m.setTheme(theme)
+            m.startEngine()
+            if !guide { m.dismissGuide() }
+            m.openBubble()
+            return m
+        }
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(settleTime)) }
+
+        for (theme, dark) in looks {
+            let look = theme == .mono ? "mono-\(dark ? "dark" : "light")" : theme.rawValue
+
+            // Each refusal as the card shows it after a failed send.
+            let cases: [(String, ResumeBlocker, Bool, Bool)] = [
+                ("home", .homeFolder, true, true), ("untrusted", .untrustedFolder, false, true),
+                ("never-answered", .noTranscript, true, true), ("login", .loginNeeded, false, true),
+                ("install", .homeFolder, false, false),
+            ]
+            for (name, blocker, saved, installed) in cases {
+                let m = model(PreviewEngine(sessions: [PreviewEngine.session],
+                                            failure: .cannotResume(blocker, messageSaved: saved)), theme: theme)
+                m.terminalCommandInstalled = installed
+                m.selectTarget(session)
+                Task { await m.sendMessage("Which plan should I pick for a team of five?") }
+                settle()
+                bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("error-\(name)-\(look).png"))
+            }
+
+            // The picker with the sessions that cannot be reached greyed out.
+            let picking = model(PreviewEngine(sessions: PreviewEngine.withUnreachable), theme: theme)
+            picking.selectTarget(session)
+            picking.openSessionList()
+            bubbleSnapshot(picking, actions: noop, dark: dark, to: dir.appendingPathComponent("picker-unreachable-\(look).png"))
+            // Choosing one of them explains instead.
+            if let blocked = PreviewEngine.withUnreachable.first(where: { $0.blocker == .homeFolder }) {
+                picking.pickSession(blocked.id)
+                bubbleSnapshot(picking, actions: noop, dark: dark, to: dir.appendingPathComponent("picker-chose-unreachable-\(look).png"))
+            }
+
+            // The guide: nothing done, the session picked, everything done.
+            let fresh = model(PreviewEngine(sessions: [PreviewEngine.session], delay: 0), theme: theme, guide: true)
+            bubbleSnapshot(fresh, actions: noop, dark: dark, to: dir.appendingPathComponent("guide-fresh-\(look).png"))
+            fresh.selectTarget(session)
+            bubbleSnapshot(fresh, actions: noop, dark: dark, to: dir.appendingPathComponent("guide-half-\(look).png"))
+            let capture = scratch.newFileURL()
+            try? scratch.prepare()
+            try? Data([0x89, 0x50, 0x4E, 0x47]).write(to: capture)
+            Task {
+                await fresh.send(imageAt: capture, note: nil)
+                await fresh.sendMessage("Done, what next?")
+            }
+            settle()
+            bubbleSnapshot(fresh, actions: noop, dark: dark, to: dir.appendingPathComponent("guide-done-\(look).png"))
+
+            // The offer to move into Applications, and the same after a failed move.
+            let offer = MoveState()
+            snapshot(MoveView(state: offer, move: {}, notNow: {}), dark: dark, to: dir.appendingPathComponent("move-\(look).png"))
+            offer.problem = Design.Copy.Move.noWritableFolder
+            snapshot(MoveView(state: offer, move: {}, notNow: {}), dark: dark, to: dir.appendingPathComponent("move-failed-\(look).png"))
+
+            // Settings, with the screen recording switch.
+            let settings = model(PreviewEngine(sessions: [PreviewEngine.session]), theme: theme)
+            snapshot(SettingsView(model: settings)
+                .padding(.horizontal, Design.Space.bubbleHorizontal)
+                .padding(.vertical, Design.Space.bubbleVertical)
+                .frame(width: Design.Bubble.width)
+                .background(Color.paper), dark: dark, to: dir.appendingPathComponent("settings-recording-\(look).png"))
+
+            // A conversation with nothing in it yet.
+            var quiet = PreviewEngine.session
+            quiet.lastReply = nil
+            let empty = model(PreviewEngine(sessions: [quiet]), theme: theme)
+            empty.selectTarget(session)
+            bubbleSnapshot(empty, actions: noop, dark: dark, to: dir.appendingPathComponent("empty-\(look).png"))
+        }
+        Design.theme = .paper
+    }
+
     // MARK: Setup
 
     nonisolated static let helper = "/Applications/Sidemoon.app/Contents/Helpers/sidemoon"
 
-    enum SetupVariant: String, CaseIterable { case fresh, attention, done }
+    /// `diskImage`: opened straight from the disk image, so the steps that change things point to the move.
+    enum SetupVariant: String, CaseIterable { case fresh, attention, done, diskImage }
 
     private static func setupModel(_ variant: SetupVariant) -> SetupModel {
         let paths = SetupPaths(home: "/Users/me", channelConfig: "/Users/me/Library/Application Support/Sidemoon/channel-mcp.json",
@@ -273,11 +404,15 @@ enum Preview {
         case .done:
             files = [paths.launcher: launcher, paths.channelConfig: Data(ChannelServer.mcpConfig(executablePath: helper).utf8)]
             hooks = .ours
+        case .diskImage:
+            files = [:]
+            hooks = .none
         }
         let model = SetupModel(helper: .found(helper), paths: paths, finder: PreviewClaudeFinder(usual: variant != .attention),
                                hooks: PreviewHooks(mode: hooks), files: PreviewFiles(contents: files),
                                permission: PreviewPermission(granted: variant == .done), relauncher: PreviewRelauncher(),
-                               defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard)
+                               defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard,
+                               location: variant == .diskImage ? .diskImage("/Volumes/Sidemoon/Sidemoon.app") : .applications)
         if variant == .attention { model.requestCapture() }
         Task { await model.refresh() }
         return model

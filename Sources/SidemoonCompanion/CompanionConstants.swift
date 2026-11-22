@@ -53,8 +53,8 @@ public enum CompanionConstants {
         public static let legacyBundleIdentifier = "dev.tagalong.companion"
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
-        public static let version = "1.0.0"
-        public static let build = "4"
+        public static let version = "1.0.1"
+        public static let build = "5"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
@@ -72,6 +72,16 @@ public enum CompanionConstants {
         public static let bundleExtension = "app"
         /// A path with this in it is a quarantined app macOS runs from a temporary copy.
         public static let translocationMarker = "/AppTranslocation/"
+        /// A bundle inside one of these folders is a build of the source, never offered a move.
+        public static let developmentFolders: Set<String> = [".build", "dist"]
+        /// Where macOS mounts disk images.
+        public static let volumesFolder = "/Volumes"
+        public static let applicationsFolder = "/Applications"
+        /// The user's own Applications folder, inside the home folder.
+        public static let applicationsFolderName = "Applications"
+        /// The extended attribute macOS puts on downloads; taken off the copy in Applications so macOS does not run it
+        /// from a temporary copy again.
+        public static let quarantineAttribute = "com.apple.quarantine"
     }
 
     /// Automatic updates (Sparkle), for the notarized direct download.
@@ -151,6 +161,16 @@ public enum CompanionConstants {
         """
         /// The full note goes out again after this many tagged messages to the same session.
         public static let replyStyleNoteEvery = 10
+    }
+
+    /// The "Try it" guide.
+    public enum Guide {
+        /// The short video that shows Sidemoon in use.
+        public static let videoURL = "https://www.sidemoon.app"
+        /// What "Send a test message" sends: harmless, and asks for an answer short enough to read at a glance.
+        public static let testMessage = "This is a test message from Sidemoon. Please answer with one short sentence so I can see it arrived."
+        /// The shortcut the guide teaches.
+        public static let shortcut = HotKeys.captureActiveWindow
     }
 
     /// Finding local files named in an answer.
@@ -247,9 +267,14 @@ public enum CompanionConstants {
         public static let shortRepliesByDefault = true
         /// Set once the user pressed Start in the setup window; until then it opens on launch.
         public static let setupSeen = "setupSeen"
+        /// Set once the "Try it" guide was finished or hidden; it then only shows when asked for from the settings.
+        public static let guideClosed = "guideClosed"
+        /// The companion's panels show up in screen recordings and screen sharing. Off unless the user turns it on.
+        public static let visibleInRecordings = "visibleInRecordings"
         /// Every key above that holds a saved setting; these are carried over from the legacy domain once.
         public static let savedKeys = [
             theme, zoom, largeWindow, bubbleWidth, bubbleHeight, shortReplies, showEndedSessions, targetSession, mascotOriginX, mascotOriginY, setupSeen,
+            guideClosed, visibleInRecordings,
         ]
     }
 }

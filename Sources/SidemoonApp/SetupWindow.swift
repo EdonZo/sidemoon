@@ -29,13 +29,15 @@ struct SystemLoginItem: LoginItem {
 
 /// Starts a shell that waits for this process to exit and then opens the bundle again, then quits.
 struct BundleRelauncher: AppRelauncher {
+    /// The bundle to open: this one, or its new copy after a move to Applications.
+    var target = Bundle.main.bundlePath
     var canRelaunch: Bool { Bundle.main.bundleURL.pathExtension == CompanionConstants.App.bundleExtension }
 
     func relaunch() {
         let s = CompanionConstants.Setup.self
         let p = Process()
         p.executableURL = URL(fileURLWithPath: s.relaunchShell)
-        p.arguments = ["-c", s.relaunchScript, s.relaunchScriptName, String(getpid()), Bundle.main.bundlePath]
+        p.arguments = ["-c", s.relaunchScript, s.relaunchScriptName, String(getpid()), target]
         do { try p.run() } catch { return }
         NSApp.terminate(nil)
     }
@@ -50,7 +52,14 @@ extension SetupModel {
                                           isExecutable: { FileManager.default.isExecutableFile(atPath: $0) })
         return SetupModel(helper: helper, paths: .standard, finder: SystemClaudeFinder(), hooks: SystemHooksService(),
                           files: SystemSetupFiles(), permission: SystemScreenCapturePermission(),
-                          relauncher: BundleRelauncher(), defaults: defaults)
+                          relauncher: BundleRelauncher(), defaults: defaults, location: .current)
+    }
+}
+
+extension AppLocation {
+    /// Where this process runs from.
+    static var current: AppLocation {
+        AppLocator.locate(bundlePath: Bundle.main.bundlePath, home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 }
 
@@ -62,6 +71,10 @@ extension SetupModel {
 final class SetupWindowController: NSObject, NSWindowDelegate {
     let setup: SetupModel
     private let companion: CompanionModel
+    /// Runs after Start, once the window has closed.
+    var onStart: () -> Void = {}
+    /// The move to Applications, from the steps that wait for it.
+    var onMove: () -> Void = {}
     private var window: NSWindow?
     private var host: NSHostingView<AnyView>?
     private var timer: Timer?
@@ -120,7 +133,8 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(text, forType: .string)
             },
-            start: { [weak self] in self?.start() })) { [weak self] height in self?.fit(height) }
+            start: { [weak self] in self?.start() },
+            moveToApplications: { [weak self] in self?.onMove() })) { [weak self] height in self?.fit(height) }
             // A new size or theme redraws everything from the tokens.
             .id("\(companion.zoom)-\(companion.theme.rawValue)"))
     }
@@ -178,6 +192,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         if setup.offersOpenAtLogin { companion.setOpensAtLogin(setup.openAtLoginChoice) }
         setup.finish()
         window?.close()
+        onStart()
     }
 
     // MARK: NSWindowDelegate
@@ -201,6 +216,7 @@ struct SetupActions {
     var openURL: (URL) -> Void
     var copy: (String) -> Void
     var start: () -> Void
+    var moveToApplications: () -> Void = {}
 }
 
 /// The setup window's content, scrolling when the screen is short.
@@ -224,7 +240,7 @@ struct SetupView: View {
 struct SetupContent: View {
     let model: SetupModel
     let actions: SetupActions
-    @State private var copied = false
+    @State private var copied: String?
 
     private typealias C = Design.Copy.Setup
 
@@ -247,6 +263,9 @@ struct SetupContent: View {
             step(2, C.connectTitle, state: model.connectionState) {
                 paragraph(model.connectionDetail)
                 feedback(model.connectionFeedback)
+                if model.needsMove, model.connectionState != .done {
+                    buttons { primary(C.moveButton, action: actions.moveToApplications) }
+                }
                 if model.canConnect || model.hasHooks {
                     buttons {
                         if model.canConnect {
@@ -273,7 +292,11 @@ struct SetupContent: View {
                 paragraph(C.terminalWhy)
                 paragraph(model.terminalDetail)
                 feedback(model.terminalFeedback)
-                if model.terminal == .installed { command }
+                if model.terminal == .installed {
+                    command(model.launcherCommand)
+                    paragraph(C.terminalResume)
+                    command(model.launcherResumeCommand)
+                }
                 if let warning = model.pathWarning { paragraph(warning) }
                 paragraph(C.terminalPreview)
                 if model.canInstallLauncher {
@@ -379,10 +402,10 @@ struct SetupContent: View {
         .buttonStyle(PressStyle())
     }
 
-    /// The command to type in a terminal, with a copy button.
-    private var command: some View {
+    /// A command to type in a terminal, with a copy button.
+    private func command(_ text: String) -> some View {
         HStack(spacing: Design.Space.m) {
-            Text(model.launcherCommand)
+            Text(text)
                 .font(.code)
                 .foregroundStyle(Color.ink)
                 .textSelection(.enabled)
@@ -390,14 +413,14 @@ struct SetupContent: View {
                 .truncationMode(.middle)
             Spacer(minLength: Design.Space.m)
             Button {
-                actions.copy(model.launcherCommand)
-                copied = true
+                actions.copy(text)
+                copied = text
                 Task {
                     try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
-                    copied = false
+                    if copied == text { copied = nil }
                 }
             } label: {
-                ReadoutText(copied ? Design.Copy.copied : Design.Copy.copy, color: copied ? .signal : .ink)
+                ReadoutText(copied == text ? Design.Copy.copied : Design.Copy.copy, color: copied == text ? .signal : .ink)
                     .padding(.horizontal, Design.Space.m)
                     .frame(height: Design.Bubble.pillHeight)
                     .overlay(RoundedRectangle(cornerRadius: Design.Radius.control).strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
@@ -416,6 +439,7 @@ struct SetupContent: View {
                 .font(.text(Design.TypeScale.h2, weight: .semibold))
                 .foregroundStyle(Color.ink)
             paragraph(C.readyExplain)
+            paragraph(C.whereItSits)
             VStack(alignment: .leading, spacing: Design.Space.m) {
                 shortcut(CompanionConstants.HotKeys.captureActiveWindow, Design.Copy.shortcutActiveWindow)
                 shortcut(CompanionConstants.HotKeys.capture, Design.Copy.shortcutRegion)
@@ -432,6 +456,8 @@ struct SetupContent: View {
                         }
                     }
                     .buttonStyle(PressStyle())
+                } else if model.needsMove {
+                    paragraph(C.openAtLoginAfterMove)
                 }
                 Spacer()
                 primary(C.start, action: actions.start)

@@ -14,7 +14,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var signalSources: [DispatchSourceSignal] = []
     private var keyMonitor: Any?
     private var setupWindow: SetupWindowController?
+    private var moveWindow: MoveWindowController?
     private var connectionTimer: Timer?
+    /// Where this copy runs from: outside Applications it offers to move there and changes nothing outside itself.
+    private let location = AppLocation.current
+    /// Another copy was already running and was asked to show itself; this one quits without touching anything.
+    private var handingOff = false
 
     /// Tells the companion whether the hooks are in place, so it can say when answers cannot come back.
     private func syncConnection() {
@@ -26,16 +31,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // even after Start was pressed, since a permission can be lost later (a reset, or a new bundle id).
         let pending = !setup.requiredStepsDone
         if model.setupPending != pending { model.setupPending = pending }
+        // Decides whether an error offers the resume command or the way to install it.
+        let installed = setup.terminal == .installed
+        if model.terminalCommandInstalled != installed { model.terminalCommandInstalled = installed }
     }
 
     /// Opens the setup window (first launch, the menu, the settings).
     private func showSetup() {
-        let controller = setupWindow ?? SetupWindowController(setup: .system(), companion: model)
+        let controller = setupWindow ?? makeSetupWindow()
         setupWindow = controller
         controller.show()
     }
 
+    private func makeSetupWindow() -> SetupWindowController {
+        let controller = SetupWindowController(setup: .system(), companion: model)
+        // After Start: the companion opens beside the mascot, with the guide, and the mascot pulses.
+        controller.onStart = { [unowned self] in
+            model.presentAfterSetup()
+            panels.reveal()
+        }
+        controller.onMove = { [unowned self] in offerMove() }
+        return controller
+    }
+
+    /// The window offering to move Sidemoon into Applications. `then` runs if it stays where it is.
+    private func offerMove(then: @escaping () -> Void = {}) {
+        let controller = MoveWindowController { [weak self] in
+            self?.moveWindow = nil
+            then()
+        }
+        moveWindow = controller
+        controller.show()
+    }
+
+    /// Opening Sidemoon while it runs (a double-click in the Finder, Spotlight, or a second copy) brings the companion
+    /// back where it can be seen, and Setup when it is not finished. With no Dock icon or menu bar item, this is how a
+    /// lost companion is found.
+    private func showYourself() {
+        panels.reveal()
+        model.requestAttention()
+        if let setup = setupWindow?.setup, setup.shouldShowOnLaunch || !setup.requiredStepsDone { showSetup() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showYourself()
+        return false
+    }
+
+    /// A second copy started while one is running: the running one is asked to show itself, and this one quits.
+    private func handOffToRunningCopy() -> Bool {
+        guard let id = Bundle.main.bundleIdentifier,
+              let other = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+                .first(where: { $0.processIdentifier != getpid() && !$0.isTerminated }),
+              let url = other.bundleURL else { return false }
+        handingOff = true
+        // Opening a running app sends it the reopen event.
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        NSApp.terminate(nil)
+        return true
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if handOffToRunningCopy() { return }
         panels = PanelController(model: model) { [unowned self] in self.buildMenu() }
         panels.install(actions: BubbleActions(
             showMenu: { [unowned self] in panels.popUpMenu() },
@@ -50,9 +107,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             close: { [unowned self] in model.closeBubble() },
             dropFiles: { [unowned self] files in Task { await model.dropFiles(files) } },
-            openSetup: { [unowned self] in showSetup() }))
+            openSetup: { [unowned self] in showSetup() },
+            copyText: { text in
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            },
+            openURL: { NSWorkspace.shared.open($0) }))
 
-        model.loginItem = SystemLoginItem()
+        // A copy outside Applications never registers itself to open at login: the setting would point at it.
+        model.loginItem = location.maySetUp ? SystemLoginItem() : nil
         model.updater = SparkleUpdater()
         // Never shown (the app has no menu bar), but it is what makes Command-C and friends work in Setup.
         NSApp.mainMenu = EditShortcut.menu()
@@ -86,10 +149,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             signalSources.append(source)
         }
 
-        // Until the user pressed Start once, setup opens on launch.
-        let setup = SetupWindowController(setup: .system(), companion: model)
+        // Until the user pressed Start once, setup opens on launch; first, a copy outside Applications offers to move.
+        let setup = makeSetupWindow()
         setupWindow = setup
-        if setup.setup.shouldShowOnLaunch { setup.show() }
+        if location.offersMove {
+            offerMove { if setup.setup.shouldShowOnLaunch { setup.show() } }
+        } else if setup.setup.shouldShowOnLaunch {
+            setup.show()
+        }
         syncConnection()
         connectionTimer = Timer.scheduledTimer(withTimeInterval: CompanionConstants.Setup.connectionCheckInterval,
                                                repeats: true) { [weak self] _ in
@@ -98,6 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Handing off, nothing was started, and the running copy owns the saved conversations.
+        guard !handingOff else { return }
         hotKeys.unregisterAll()
         // A capture still waiting for its note is deleted, never left on disk.
         model.discardHeldCapture()

@@ -6,10 +6,21 @@ public enum Constants {
     // MARK: Files and sockets
 
     public enum Paths {
-        /// Engine state directory, created with owner-only permissions.
+        /// Engine state directory, created with owner-only permissions. Everything Sidemoon keeps derives from
+        /// it: the engine socket the hooks and the channel talk to, the channel config, saved conversations.
         public static var supportDirectory: URL {
-            FileManager.default.homeDirectoryForCurrentUser
+            if let override = supportDirectoryOverride { return URL(fileURLWithPath: override, isDirectory: true) }
+            return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(supportDirectoryInHome, isDirectory: true)
+        }
+        /// For the end-to-end tests only (scripts/e2e.sh), never set in normal use: an absolute folder that
+        /// replaces the support directory, so a test engine, its hooks and its channel use their own socket and
+        /// never reach the engine inside the running app.
+        public static let supportDirectoryOverrideVariable = "SIDEMOON_SUPPORT_DIR"
+        static var supportDirectoryOverride: String? {
+            guard let value = ProcessInfo.processInfo.environment[supportDirectoryOverrideVariable],
+                  PathPolicy.absolute(value) != nil else { return nil }
+            return value
         }
         /// The support directory relative to the home directory (the launcher script names it after `$HOME`).
         public static let supportDirectoryInHome = "Library/Application Support/Sidemoon"
@@ -68,6 +79,10 @@ public enum Constants {
         public static let messageHint = Data("\"message\":".utf8)
         /// An assistant message with one of these ended its turn; "tool_use" and a missing value did not.
         public static let turnEndingStopReasons: Set<String> = ["end_turn", "stop_sequence", "max_tokens", "refusal"]
+        /// Claude Code writes an error (a failed login, an API outage) as an assistant message with this flag set
+        /// and this model name. Such a message ended its turn but is not an answer.
+        public static let apiErrorKey = "isApiErrorMessage"
+        public static let syntheticModel = "<synthetic>"
     }
 
     // MARK: Limits and timeouts (seconds unless noted)
@@ -83,6 +98,11 @@ public enum Constants {
         public static let maxTranscriptTailBytes = 4 << 20
         /// Read first when only the last record matters; the full tail is the fallback.
         public static let turnProbeTailBytes = 256 << 10
+        /// Read from each end of a transcript to find a finished answer; a longer file whose ends hold none is
+        /// left undecided rather than read whole.
+        public static let answerProbeBytes = 256 << 10
+        /// Characters of `claude` output kept with a failure, for the Details a bug report can quote.
+        public static let failureDetailCharacters = 300
         public static let listenBacklog: Int32 = 16
     }
 
@@ -155,6 +175,17 @@ public enum Constants {
         public static let channelLaunchFlags = ["--mcp-config", "--dangerously-load-development-channels"]
         /// The value that follows the channel flag: the channel server's name.
         public static var channelLaunchValue: String { "server:\(Channel.serverName)" }
+    }
+
+    /// Claude Code's own words when `claude --resume <id> --bg` refuses to reopen a session, matched in
+    /// lower case. Checked in this order: the home-folder message also says "workspace not trusted".
+    public enum ResumeRefusal {
+        public static let homeFolderPhrases = ["home directory is trusted one session at a time"]
+        public static let noTranscriptPhrases = ["has no saved transcript", "stopped before its first response"]
+        public static let loginPhrases = ["login expired", "login required", "/login", "not signed in", "failed to authenticate"]
+        public static let untrustedFolderPhrases = ["workspace not trusted"]
+        /// Added when Claude Code kept the message to deliver the next time the session starts.
+        public static let messageSavedPhrases = ["your message is saved and will be delivered"]
     }
 
     // MARK: Hooks

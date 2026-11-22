@@ -209,6 +209,9 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
         older.lastEventAt = Date().addingTimeInterval(-600)
         var oldest = Session(id: "5a9e8a52-3f0e-4a8e-9d6f-2c7a1f6b9e06")
         oldest.lastEventAt = Date().addingTimeInterval(-1200)
+        // Reachable, so entering one makes it the target (a terminal session without the channel would not).
+        older.channelConnected = true
+        oldest.channelConnected = true
         model.apply(older)
         model.apply(oldest)
         model.openBubble()

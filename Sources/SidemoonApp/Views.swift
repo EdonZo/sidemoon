@@ -12,6 +12,9 @@ struct BubbleActions {
     var close: () -> Void
     var dropFiles: @MainActor @Sendable ([URL]) -> Void
     var openSetup: () -> Void = {}
+    /// Puts text on the clipboard (a command to paste in a terminal).
+    var copyText: (String) -> Void = { _ in }
+    var openURL: (URL) -> Void = { _ in }
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -35,6 +38,8 @@ struct BubbleView: View {
     @State private var bodyHeight: CGFloat = 0
     @State private var bottomHeight: CGFloat = 0
     @State private var dropTargeted = false
+    @State private var showsErrorDetail = false
+    @State private var commandCopied = false
 
     /// Marks the bottom of the thread, where the newest entry is.
     static let newestID = "newest"
@@ -299,38 +304,148 @@ struct BubbleView: View {
 
     private func errorRow(_ error: CompanionError) -> some View {
         let needsSession = error == .noTarget || error == .unknownSession
+        let remedies = model.remedies(for: error)
+        let copy = Design.Copy.Unreachable.self
         return VStack(alignment: .leading, spacing: Design.Space.m) {
             HStack(alignment: .firstTextBaseline, spacing: Design.Space.m) {
                 Circle().fill(Color.problem)
                     .frame(width: Design.Bubble.errorDot, height: Design.Bubble.errorDot)
                     .alignmentGuide(.firstTextBaseline) { $0[.bottom] + Design.Space.xxs }
-                VStack(alignment: .leading, spacing: Design.Space.xxs) {
-                    Text(error.title)
-                        .font(.text(Design.TypeScale.body, weight: .semibold))
-                        .foregroundStyle(Color.ink)
-                    Text(error.advice)
-                        .font(.proseSmall)
+                VStack(alignment: .leading, spacing: Design.Space.s) {
+                    VStack(alignment: .leading, spacing: Design.Space.xxs) {
+                        Text(error.title)
+                            .font(.text(Design.TypeScale.body, weight: .semibold))
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(error.advice)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.mute)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                    if remedies.contains(.runLogin) {
+                        Text(copy.runLogin)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if remedies.contains(.copyResumeCommand) { CommandText(text: model.resumeCommand) }
+                    if remedies.contains(.installTerminalCommand) {
+                        Text(copy.installCommandNote)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            // Side by side when they fit, one under the other when they do not (a narrow or zoomed window).
+            // Dismiss goes on a line of its own before the next steps are split up.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Design.Space.s) {
+                    remedyButtons(remedies)
+                    dismissButton(remedies, needsSession: needsSession)
+                }
+                VStack(alignment: .leading, spacing: Design.Space.s) {
+                    HStack(spacing: Design.Space.s) { remedyButtons(remedies) }
+                    dismissButton(remedies, needsSession: needsSession)
+                }
+                VStack(alignment: .leading, spacing: Design.Space.s) {
+                    remedyButtons(remedies)
+                    dismissButton(remedies, needsSession: needsSession)
+                }
+            }
+            if let detail = error.detail, !detail.isEmpty {
+                Button { showsErrorDetail.toggle() } label: {
+                    HStack(spacing: Design.Space.xs) {
+                        Image(systemName: showsErrorDetail ? "chevron.down" : "chevron.right")
+                            .font(.system(size: Design.Bubble.chipIcon, weight: .semibold))
+                            .foregroundStyle(Color.mute)
+                        ReadoutText(showsErrorDetail ? copy.hideDetails : copy.details)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                if showsErrorDetail {
+                    Text(detail)
+                        .font(.system(size: Design.TypeScale.code, design: .monospaced))
                         .foregroundStyle(Color.mute)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
+                        .padding(Design.Space.m)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(Color.paper2))
                 }
             }
-            Button {
-                if needsSession { model.openSessionList() }
-                model.dismissError()
-            } label: {
-                Text(needsSession ? Design.Copy.noSession : Design.Copy.dismiss)
-                    .font(.text(Design.TypeScale.small, weight: .medium))
-                    .foregroundStyle(Color.paper)
-                    .padding(.horizontal, Design.Space.l)
-                    .frame(height: Design.Bubble.buttonHeight)
-                    .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(Color.ink))
-            }
-            .buttonStyle(PressStyle())
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, Design.Space.bubbleHorizontal)
         .padding(.vertical, Design.Space.bubbleVertical)
+        .onChange(of: error) { showsErrorDetail = false }
+    }
+
+    /// The error's next steps, the first one filled.
+    @ViewBuilder
+    private func remedyButtons(_ remedies: [Remedy]) -> some View {
+        let copy = Design.Copy.Unreachable.self
+        let actionable = remedies.filter { $0 != .runLogin }
+        ForEach(Array(actionable.enumerated()), id: \.element) { index, remedy in
+            switch remedy {
+            case .copyResumeCommand:
+                cardButton(commandCopied ? Design.Copy.copied : copy.copyCommand, primary: index == 0) {
+                    actions.copyText(model.resumeCommand)
+                    commandCopied = true
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
+                        commandCopied = false
+                    }
+                }
+                .help(copy.commandHelp)
+            case .installTerminalCommand:
+                cardButton(copy.installCommand, primary: index == 0) {
+                    actions.openSetup()
+                    model.dismissError()
+                }
+            case .chooseAnotherSession:
+                cardButton(copy.chooseAnother, primary: index == 0) {
+                    model.dismissError()
+                    model.openSessionList()
+                }
+            case .runLogin:
+                EmptyView()
+            }
+        }
+    }
+
+    /// Dismiss, or the way to a session when that is what is missing. Filled when there is nothing else to do.
+    @ViewBuilder
+    private func dismissButton(_ remedies: [Remedy], needsSession: Bool) -> some View {
+        let actionable = remedies.filter { $0 != .runLogin }
+        if actionable.isEmpty {
+            cardButton(needsSession ? Design.Copy.noSession : Design.Copy.dismiss, primary: true) {
+                if needsSession { model.openSessionList() }
+                model.dismissError()
+            }
+        } else {
+            cardButton(Design.Copy.dismiss, primary: false) { model.dismissError() }
+        }
+    }
+
+    /// A button in a card: filled with ink for the main step, outlined for the others.
+    private func cardButton(_ title: String, primary: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.text(Design.TypeScale.small, weight: .medium))
+                .foregroundStyle(primary ? Color.paper : Color.ink)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, Design.Space.l)
+                .frame(height: Design.Bubble.buttonHeight)
+                .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(primary ? Color.ink : Color.clear))
+                .overlay(RoundedRectangle(cornerRadius: Design.Radius.control)
+                    .strokeBorder(primary ? Color.clear : Color.line, lineWidth: Design.Bubble.hairline))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
     }
 
     /// A reminder with a way back into Setup. Shown until the hooks are installed (sessions can be seen and
@@ -368,6 +483,10 @@ struct BubbleView: View {
     private var content: some View {
         let thread = model.thread
         let working = model.isAwaitingReply
+        if model.showsGuide {
+            GuideCard(model: model, actions: actions)
+                .padding(.bottom, thread.isEmpty && !working ? 0 : Design.Bubble.entrySpacing)
+        }
         if !thread.isEmpty || working {
             // Only the recent end of a long conversation is drawn; the rest waits behind "earlier messages".
             let hidden = max(0, thread.count - shownEntries)
@@ -391,25 +510,196 @@ struct BubbleView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             // Another session starts again from its recent end.
             .onChange(of: model.targetId) { shownEntries = CompanionConstants.Thread.visibleEntries }
-        } else {
-            VStack(alignment: .leading, spacing: Design.Space.l) {
-                Text(model.targetId == nil ? Design.Copy.emptyNoSession : Design.Copy.empty)
+        } else if !model.showsGuide {
+            emptyState
+        }
+    }
+
+    /// A conversation with nothing in it yet: how to start one.
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: Design.Space.m) {
+            if model.targetId == nil {
+                Text(Design.Copy.emptyNoSession)
                     .font(.prose)
                     .foregroundStyle(Color.mute)
-                if model.targetId != nil {
-                    HStack(spacing: Design.Space.xs) {
-                        ForEach(Design.Copy.keycaps, id: \.self) { Keycap($0) }
-                        Text(Design.Copy.emptyHint(session: model.targetTitle))
-                            .font(.proseSmall)
-                            .foregroundStyle(Color.mute)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .padding(.leading, Design.Space.xs)
+                    .fixedSize(horizontal: false, vertical: true)
+                cardButton(Design.Copy.noSession, primary: true) { model.openSessionList() }
+            } else {
+                Text(Design.Copy.emptyThread(session: model.targetTitle))
+                    .font(.prose)
+                    .foregroundStyle(Color.ink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: Design.Space.xs) {
+                    ForEach(CompanionConstants.Guide.shortcut.symbols, id: \.self) { Keycap($0) }
+                    Text(Design.Copy.emptyShortcut)
+                        .font(.proseSmall)
+                        .foregroundStyle(Color.mute)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, Design.Space.xs)
+                }
+                Text(Design.Copy.emptyOrType)
+                    .font(.proseSmall)
+                    .foregroundStyle(Color.mute)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The "Try it" guide: three steps that tick off as the user does them, a test message, and the video.
+struct GuideCard: View {
+    @Bindable var model: CompanionModel
+    let actions: BubbleActions
+
+    var body: some View {
+        let g = Design.Copy.Guide.self
+        let progress = model.guide
+        VStack(alignment: .leading, spacing: Design.Space.l) {
+            HStack(spacing: Design.Space.m) {
+                ReadoutText(progress.isComplete ? g.doneHeading : g.heading, color: .signal)
+                ReadoutText(g.progress(progress.doneCount))
+                Spacer(minLength: 0)
+                Button(action: model.dismissGuide) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: Design.Bubble.chipIcon, weight: .semibold))
+                        .foregroundStyle(Color.mute)
+                        .frame(width: Design.Bubble.pillHeight, height: Design.Bubble.pillHeight)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .help(g.dismiss)
+            }
+            VStack(alignment: .leading, spacing: Design.Space.m) {
+                step(1, g.stepPick, done: progress.pickedSession) {
+                    if !progress.pickedSession {
+                        smallButton(g.pickButton) { model.openSessionList() }
                     }
                 }
+                step(2, g.stepSend, done: progress.sentCapture) {
+                    HStack(spacing: Design.Space.xs) {
+                        ForEach(CompanionConstants.Guide.shortcut.symbols, id: \.self) { Keycap($0) }
+                    }
+                }
+                step(3, g.stepReply, done: progress.replied) { EmptyView() }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            if progress.isComplete {
+                Button(action: model.dismissGuide) {
+                    Text(g.doneButton)
+                        .font(.text(Design.TypeScale.small, weight: .medium))
+                        .foregroundStyle(Color.paper)
+                        .padding(.horizontal, Design.Space.l)
+                        .frame(height: Design.Bubble.buttonHeight)
+                        .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(Color.ink))
+                }
+                .buttonStyle(PressStyle())
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: Design.Space.l) { testAndVideo }
+                    VStack(alignment: .leading, spacing: Design.Space.s) { testAndVideo }
+                }
+            }
+            Text(g.terminalNote)
+                .font(.proseSmall)
+                .foregroundStyle(Color.mute)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(Design.Bubble.entryPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous).fill(Color.paper2))
+        .overlay(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+            .strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
+    }
+
+    @ViewBuilder
+    private var testAndVideo: some View {
+        let g = Design.Copy.Guide.self
+        let canTest = model.targetId != nil
+        Button { Task { await model.sendTestMessage() } } label: {
+            Text(g.testMessageButton)
+                .font(.text(Design.TypeScale.small, weight: .medium))
+                .foregroundStyle(canTest ? Color.paper : Color.mute)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, Design.Space.l)
+                .frame(height: Design.Bubble.buttonHeight)
+                .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(canTest ? Color.ink : Color.paper2))
+        }
+        .buttonStyle(PressStyle())
+        .disabled(!canTest)
+        Button {
+            if let url = URL(string: CompanionConstants.Guide.videoURL) { actions.openURL(url) }
+        } label: {
+            HStack(spacing: Design.Space.xs) {
+                Image(systemName: "play.circle")
+                    .font(.system(size: Design.Bubble.iconSize, weight: .medium))
+                Text(g.video)
+                    .font(.text(Design.TypeScale.small, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .foregroundStyle(Color.signal)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
+    }
+
+    /// One step: its number, or a tick once done, and what to do.
+    private func step<Extra: View>(_ number: Int, _ text: String, done: Bool, @ViewBuilder extra: () -> Extra) -> some View {
+        HStack(alignment: .center, spacing: Design.Space.m) {
+            ZStack {
+                Circle()
+                    .fill(done ? Color.signal : Color.clear)
+                    .overlay(Circle().strokeBorder(done ? Color.clear : Color.line, lineWidth: Design.Bubble.hairline))
+                if done {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: Design.Guide.markIcon, weight: .bold))
+                        .foregroundStyle(Color.paper)
+                } else {
+                    Text("\(number)")
+                        .font(.system(size: Design.Guide.markIcon, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Color.mute)
+                }
+            }
+            .frame(width: Design.Guide.mark, height: Design.Guide.mark)
+            .accessibilityLabel(done ? Design.Copy.Guide.stepDone : "\(number)")
+            Text(text)
+                .font(.proseSmall)
+                .foregroundStyle(done ? Color.mute : Color.ink)
+                .strikethrough(done, color: Color.mute)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: Design.Space.s)
+            extra()
+        }
+    }
+
+    private func smallButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ReadoutText(title, color: .ink)
+                .padding(.horizontal, Design.Space.m)
+                .frame(height: Design.Bubble.pillHeight)
+                .overlay(RoundedRectangle(cornerRadius: Design.Radius.control).strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
+    }
+}
+
+/// A command to paste in a terminal, set in a quiet block and selectable.
+struct CommandText: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: Design.TypeScale.code, design: .monospaced))
+            .foregroundStyle(Color.ink)
+            .textSelection(.enabled)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .padding(.horizontal, Design.Space.m)
+            .padding(.vertical, Design.Space.s)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(Color.paper2))
     }
 }
 
@@ -436,7 +726,7 @@ struct ThreadEntryView: View, Equatable {
                 switch entry.delivery {
                 case .sending: ReadoutText(Design.Copy.sending, color: .signal)
                 case .queued: ReadoutText(Design.Copy.queued, color: .signal)
-                case .failed:
+                case .failed, .refused:
                     ReadoutText(Design.Copy.notDelivered, color: .problem)
                     if entry.canRetry, let onRetry {
                         Button(action: onRetry) {
@@ -481,7 +771,7 @@ struct ThreadEntryView: View, Equatable {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
-            if case let .failed(reason) = entry.delivery {
+            if let reason = entry.delivery.failureReason {
                 Text(reason).font(.proseSmall).foregroundStyle(Color.mute).fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -578,7 +868,7 @@ struct SessionPicker: View {
                 ForEach(rows) { row in
                     SessionRowView(row: row, selected: row.id == model.targetId, unread: model.unreadSessions.contains(row.id),
                                    highlighted: row.id == model.highlightedSession) {
-                        model.selectTarget(row.id)
+                        model.pickSession(row.id)
                         onPick()
                     }
                     .id(row.id)
@@ -650,6 +940,31 @@ struct SettingsView: View {
             }
             row(Design.Copy.setup) {
                 choice(Design.Copy.openSetup, selected: false, action: openSetup)
+            }
+            row(Design.Copy.guide) {
+                choice(Design.Copy.showGuide, selected: false) { model.showGuide() }
+            }
+            HStack(alignment: .top, spacing: Design.Space.s) {
+                ReadoutText(Design.Copy.recording).frame(width: Design.Bubble.settingsLabel, alignment: .leading)
+                VStack(alignment: .leading, spacing: Design.Space.xs) {
+                    Button { model.visibleInRecordings.toggle() } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: Design.Space.s) {
+                            Image(systemName: model.visibleInRecordings ? "checkmark.square.fill" : "square")
+                                .font(.system(size: Design.TypeScale.body, weight: .medium))
+                                .foregroundStyle(model.visibleInRecordings ? Color.signal : Color.mute)
+                            Text(Design.Copy.visibleInRecordings)
+                                .font(.proseSmall)
+                                .foregroundStyle(Color.ink)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressStyle())
+                    Text(Design.Copy.visibleInRecordingsNote)
+                        .font(.proseSmall)
+                        .foregroundStyle(Color.mute)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Rectangle().fill(Color.line).frame(height: Design.Bubble.hairline)
             VStack(alignment: .leading, spacing: Design.Space.m) {
@@ -737,11 +1052,12 @@ struct SessionRowView: View {
                 VStack(alignment: .leading, spacing: Design.Space.xxs) {
                     Text(row.title)
                         .font(.text(Design.TypeScale.body, weight: selected ? .semibold : .regular))
-                        .foregroundStyle(Color.ink)
+                        .foregroundStyle(row.reachable ? Color.ink : Color.mute)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if let folder = row.folder, folder != row.title { ReadoutText(folder).truncationMode(.middle) }
                 }
+                .opacity(row.reachable ? 1 : Design.Bubble.unreachableOpacity)
                 Spacer(minLength: Design.Space.m)
                 status
             }
@@ -761,10 +1077,12 @@ struct SessionRowView: View {
     /// Plain words for what the session is doing. A busy one is still fine to pick: messages wait for it.
     @ViewBuilder
     private var status: some View {
-        if unread {
+        if let blocker = row.blocker {
+            ReadoutText(Design.Copy.Unreachable.reason(blocker))
+        } else if unread {
             ReadoutText(Design.Copy.stateNewReply, color: .signal)
         } else if !row.reachable && !row.ended {
-            ReadoutText(Design.Copy.needsChannel)
+            ReadoutText(Design.Copy.Unreachable.noChannelReason)
         } else {
             switch row.state {
             case .working: ReadoutText(Design.Copy.working, color: .signal)
