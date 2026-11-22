@@ -54,7 +54,7 @@ public enum CompanionConstants {
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
         public static let version = "1.0.2"
-        public static let build = "6"
+        public static let build = "7"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
@@ -100,6 +100,16 @@ public enum CompanionConstants {
         public static let enableAutomaticChecksPlistKey = "SUEnableAutomaticChecks"
         /// True once the public key is filled in.
         public static var isConfigured: Bool { !publicEDKey.isEmpty }
+    }
+
+    /// Reopening a session in the Terminal app with one click: a small script file that Terminal runs.
+    public enum TerminalOpen {
+        /// Written in the support folder and opened; the Finder hands `.command` files to Terminal.
+        public static let scriptName = "open-session.command"
+        public static let scriptPermissions: Int16 = 0o700
+        public static let shebang = "#!/bin/sh"
+        /// A session id is letters, digits and dashes; anything else is left out and Claude Code lists the sessions.
+        public static let sessionIdCharacters = "0123456789abcdefABCDEF-"
     }
 
     /// The setup window.

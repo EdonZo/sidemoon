@@ -113,7 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSPasteboard.general.setString(text, forType: .string)
             },
             openURL: { NSWorkspace.shared.open($0) },
-            sendFeedback: { FeedbackSender.send($0) }))
+            sendFeedback: { FeedbackSender.send($0) },
+            openInTerminal: { TerminalOpener.open(sessionId: $0, folder: $1) }))
 
         // A copy outside Applications never registers itself to open at login: the setting would point at it.
         model.loginItem = location.maySetUp ? SystemLoginItem() : nil

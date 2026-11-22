@@ -17,6 +17,8 @@ struct BubbleActions {
     var openURL: (URL) -> Void = { _ in }
     /// Opens a report, filled in, for the user to send.
     var sendFeedback: (FeedbackRoute) -> Void = { _ in }
+    /// Opens the Terminal app with this session reopened through the launcher (session id, its folder).
+    var openInTerminal: (String?, String?) -> Void = { _, _ in }
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -331,7 +333,6 @@ struct BubbleView: View {
                             .foregroundStyle(Color.ink)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    if remedies.contains(.copyResumeCommand) { CommandText(text: model.resumeCommand) }
                     if remedies.contains(.installTerminalCommand) {
                         Text(copy.installCommandNote)
                             .font(.proseSmall)
@@ -393,15 +394,15 @@ struct BubbleView: View {
         ForEach(Array(actionable.enumerated()), id: \.element) { index, remedy in
             switch remedy {
             case .copyResumeCommand:
-                cardButton(commandCopied ? Design.Copy.copied : copy.copyCommand, primary: index == 0) {
-                    actions.copyText(model.resumeCommand)
+                cardButton(commandCopied ? copy.openedInTerminal : copy.openInTerminal, primary: index == 0) {
+                    actions.openInTerminal(model.targetId, model.target?.cwd)
                     commandCopied = true
                     Task { @MainActor in
                         try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
                         commandCopied = false
                     }
                 }
-                .help(copy.commandHelp)
+                .help(copy.openInTerminalHelp)
             case .installTerminalCommand:
                 cardButton(copy.installCommand, primary: index == 0) {
                     actions.openSetup()
