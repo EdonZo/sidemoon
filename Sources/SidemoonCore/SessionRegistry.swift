@@ -17,8 +17,12 @@ public final class SessionRegistry: @unchecked Sendable {
     private let answerProbe: @Sendable (_ sessionId: String, _ transcriptHint: String?) -> Bool?
     /// Sessions known to have finished an answer. A transcript only grows, so this never has to be undone.
     private var answered: Set<String> = []
-    /// The user's home folder, where Claude Code will not reopen a background session.
+    /// When each session last reported a UserPromptSubmit hook.
+    private var promptSubmittedAt: [String: Date] = [:]
+    /// The user's home folder, where Claude Code on some Macs will not reopen a background session.
     public let home: String
+    /// Whether this Mac's Claude Code has been seen refusing that.
+    public let homeFolderMemory: HomeFolderMemory
 
     private final class StopWaiter: @unchecked Sendable {
         let sessionId: String
@@ -39,11 +43,29 @@ public final class SessionRegistry: @unchecked Sendable {
                     agent.transcriptPath.flatMap(TranscriptReader.turnIsOpen(transcriptPath:))
                 },
                 answerProbe: @escaping @Sendable (String, String?) -> Bool? = { TranscriptReader.sessionHasAnswered($0, hint: $1) },
-                home: String = FileManager.default.homeDirectoryForCurrentUser.path) {
+                home: String = FileManager.default.homeDirectoryForCurrentUser.path,
+                homeFolderMemory: HomeFolderMemory = .inMemory()) {
         self.replyReader = replyReader
         self.turnProbe = turnProbe
         self.answerProbe = answerProbe
         self.home = home
+        self.homeFolderMemory = homeFolderMemory
+    }
+
+    /// Records whether Claude Code just refused (true) or reopened (false) a background session in the home
+    /// folder. Forgetting a refusal frees the home-folder sessions at once; a new refusal greys the other running
+    /// ones at the next listing (the refused session itself is marked by the engine).
+    public func homeFolderResume(refused: Bool) {
+        guard homeFolderMemory.set(refused: refused), !refused else { return }
+        let changed: [Session] = lock.withLock {
+            var changed: [Session] = []
+            for (id, s) in sessions where s.blocker == .homeFolder {
+                sessions[id]?.blocker = nil
+                changed.append(sessions[id] ?? s)
+            }
+            return changed
+        }
+        changed.forEach(emit)
     }
 
     /// Whether this session is in the middle of a turn right now.
@@ -64,6 +86,9 @@ public final class SessionRegistry: @unchecked Sendable {
     }
 
     public func session(_ id: String) -> Session? { lock.withLock { sessions[id.lowercased()] } }
+
+    /// When the session last reported a submitted prompt (its UserPromptSubmit hook).
+    public func lastPromptSubmit(_ sessionId: String) -> Date? { lock.withLock { promptSubmittedAt[sessionId.lowercased()] } }
 
     /// The session a Claude Code process currently hosts, according to its hooks.
     public func sessionId(forPid pid: Int32) -> String? { lock.withLock { pidToSession[pid] } }
@@ -125,13 +150,18 @@ public final class SessionRegistry: @unchecked Sendable {
                     if pidToSession[pid] == e.sessionId { pidToSession[pid] = nil }
                 } else {
                     // A /clear or resume inside the same process moves the binding to the new session.
-                    if let old = pidToSession[pid], old != e.sessionId { sessions[old]?.channelConnected = false }
+                    if let old = pidToSession[pid], old != e.sessionId {
+                        sessions[old]?.channelConnected = false
+                        sessions[old]?.channelDropped = false
+                    }
                     pidToSession[pid] = e.sessionId
                 }
             }
             switch e.eventName {
             case Constants.HookEvents.sessionStart: s.state = .idle
-            case Constants.HookEvents.userPromptSubmit: s.state = .working
+            case Constants.HookEvents.userPromptSubmit:
+                s.state = .working
+                promptSubmittedAt[e.sessionId] = e.receivedAt
             case Constants.HookEvents.stop:
                 // A session that ends right after its answer sends Stop and SessionEnd together, and the end
                 // can be applied first (reading the reply for Stop takes a moment). Ended stays ended; a
@@ -145,6 +175,7 @@ public final class SessionRegistry: @unchecked Sendable {
             case Constants.HookEvents.sessionEnd:
                 s.state = .ended
                 s.channelConnected = false
+                s.channelDropped = false
             default: break
             }
             sessions[e.sessionId] = s
@@ -202,7 +233,10 @@ public final class SessionRegistry: @unchecked Sendable {
                     // Only a running session is stopped before it is resumed, so only there does a missing
                     // answer matter beforehand: Claude Code reopens a stopped session that never answered.
                     let answered = s.state == .working || !a.isRunning ? nil : answeredNow[a.sessionId] ?? nil
-                    if let seen = ResumeCheck.blocker(cwd: s.cwd ?? a.cwd, home: home, answered: answered) {
+                    // The same goes for the home folder: a stopped one is left for Claude Code to judge, and
+                    // its answer is what keeps or clears the memory of a refusal.
+                    let homeRefused = a.isRunning && homeFolderMemory.refused
+                    if let seen = ResumeCheck.blocker(cwd: s.cwd ?? a.cwd, home: home, answered: answered, homeFolderRefused: homeRefused) {
                         s.blocker = seen
                     } else if s.blocker == .homeFolder || s.blocker == .noTranscript {
                         s.blocker = nil
@@ -217,19 +251,24 @@ public final class SessionRegistry: @unchecked Sendable {
         changed.forEach(emit)
     }
 
-    public func setChannel(sessionId: String, connected: Bool) {
+    /// `dropped`: a helper is bound to the session but Claude Code does not pass on what it sends (only when not
+    /// `connected`).
+    public func setChannel(sessionId: String, connected: Bool, dropped: Bool = false) {
+        let dropped = dropped && !connected
         let s: Session? = lock.withLock {
             guard var s = sessions[sessionId] else {
-                guard connected else { return nil }
+                guard connected || dropped else { return nil }
                 var fresh = Session(id: sessionId)
-                fresh.channelConnected = true
+                fresh.channelConnected = connected
+                fresh.channelDropped = dropped
                 fresh.kind = .interactive
                 sessions[sessionId] = fresh
                 return fresh
             }
-            guard s.channelConnected != connected else { return nil }
+            guard s.channelConnected != connected || s.channelDropped != dropped else { return nil }
             s.channelConnected = connected
-            if connected, s.kind == .unknown { s.kind = .interactive }
+            s.channelDropped = dropped
+            if connected || dropped, s.kind == .unknown { s.kind = .interactive }
             sessions[sessionId] = s
             return s
         }

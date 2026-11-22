@@ -83,6 +83,10 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
     /// `stoppedFirst`: Sidemoon had already stopped the running session when Claude Code refused, so it is
     /// left stopped (the cases the checks before stopping cannot see).
     case cannotResume(ResumeBlocker, messageSaved: Bool, stoppedFirst: Bool = false)
+    /// Claude Code does not pass on what Sidemoon's helper sends to this session: the process hosting it did not
+    /// load the helper as a channel (known from its flags, or because a delivery was confirmed by the helper and
+    /// then not picked up). `fallback`: the route a new attempt will take now, nil when there is none.
+    case channelIgnored(fallback: Route?)
 
     public var description: String {
         switch self {
@@ -101,6 +105,9 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
         case let .cannotResume(b, saved, stopped):
             return "cannot resume: \(b.description)" + (saved ? "; claude code saved the message for the session's next start" : "")
                 + (stopped ? "; sidemoon had stopped the running session before the resume was refused" : "")
+        case let .channelIgnored(fallback):
+            return "channel not picked up: the claude code process hosting this session does not pass on what the "
+                + "sidemoon channel sends; " + (fallback.map { "the next attempt uses the \($0.rawValue) route" } ?? "no other route reaches it")
         }
     }
 }
@@ -139,9 +146,11 @@ public enum ResumeCheck {
     }
 
     /// What would make a resume fail, from what can be seen without trying. `answered` is whether the
-    /// session has finished an answer (nil: unknown, which never blocks).
-    public static func blocker(cwd: String?, home: String, answered: Bool?) -> ResumeBlocker? {
-        if let cwd, isHomeFolder(cwd, home: home) { return .homeFolder }
+    /// session has finished an answer (nil: unknown, which never blocks). `homeFolderRefused`: Claude Code on
+    /// this Mac has refused to reopen a home-folder session (`HomeFolderMemory`). Only then does the home folder
+    /// block; on other Macs Claude Code reopens such sessions.
+    public static func blocker(cwd: String?, home: String, answered: Bool?, homeFolderRefused: Bool) -> ResumeBlocker? {
+        if homeFolderRefused, let cwd, isHomeFolder(cwd, home: home) { return .homeFolder }
         if answered == false { return .noTranscript }
         return nil
     }
@@ -158,6 +167,45 @@ public enum ResumeCheck {
         else if says(r.untrustedFolderPhrases) { blocker = .untrustedFolder }
         else { return nil }
         return (blocker, says(r.messageSavedPhrases))
+    }
+}
+
+/// Whether Claude Code on this Mac has refused to reopen a background session in the home folder. Some Macs
+/// refuse ("the home directory is trusted one session at a time"), others reopen such sessions, so nothing is
+/// assumed until a refusal is seen. Remembered in a file in the support directory, so it survives a restart;
+/// a later home-folder resume that works forgets it.
+public final class HomeFolderMemory: @unchecked Sendable {
+    private let lock = NSLock()
+    private let path: String?
+    private var value: Bool
+
+    /// Backed by a file; `path` nil keeps it in memory only (tests, and engines that do not own the support folder).
+    public init(path: String?) {
+        self.path = path
+        value = path.map { FileManager.default.fileExists(atPath: $0) } ?? false
+    }
+
+    public static func inMemory() -> HomeFolderMemory { HomeFolderMemory(path: nil) }
+    public static func supportFolder() -> HomeFolderMemory { HomeFolderMemory(path: Constants.Paths.homeFolderRefusalPath) }
+
+    public var refused: Bool { lock.withLock { value } }
+
+    /// Records what the last home-folder resume showed. Returns whether that changed what is remembered.
+    @discardableResult
+    public func set(refused: Bool) -> Bool {
+        lock.withLock {
+            guard value != refused else { return false }
+            value = refused
+            guard let path else { return true }
+            if refused {
+                let stamp = Data(ISO8601DateFormatter().string(from: Date()).utf8)
+                FileManager.default.createFile(atPath: path, contents: stamp,
+                                               attributes: [.posixPermissions: Constants.Permissions.stateFile])
+            } else {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            return true
+        }
     }
 }
 

@@ -97,6 +97,39 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         #expect(rows[1].blocker == nil)
     }
 
+    /// A session whose Sidemoon connection Claude Code does not pass on: a background one keeps its background
+    /// route and is listed normally; any other is greyed with that reason, not "started without sidemoon-claude".
+    @Test func droppedChannelIsDescribedTruthfully() {
+        var background = session(first, age: 1)
+        background.channelDropped = true
+        var terminal = session(second, age: 2, kind: .interactive)
+        terminal.channelDropped = true
+        let rows = SessionList.rows([background, terminal, session(third, age: 3, kind: .interactive)], showEnded: false)
+        #expect(rows.map(\.reachability) == [.reachable, .channelDropped, .needsChannel])
+        #expect(background.routes == [.background])
+        #expect(Design.Copy.Unreachable.notPickedUpReason != Design.Copy.Unreachable.noChannelReason)
+    }
+
+    @Test func messageNotPickedUpIsTypedAndRetried() {
+        var result = SendResult.failure(.channelIgnored(fallback: .background), sessionId: first, route: .channel)
+        result.detail = "raw"
+        let e = CompanionError.from(result)
+        #expect(e == .notPickedUp(fallback: .background))
+        #expect(e.canRetry)
+        #expect(e.remedies.isEmpty)
+        #expect(e.title == Design.Copy.Unreachable.notPickedUpTitle)
+        #expect(e.advice.hasPrefix(Design.Copy.Unreachable.notPickedUpWhy))
+        #expect(e.advice.contains("Retry"))
+        // Nothing else reaches it: Retry is still offered, and so is reopening it.
+        let stuck = CompanionError.from(SendResult.failure(.channelIgnored(fallback: nil), sessionId: first, route: .channel))
+        #expect(stuck == .notPickedUp(fallback: nil) && stuck.canRetry)
+        #expect(stuck.remedies == [.copyResumeCommand, .chooseAnotherSession])
+        #expect(stuck.advice != e.advice)
+        for text in [e.title, e.advice, stuck.advice] {
+            for word in ["channel", "mcp", "route", "pid"] { #expect(!text.lowercased().contains(word), "\(text): \(word)") }
+        }
+    }
+
     @Test func defaultTargetIsTheMostRecentReachableOne() {
         #expect(SessionList.defaultTarget([
             session(first, age: 1, blocker: .noTranscript),
@@ -172,6 +205,19 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         m.dismissError()
         m.pickSession(first)
         #expect(m.currentError == nil)
+    }
+
+    @Test func choosingASessionWhoseConnectionIsDroppedExplainsThat() {
+        let engine = FakeEngine()
+        var dropped = session(second, age: 9, kind: .interactive)
+        dropped.channelDropped = true
+        engine.list = [session(first, age: 1), dropped]
+        let (m, _) = model(engine)
+        m.startEngine()
+        m.openSessionList()
+        m.pickSession(second)
+        #expect(m.targetId == first)
+        #expect(m.currentError == .notPickedUp(fallback: nil))
     }
 
     /// A terminal session started with plain `claude` is known only from its hooks: no kind, no channel.

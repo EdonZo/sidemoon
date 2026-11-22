@@ -41,10 +41,11 @@ NOISE_LINES='^↳ (///|Testing Library|Target Platform)'
 # name|test function|needs the home-folder session|what it checks
 SCENARIOS='idle|idleBackgroundSession|no|Idle background session: answered, same session continued
 busy|busyBackgroundSession|no|Busy background session: the message waits its turn, then goes
-home|homeFolderSession|yes|Home-folder session: refused before any stop, still running, greyed
+home|homeFolderSession|yes|Home-folder session: answered here; refused before any stop where a refusal is remembered
 never-answered|neverAnsweredSession|no|Session stopped before its first answer: refused, untouched
 ended|endedSession|no|Ended session: resumed headlessly and answers
 channel|terminalChannelSession|no|Terminal session with the channel: delivered, never restarted
+mcp-without-channel|mcpWithoutChannel|no|Helper loaded without the channel flag: not claimed, a send fails fast
 attachments|imageAndFile|no|A capture with one word and a dropped text file reach the session
 retry|retryAfterFailure|yes|A failed send then Retry succeeds; no Retry for a refusal
 session-list|sessionListTruth|yes|Session list reachability matches what Claude Code says'
@@ -53,7 +54,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 list() {
     printf '%s\n' "$SCENARIOS" | while IFS='|' read -r name _ _ what; do
-        printf '  %-16s %s\n' "$name" "$what"
+        printf '  %-20s %s\n' "$name" "$what"
     done
 }
 

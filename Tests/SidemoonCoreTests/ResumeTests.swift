@@ -23,24 +23,72 @@ private func refusedOrStopped(_ runner: FakeRunner) -> Bool {
     runner.recorded.contains { $0.first == Constants.ClaudeCLI.stopCommand || $0.first == Constants.ClaudeCLI.resumeFlag }
 }
 
-private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answered: Bool? = true) -> Engine {
+private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answered: Bool? = true,
+                    memory: HomeFolderMemory = .inMemory()) -> Engine {
     let e = Engine(socketPath: "/tmp/unused-\(UUID().uuidString).sock", runner: runner,
-                   registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in answered }, home: home))
+                   registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in answered }, home: home,
+                                             homeFolderMemory: memory))
     e.refreshAgents()
     return e
 }
 
 @Suite struct ResumePreflightTests {
-    @Test func homeFolderSessionIsRefusedWithoutStopping() {
-        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "done", cwd: "/Users/someone"))
+    /// On a Mac where Claude Code reopens home-folder background sessions (seen on the owner's Mac with 2.1.330),
+    /// nothing is assumed: the session is listed as reachable and the message goes.
+    @Test func homeFolderSessionIsSentToUntilClaudeCodeRefusesOne() async {
+        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "done", cwd: "/Users/someone"),
+                                resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = engine(runner)
-        // The session list already knows, before anything is sent.
-        #expect(e.registry.session(listed)?.blocker == .homeFolder)
-        let r = e.send(SendRequest(session: listed, text: "hi"))
-        #expect(!r.ok)
-        #expect(r.failure == .cannotResume(.homeFolder, messageSaved: false))
-        #expect(r.route == .background)
-        #expect(!refusedOrStopped(runner))
+        #expect(e.registry.session(listed)?.blocker == nil)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+            runner.agentsJSON = agents(status: "busy", state: "working", cwd: "/Users/someone")
+        }
+        #expect(await e.sending(SendRequest(session: listed, text: "hi")).ok)
+        #expect(!e.registry.homeFolderMemory.refused)
+    }
+
+    /// Where Claude Code refuses one (seen on a user's MacBook), the refusal is remembered across restarts, the
+    /// next running home-folder session is refused before anything is stopped, and a home-folder resume that
+    /// works later forgets it.
+    @Test func homeFolderRefusalIsRememberedPreBlockedAndCleared() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-home-\(UUID().uuidString)").path
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let file = "\(folder)/\(Constants.Paths.homeFolderRefusalName)"
+        let home = "/Users/someone"
+
+        // 1. Refused by Claude Code after Sidemoon stopped the running session: remembered, on disk.
+        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "done", cwd: home), resumeOutput: Said.homeFolder, resumeStatus: 1)
+        let first = engine(runner, memory: HomeFolderMemory(path: file))
+        #expect(first.registry.session(listed)?.blocker == nil)
+        let refused = await first.sending(SendRequest(session: listed, text: "hi"))
+        #expect(refused.failure == .cannotResume(.homeFolder, messageSaved: true, stoppedFirst: true))
+        #expect(first.registry.homeFolderMemory.refused)
+        #expect(FileManager.default.fileExists(atPath: file))
+
+        // 2. After a restart: a running home-folder session is greyed and refused without being stopped.
+        let again = FakeRunner(agentsJSON: agents(status: "idle", state: "done", cwd: home))
+        let second = engine(again, memory: HomeFolderMemory(path: file))
+        #expect(second.registry.session(listed)?.blocker == .homeFolder)
+        let blocked = await second.sending(SendRequest(session: listed, text: "hi"))
+        #expect(blocked.failure == .cannotResume(.homeFolder, messageSaved: false))
+        #expect(blocked.detail?.contains("checked before stopping") == true)
+        #expect(!refusedOrStopped(again))
+
+        // 3. A stopped one is left to Claude Code; it reopens it, which clears the memory.
+        again.agentsJSON = agents(status: "idle", state: "done", running: false, cwd: home)
+        again.resumeOutput = "backgrounded · 0b8e8a52 · t\n"
+        second.refreshAgents()
+        #expect(second.registry.session(listed)?.blocker == nil)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { again.agentsJSON = agents(status: "busy", state: "working", cwd: home) }
+        #expect(await second.sending(SendRequest(session: listed, text: "hi")).ok)
+        #expect(!second.registry.homeFolderMemory.refused)
+        #expect(!FileManager.default.fileExists(atPath: file))
+        // Running home-folder sessions are no longer greyed.
+        again.agentsJSON = agents(status: "idle", state: "done", cwd: home)
+        second.refreshAgents()
+        #expect(second.registry.session(listed)?.blocker == nil)
+        #expect(!HomeFolderMemory(path: file).refused)
     }
 
     @Test func homeFolderIsComparedAsAPath() {

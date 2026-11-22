@@ -23,9 +23,13 @@ public enum CompanionError: Equatable, Sendable {
     case cannotReach(ResumeBlocker, messageSaved: Bool, stoppedFirst: Bool = false, detail: String?)
     /// A terminal session started with plain `claude`, without Sidemoon's channel: nothing can reach it.
     case needsLauncher
+    /// Claude Code did not pass on what Sidemoon's connection sent: the session runs in a process that does not
+    /// load it. `fallback`: the route Retry will take, nil when there is none.
+    case notPickedUp(fallback: Route?)
 
     public var title: String {
         switch self {
+        case .notPickedUp: return Design.Copy.Unreachable.notPickedUpTitle
         case let .cannotReach(blocker, _, _, _): return Design.Copy.Unreachable.title(blocker)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelTitle
         case .noTarget: return "No session chosen"
@@ -48,6 +52,7 @@ public enum CompanionError: Equatable, Sendable {
         case let .cannotReach(blocker, saved, stopped, _):
             return Design.Copy.Unreachable.advice(blocker, messageSaved: saved, stoppedFirst: stopped)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelAdvice
+        case let .notPickedUp(fallback): return Design.Copy.Unreachable.notPickedUpAdvice(retryGoesInBackground: fallback == .background)
         case .noTarget:
             return "Open the menu and choose which Claude Code session should get your screenshots."
         case .engineConflict:
@@ -80,7 +85,7 @@ public enum CompanionError: Equatable, Sendable {
 
     /// What the user can do about it, shown as buttons under the advice. Empty for most errors.
     public var remedies: [Remedy] {
-        if self == .needsLauncher { return [.copyResumeCommand, .chooseAnotherSession] }
+        if self == .needsLauncher || self == .notPickedUp(fallback: nil) { return [.copyResumeCommand, .chooseAnotherSession] }
         guard case let .cannotReach(blocker, _, _, _) = self else { return [] }
         switch blocker {
         case .homeFolder, .untrustedFolder: return [.copyResumeCommand, .chooseAnotherSession]
@@ -115,6 +120,7 @@ public enum CompanionError: Equatable, Sendable {
         case .unknownSession?: return .unknownSession
         case .replyTimeout?: return .replyTimeout
         case .forked?: return .forked
+        case let .channelIgnored(fallback)?: return .notPickedUp(fallback: fallback)
         default: return .delivery(result.error ?? "The engine did not say why.")
         }
     }
@@ -345,6 +351,9 @@ public enum Reachability: Equatable, Sendable {
     case reachable
     /// A terminal session started without Sidemoon's channel (plain `claude`, not `sidemoon-claude`).
     case needsChannel
+    /// Sidemoon's helper runs with the session, but Claude Code does not pass on what it sends, and no other
+    /// route reaches it.
+    case channelDropped
     /// A background session Claude Code would not reopen.
     case blocked(ResumeBlocker)
 }
@@ -381,7 +390,8 @@ public enum SessionList {
     public static func reachability(_ s: Session) -> Reachability {
         if s.channelConnected { return .reachable }
         if s.kind == .background, let blocker = s.blocker { return .blocked(blocker) }
-        return !s.routes.isEmpty || s.kind == .background ? .reachable : .needsChannel
+        if !s.routes.isEmpty || s.kind == .background { return .reachable }
+        return s.channelDropped ? .channelDropped : .needsChannel
     }
 
     /// The session to talk to when none is chosen: the most recently active one that can be reached.

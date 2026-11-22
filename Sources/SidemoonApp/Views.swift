@@ -15,6 +15,8 @@ struct BubbleActions {
     /// Puts text on the clipboard (a command to paste in a terminal).
     var copyText: (String) -> Void = { _ in }
     var openURL: (URL) -> Void = { _ in }
+    /// Opens a report, filled in, for the user to send.
+    var sendFeedback: (FeedbackRoute) -> Void = { _ in }
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -79,7 +81,7 @@ struct BubbleView: View {
                         Color.clear.frame(height: 0).id(BubbleView.topID)
                         Group {
                             if model.isShowingSettings {
-                                SettingsView(model: model, openSetup: actions.openSetup)
+                                SettingsView(model: model, openSetup: actions.openSetup, sendFeedback: actions.sendFeedback)
                             } else if model.isPickingSession {
                                 SessionPicker(model: model) { model.closeSessionList() }
                             } else {
@@ -888,6 +890,7 @@ struct SessionPicker: View {
 struct SettingsView: View {
     @Bindable var model: CompanionModel
     var openSetup: () -> Void = {}
+    var sendFeedback: (FeedbackRoute) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Design.Space.xl) {
@@ -974,6 +977,12 @@ struct SettingsView: View {
                 shortcut(CompanionConstants.HotKeys.captureWithNote, Design.Copy.shortcutRegionNote)
             }
             Rectangle().fill(Color.line).frame(height: Design.Bubble.hairline)
+            row(Design.Copy.Feedback.title) {
+                choice(Design.Copy.Feedback.onGitHub, selected: false) { sendFeedback(.gitHub) }
+                    .help(Design.Copy.Feedback.onGitHubHelp)
+                choice(Design.Copy.Feedback.byEmail, selected: false) { sendFeedback(.email) }
+                    .help(Design.Copy.Feedback.byEmailHelp)
+            }
             // The normal terminate path, so applicationWillTerminate saves the conversations first.
             row(Design.Copy.app) {
                 choice(Design.Copy.menuQuit, selected: false) { NSApp.terminate(nil) }
@@ -1081,6 +1090,8 @@ struct SessionRowView: View {
             ReadoutText(Design.Copy.Unreachable.reason(blocker))
         } else if unread {
             ReadoutText(Design.Copy.stateNewReply, color: .signal)
+        } else if row.reachability == .channelDropped {
+            ReadoutText(Design.Copy.Unreachable.notPickedUpReason)
         } else if !row.reachable && !row.ended {
             ReadoutText(Design.Copy.Unreachable.noChannelReason)
         } else {

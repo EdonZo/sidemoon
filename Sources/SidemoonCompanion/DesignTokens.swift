@@ -486,6 +486,18 @@ public enum Design {
             /// The short reason such a session is greyed out in the session list.
             public static let noChannelReason = "Started without sidemoon-claude"
 
+            /// Sidemoon's connection to the session was confirmed, but Claude Code never took the message in: it
+            /// runs the session in a process that does not pass on what the connection sends.
+            public static let notPickedUpTitle = "Claude Code did not pick up the message"
+            public static let notPickedUpWhy = "It moved this session to the background, where the Sidemoon connection is not passed on."
+            public static func notPickedUpAdvice(retryGoesInBackground: Bool) -> String {
+                notPickedUpWhy + " " + (retryGoesInBackground
+                    ? "Retry sends it the way Sidemoon reaches background sessions: it restarts the session with your message."
+                    : "Nothing else reaches it while it runs there. Reopen it with the command below, then pick it again.")
+            }
+            /// The short reason such a session is greyed out in the session list.
+            public static let notPickedUpReason = "Sidemoon connection not passed on"
+
             /// The short reason a session is greyed out in the session list.
             public static func reason(_ blocker: ResumeBlocker) -> String {
                 switch blocker {

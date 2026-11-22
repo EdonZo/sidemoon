@@ -9,24 +9,36 @@ public final class Engine: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var channels: [Int32: ChannelLink] = [:]
 
+    /// How long an idle session has to show it picked up a channel delivery (`Constants.Timeouts.channelPickupWait`).
+    let pickupWait: TimeInterval
+
     final class ChannelLink: @unchecked Sendable {
         let conn: LineConnection
         let claudePid: Int32
         let envSessionId: String?
+        /// What the helper read from its parent's command line.
+        let role: ChannelRole
+        /// A delivery the helper confirmed was then not picked up: Claude Code ignores this helper.
+        var pickupFailed = false
         var boundSession: String?
         var pendingAcks: [String: DispatchSemaphore] = [:]
-        init(conn: LineConnection, claudePid: Int32, envSessionId: String?) {
+        /// Whether a message sent through it can reach the session. Unknown counts, guarded by the pick-up check.
+        var usable: Bool { role != .notChannel && !pickupFailed }
+        init(conn: LineConnection, claudePid: Int32, envSessionId: String?, role: ChannelRole) {
             self.conn = conn
             self.claudePid = claudePid
             self.envSessionId = envSessionId
+            self.role = role
         }
     }
 
     public init(socketPath: String = Constants.Paths.socketPath, runner: ClaudeRunner = SystemClaudeRunner(),
-                registry: SessionRegistry = SessionRegistry()) {
+                registry: SessionRegistry = SessionRegistry(homeFolderMemory: .supportFolder()),
+                pickupWait: TimeInterval = Constants.Timeouts.channelPickupWait) {
         self.socketPath = socketPath
         self.runner = runner
         self.registry = registry
+        self.pickupWait = pickupWait
     }
 
     // MARK: Lifecycle
@@ -89,7 +101,8 @@ public final class Engine: @unchecked Sendable {
         case Constants.Ops.channelHello:
             guard let pid = (msg["claudePid"] as? NSNumber)?.int32Value, pid > 1 else { return }
             let env = (msg["envSessionId"] as? String).flatMap { SessionID.isValid($0) ? $0.lowercased() : nil }
-            serveChannel(ChannelLink(conn: conn, claudePid: pid, envSessionId: env))
+            let role = (msg[Constants.Channel.roleKey] as? String).flatMap(ChannelRole.init(rawValue:)) ?? .unknown
+            serveChannel(ChannelLink(conn: conn, claudePid: pid, envSessionId: env, role: role))
         case Constants.Ops.sessions:
             if msg["refresh"] as? Bool == true { refreshAgents() }
             _ = conn.writeJSON(["ok": true, "sessions": encodeSessions(registry.snapshot())])
@@ -135,28 +148,32 @@ public final class Engine: @unchecked Sendable {
     /// Recomputes which session each channel serves. The binding key is the Claude Code process id:
     /// the channel reports its parent pid, hooks report CLAUDE_PID, so a /clear or resume inside the
     /// same process follows along. The env session id is only used until the first hook arrives.
+    /// A session counts as channel-connected only through a link that can reach it (`ChannelLink.usable`); one
+    /// with only links Claude Code ignores is marked as having its channel dropped instead.
     func syncChannels() {
-        var updates: [(String, Bool)] = []
-        lock.withLock {
-            var live = Set<String>()
+        // Session id -> whether any link bound to it is usable.
+        let bound: [String: Bool] = lock.withLock {
+            var bound: [String: Bool] = [:]
             for link in channels.values {
                 let now = registry.sessionId(forPid: link.claudePid) ?? link.envSessionId
-                if let old = link.boundSession, old != now { updates.append((old, false)) }
                 link.boundSession = now
-                if let now { live.insert(now) }
+                if let now { bound[now] = (bound[now] ?? false) || link.usable }
             }
-            for s in live { updates.append((s, true)) }
-            updates = updates.filter { !($0.1 == false && live.contains($0.0)) }
+            return bound
         }
-        updates.forEach { registry.setChannel(sessionId: $0.0, connected: $0.1) }
-        let connectedButUnbound = registry.snapshot().filter { s in
-            s.channelConnected && !lock.withLock { channels.values.contains { $0.boundSession == s.id } }
+        for (id, usable) in bound { registry.setChannel(sessionId: id, connected: usable, dropped: !usable) }
+        for s in registry.snapshot() where (s.channelConnected || s.channelDropped) && bound[s.id] == nil {
+            registry.setChannel(sessionId: s.id, connected: false)
         }
-        connectedButUnbound.forEach { registry.setChannel(sessionId: $0.id, connected: false) }
     }
 
+    /// A usable link bound to the session; one the hooks bind by its process id comes before one bound by the
+    /// helper's environment alone.
     private func channelLink(for sessionId: String) -> ChannelLink? {
-        lock.withLock { channels.values.first { $0.boundSession == sessionId } }
+        lock.withLock {
+            let candidates = channels.values.filter { $0.boundSession == sessionId && $0.usable }
+            return candidates.first { registry.sessionId(forPid: $0.claudePid) == sessionId } ?? candidates.first
+        }
     }
 
     // MARK: Sending
@@ -195,6 +212,12 @@ public final class Engine: @unchecked Sendable {
             session = fresh
             return sendViaBackground(session, image: image, files: files, text: outgoing, wait: req.wait)
         }
+        // Sidemoon's helper is there, but Claude Code does not pass on what it sends.
+        if registry.session(session.id)?.channelDropped == true {
+            var r = SendResult.failure(.channelIgnored(fallback: nil), sessionId: session.id, route: .channel)
+            r.detail = "a sidemoon helper is connected for this session, but its claude code process does not load it as a channel"
+            return r
+        }
         return .failure(.noRoute("session is \(session.state.rawValue) and has no Sidemoon channel connected; "
             + "the background route needs a `claude --bg` session and the headless route needs an ended session"),
             sessionId: session.id)
@@ -232,6 +255,7 @@ public final class Engine: @unchecked Sendable {
         }
         let ack = DispatchSemaphore(value: 0)
         lock.withLock { link.pendingAcks[deliveryId] = ack }
+        let sentAt = Date()
         let sent = link.conn.writeJSON(["op": Constants.Ops.channelDeliver, "id": deliveryId, "content": content,
                                         "meta": [Constants.Channel.deliveryIdMetaKey: deliveryId]])
         guard sent, ack.wait(timeout: .now() + Constants.Timeouts.channelDeliveryAck) == .success else {
@@ -239,7 +263,42 @@ public final class Engine: @unchecked Sendable {
             registry.cancelWait(token)
             return .failure(.channel("the channel server did not confirm delivery"), sessionId: s.id, route: .channel)
         }
+        // The helper only says it passed the message on; Claude Code may still ignore it (a process that did not
+        // load the helper as a channel). Waiting for a Stop would then take the whole reply timeout.
+        guard pickedUp(s.id, marker: deliveryId, since: sentAt) else {
+            registry.cancelWait(token)
+            lock.withLock { link.pickupFailed = true }
+            syncChannels()
+            let now = registry.session(s.id) ?? s
+            let fallback: Route? = now.kind == .background ? .background : now.routes.first
+            var r = SendResult.failure(.channelIgnored(fallback: fallback), sessionId: s.id, route: .channel)
+            r.detail = "the helper under claude pid \(link.claudePid) (channel role \(link.role.rawValue)) confirmed delivery \(deliveryId), "
+                + "but the session showed no sign of it within \(Int(pickupWait))s of being idle"
+            return r
+        }
         return finish(s.id, route: .channel, token: token, wait: wait, marker: deliveryId, detail: imagePath.map { "image at \($0)" })
+    }
+
+    /// Whether the session took in a channel delivery: its marker in the session's transcript, or a prompt
+    /// submitted to the session after the send. Seen with Claude Code 2.1.330: a channel message runs the
+    /// UserPromptSubmit hook at once and its marker is in the transcript within half a second. A
+    /// session that is mid-turn or waiting on a prompt takes the message only when that is over, so the wait
+    /// starts again while it is busy, up to the reply timeout.
+    private func pickedUp(_ sessionId: String, marker: String, since: Date) -> Bool {
+        let giveUp = since.addingTimeInterval(Constants.Timeouts.replyWait)
+        var idleSince = Date()
+        while Date() < giveUp {
+            let s = registry.session(sessionId)
+            if let path = s?.transcriptPath, TranscriptReader.contains(path, marker) { return true }
+            if let prompted = registry.lastPromptSubmit(sessionId), prompted >= since { return true }
+            if let state = s?.state, state == .working || state == .needsInput {
+                idleSince = Date()
+            } else if Date().timeIntervalSince(idleSince) >= pickupWait {
+                return false
+            }
+            Thread.sleep(forTimeInterval: Constants.Timeouts.pollInterval)
+        }
+        return false
     }
 
     private func finish(_ sessionId: String, route: Route, token: UUID, wait: Bool, marker: String?, detail: String?) -> SendResult {
@@ -278,7 +337,10 @@ public final class Engine: @unchecked Sendable {
         // A session that is already stopped is not stopped here, so Claude Code's own answer is safe to wait for;
         // it reopens a stopped session that never answered.
         let answered = a.isRunning ? registry.hasAnswered(s.id, transcriptHint: current.transcriptPath ?? a.transcriptPath) : nil
-        if let blocker = ResumeCheck.blocker(cwd: cwd, home: registry.home, answered: answered) {
+        // The home folder only blocks where Claude Code has refused it before, and only a running session.
+        let inHome = ResumeCheck.isHomeFolder(cwd, home: registry.home)
+        let homeRefused = a.isRunning && registry.homeFolderMemory.refused
+        if let blocker = ResumeCheck.blocker(cwd: cwd, home: registry.home, answered: answered, homeFolderRefused: homeRefused) {
             registry.setBlocker(sessionId: s.id, blocker)
             var r = SendResult.failure(.cannotResume(blocker, messageSaved: false), sessionId: s.id, route: .background)
             r.detail = "checked before stopping the session: \(blocker.description) (\(cwd))"
@@ -320,6 +382,8 @@ public final class Engine: @unchecked Sendable {
             let said = "resume exited \(r.status): \(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Constants.Limits.failureDetailCharacters))"
             // Claude Code's own reason, for the cases the checks above cannot see.
             if let refusal = ResumeCheck.classify(output) {
+                // Remembered for this Mac, so the next home-folder session is not stopped for nothing.
+                if refusal.blocker == .homeFolder { registry.homeFolderResume(refused: true) }
                 registry.setBlocker(sessionId: s.id, refusal.blocker)
                 var failed = SendResult.failure(.cannotResume(refusal.blocker, messageSaved: refusal.messageSaved,
                                                               stoppedFirst: stoppedFirst),
@@ -362,6 +426,8 @@ public final class Engine: @unchecked Sendable {
             r.detail = "claude output: \(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))"
             return r
         }
+        // Claude Code reopened a home-folder session here: a refusal remembered from before no longer holds.
+        if inHome { registry.homeFolderResume(refused: false) }
         return finish(s.id, route: .background, token: token, wait: wait, marker: nil, detail: imagePath.map { "image at \($0)" })
     }
 

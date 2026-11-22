@@ -543,6 +543,9 @@ public final class CompanionModel {
         case .needsChannel?:
             closeSessionList()
             status.handle(.failed(.needsLauncher))
+        case .channelDropped?:
+            closeSessionList()
+            status.handle(.failed(.notPickedUp(fallback: nil)))
         case .reachable?, nil:
             selectTarget(id)
         }

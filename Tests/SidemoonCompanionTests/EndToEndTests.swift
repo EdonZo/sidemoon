@@ -104,12 +104,75 @@ import Testing
 
     // MARK: 3
 
-    /// A background session in the home folder is refused before anything is done to it, and stays running.
+    /// A background session in the home folder. Claude Code on this Mac reopens one (seen with 2.1.330), so it is
+    /// listed as reachable and a message is answered. Where Claude Code has refused one before (remembered by the
+    /// engine; seen on a user's MacBook), a running one is greyed and refused before anything is done to it.
     @Test func homeFolderSession() async {
         await scenario("home") { fx in
             let home = try await homeSession(fx)
             let sid = home.sessionId
             let pidBefore = home.pid
+            let registry = SharedEngine.engine.engine.registry
+            #expect(!registry.homeFolderMemory.refused, "a fresh support folder remembers no refusal")
+
+            // 1. Nothing remembered: reachable, and the message is delivered and answered by the same session.
+            try await waitFor("the home-folder session to be listed as reachable", timeout: E2E.Timeout.listing,
+                              observed: { fx.describe(sid) }) {
+                fx.session(sid)?.kind == .background && fx.model.rows.first { $0.id == sid }?.reachability == .reachable
+            }
+            try fx.select(sid)
+            // A session in the home folder reads ~/.claude/settings.json as its project settings, so its hooks report
+            // to the installed app, never to the test engine. The runner stands in for its Stop hook: once the
+            // transcript holds the finished answer to this message, the test engine is told, as the hook would.
+            let prompt = E2E.Words.reply("HOMEWARD")
+            let transcript = home.transcriptPath ?? ""
+            let sentAt = Date()
+            let stopHook = Task.detached { () -> Bool in
+                let deadline = Date().addingTimeInterval(E2E.Timeout.firstAnswer)
+                while Date() < deadline, !Task.isCancelled {
+                    if TranscriptReader.turnIsOpen(transcriptPath: transcript) == false,
+                       TranscriptReader.finalTurnText(transcriptPath: transcript, promptId: nil, marker: prompt) != nil,
+                       let modified = (try? FileManager.default.attributesOfItem(atPath: transcript))?[.modificationDate] as? Date,
+                       modified > sentAt {
+                        let o: [String: Any] = ["session_id": sid, "hook_event_name": Constants.HookEvents.stop,
+                                                "transcript_path": transcript, "cwd": home.cwd ?? ""]
+                        guard let data = try? JSONSerialization.data(withJSONObject: o),
+                              let event = HookEvent(json: data, claudePid: nil) else { return false }
+                        SharedEngine.engine.engine.registry.apply(event)
+                        return true
+                    }
+                    try? await Task.sleep(for: .seconds(E2E.Timeout.poll))
+                }
+                return false
+            }
+            try await fx.send(prompt, to: sid)
+            stopHook.cancel()
+            e2eLog("[home] stood in for the Stop hook: \(await stopHook.value)")
+            let reply = fx.lastEntry(role: .session, of: sid)?.text ?? ""
+            e2eLog("[home] send: \(String(describing: fx.model.currentError)); reply \(reply.prefix(80)); "
+                + "refusal remembered: \(registry.homeFolderMemory.refused)")
+            if case let .cannotReach(blocker, _, _, detail)? = fx.model.currentError {
+                // Claude Code here has started refusing: the refusal must be remembered and the row greyed.
+                #expect(registry.homeFolderMemory.refused)
+                Issue.record("Claude Code on this Mac refused the home-folder session (\(blocker)): \(detail ?? "-")")
+                return
+            }
+            #expect(fx.model.currentError == nil, "error: \(String(describing: fx.model.currentError)); \(fx.describeThread(sid))")
+            #expect(fx.lastEntry(role: .you, of: sid)?.delivery == .delivered, "\(fx.describeThread(sid))")
+            #expect(reply.uppercased().contains("HOMEWARD"), "reply was: \(reply)")
+            #expect(!registry.homeFolderMemory.refused)
+            let resumed = await Task.detached { ClaudeCLI.agent(short: home.agentId) }.value
+            #expect(resumed?.sessionId == sid, "after: \(ClaudeCLI.describe(resumed))")
+            fx.model.dismissError()
+
+            // 2. A refusal remembered from before: greyed, explained, and refused before any stop.
+            try await waitForBlocking("the resumed home-folder session to finish its answer", timeout: E2E.Timeout.firstAnswer,
+                                      observed: { ClaudeCLI.describe(ClaudeCLI.agent(short: home.agentId)) }) {
+                ClaudeCLI.agent(short: home.agentId).map { $0.isRunning && $0.status != Constants.ClaudeCLI.busyStatus } ?? false
+            }
+            let pidRunning = await Task.detached { ClaudeCLI.agent(short: home.agentId) }.value?.pid
+            e2eLog("[home] running again as pid \(pidRunning.map(String.init) ?? "-") (was \(pidBefore.map(String.init) ?? "-"))")
+            fx.rememberHomeFolderRefusal()
             try await waitFor("the home-folder session to be greyed in the list", timeout: E2E.Timeout.listing,
                               observed: { fx.describe(sid) }) {
                 fx.model.rows.first { $0.id == sid }?.reachability == .blocked(.homeFolder)
@@ -135,7 +198,7 @@ import Testing
             let after = await Task.detached { ClaudeCLI.agent(short: home.agentId) }.value
             e2eLog("[home] after the refused send: \(ClaudeCLI.describe(after))")
             #expect(after?.isRunning == true, "the home-folder session is no longer running: \(ClaudeCLI.describe(after))")
-            #expect(after?.pid == pidBefore, "its process changed: \(pidBefore.map(String.init) ?? "-") -> \(ClaudeCLI.describe(after))")
+            #expect(after?.pid == pidRunning, "its process changed: \(pidRunning.map(String.init) ?? "-") -> \(ClaudeCLI.describe(after))")
             #expect(fx.model.rows.first { $0.id == sid }?.reachable == false)
         }
     }
@@ -270,16 +333,24 @@ import Testing
 
     // MARK: 6
 
+    /// An MCP config that loads the Sidemoon helper (by default the test build, run directly) on the test socket.
+    private func channelConfig(_ name: String, command: String = E2E.helper, args: [String] = [Constants.Channel.subcommand],
+                               env extra: [String: String] = [:]) throws -> String {
+        var env = [Constants.Paths.supportDirectoryOverrideVariable: Constants.Paths.supportDirectoryOverride ?? ""]
+        env.merge(extra) { $1 }
+        let config: [String: Any] = ["mcpServers": [Constants.Channel.serverName: ["command": command, "args": args, "env": env]]]
+        let path = "\(E2E.run)/\(name)-mcp.json"
+        try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: path))
+        return path
+    }
+
     /// A terminal session started with the channel gets the message through the channel; it is never restarted.
+    /// It also records what showed the engine that Claude Code picked the message up.
     @Test func terminalChannelSession() async {
         await scenario("channel") { fx in
-            let support = Constants.Paths.supportDirectoryOverride ?? ""
-            let config: [String: Any] = ["mcpServers": [Constants.Channel.serverName: [
-                "command": E2E.helper, "args": [Constants.Channel.subcommand],
-                "env": [Constants.Paths.supportDirectoryOverrideVariable: support]]]]
-            let configPath = "\(E2E.run)/channel-mcp.json"
-            try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
+            let configPath = try channelConfig("channel")
             let sid = UUID().uuidString.lowercased()
+            let events = HookLog(fx.guarded, sessionId: sid)
             let pty = try fx.startTerminal("channel", sessionId: sid, extraArgs: [
                 Constants.ClaudeCLI.channelLaunchFlags[0], configPath,
                 Constants.ClaudeCLI.channelLaunchFlags[1], Constants.ClaudeCLI.channelLaunchValue])
@@ -290,16 +361,109 @@ import Testing
             }
             e2eLog("[channel] connected; development-channels question answered: \(pty.asked(E2E.Terminal.developmentChannelsChoice))")
             #expect(fx.model.rows.first { $0.id == sid }?.reachable == true)
+            #expect(fx.session(sid)?.channelDropped == false)
             try fx.select(sid)
             #expect(fx.model.target?.routes.first == .channel)
+            // Watch the transcript for the delivery marker while the message travels.
+            let transcript = fx.session(sid)?.transcriptPath ?? ""
+            let sentAt = Date()
+            let marker = Task.detached { () -> TimeInterval? in
+                let deadline = Date().addingTimeInterval(Constants.Timeouts.replyWait)
+                while Date() < deadline, !Task.isCancelled {
+                    if TranscriptReader.contains(transcript, Constants.Channel.deliveryIdMetaKey) { return Date().timeIntervalSince(sentAt) }
+                    try? await Task.sleep(for: .seconds(E2E.Timeout.poll))
+                }
+                return nil
+            }
             try await fx.send(E2E.Words.reply("LEMON"), to: sid)
+            let took = Date().timeIntervalSince(sentAt)
+            marker.cancel()
+            let markerAfter = await marker.value
             let reply = fx.lastEntry(role: .session, of: sid)?.text ?? ""
+            e2eLog("[channel] answered after \(String(format: "%.1f", took))s; delivery marker in the transcript after "
+                + "\(markerAfter.map { String(format: "%.1f", $0) + "s" } ?? "never"); hooks after the send: \(events.since(sentAt))")
             #expect(fx.model.currentError == nil, "error: \(String(describing: fx.model.currentError)); screen: \(pty.tail)")
             #expect(reply.uppercased().contains("LEMON"), "reply was: \(reply); screen: \(pty.tail)")
+            // The sign the engine waits for: the marker shows up well within the pick-up wait.
+            #expect(markerAfter.map { $0 < Constants.Timeouts.channelPickupWait } == true, "marker after \(String(describing: markerAfter))")
             // Never restarted: the same process, still running, still this session, still on the channel.
             #expect(pty.isRunning && pty.pid == pid, "the terminal session's process ended or changed")
             #expect(fx.session(sid)?.channelConnected == true, "\(fx.describe(sid))")
             #expect(fx.session(sid)?.pid == pid, "hooks report pid \(fx.session(sid)?.pid.map(String.init) ?? "-"), started \(pid)")
+        }
+    }
+
+    // MARK: 6b
+
+    /// A terminal session started with only `--mcp-config`, as Claude Code starts the process that hosts a session
+    /// it moved to the background (seen on a user's MacBook). The helper runs and connects, but Claude Code ignores
+    /// what it pushes. Sidemoon must not claim the channel, and a send must never wait the full reply timeout.
+    /// Then the same with a helper that is misled into claiming a channel (its parent is a shell whose command
+    /// line names the channel flag): the pick-up check must catch it within the short wait.
+    @Test func mcpWithoutChannel() async {
+        await scenario("mcp-without-channel") { fx in
+            let mcpOnly = Constants.ClaudeCLI.channelLaunchFlags[0]
+            let replyWait = Constants.Timeouts.replyWait
+
+            // 1. The helper's parent is that process itself: it says it is not a channel.
+            let plain = UUID().uuidString.lowercased()
+            let plainPty = try fx.startTerminal("mcp-only", sessionId: plain, extraArgs: [mcpOnly, try channelConfig("mcp-only")])
+            try await waitFor("the helper to connect for the session", timeout: E2E.Timeout.terminalStart,
+                              observed: { "\(fx.describe(plain)); screen: \(plainPty.tail)" }) {
+                fx.session(plain)?.channelDropped == true
+            }
+            #expect(fx.session(plain)?.channelConnected == false, "\(fx.describe(plain))")
+            #expect(fx.model.rows.first { $0.id == plain }?.reachability == .channelDropped, "\(fx.describe(plain))")
+            try fx.select(plain)
+            let plainStart = Date()
+            try await fx.send(E2E.Words.reply("FIG"), to: plain)
+            let plainTook = Date().timeIntervalSince(plainStart)
+            e2eLog("[mcp-without-channel] not a channel: \(String(describing: fx.model.currentError)) after \(String(format: "%.1f", plainTook))s; "
+                + "\(fx.describeThread(plain))")
+            #expect(plainTook < replyWait / 10, "took \(plainTook)s")
+            if fx.lastEntry(role: .you, of: plain)?.delivery != .delivered {
+                #expect(fx.model.currentError == .notPickedUp(fallback: nil), "error: \(String(describing: fx.model.currentError))")
+            }
+            fx.model.dismissError()
+
+            // 2. A helper misled into claiming a channel; its session id comes from its environment, as the real
+            //    helper's does until a hook binds it.
+            let misled = UUID().uuidString.lowercased()
+            let wrapper = try channelConfig("mcp-misled", command: E2E.shell,
+                                            args: [E2E.shellCommandFlag, E2E.runHelperThenExit, E2E.helper,
+                                                   Constants.ClaudeCLI.channelLaunchFlags[1], Constants.ClaudeCLI.channelLaunchValue],
+                                            env: [Constants.Channel.sessionIdEnv: misled])
+            let misledPty = try fx.startTerminal("mcp-misled", sessionId: misled, extraArgs: [mcpOnly, wrapper])
+            try await waitFor("the misled helper to claim the session", timeout: E2E.Timeout.terminalStart,
+                              observed: { "\(fx.describe(misled)); screen: \(misledPty.tail)" }) {
+                fx.session(misled)?.channelConnected == true && fx.session(misled)?.lastEventName != nil
+            }
+            try fx.select(misled)
+            let misledStart = Date()
+            try await fx.send(E2E.Words.reply("DATE"), to: misled)
+            let misledTook = Date().timeIntervalSince(misledStart)
+            let failed = fx.lastEntry(role: .you, of: misled)
+            e2eLog("[mcp-without-channel] misled helper: \(String(describing: fx.model.currentError)) after "
+                + "\(String(format: "%.1f", misledTook))s; \(fx.describe(misled)); \(fx.describeThread(misled))")
+            #expect(misledTook < Constants.Timeouts.channelPickupWait + replyWait / 10, "took \(misledTook)s")
+            if failed?.delivery == .delivered {
+                // Claude Code took the push from a server it did not load as a channel: then it must be answered.
+                let reply = fx.lastEntry(role: .session, of: misled)?.text ?? ""
+                Issue.record("Claude Code picked up a push from a non-channel server; reply: \(reply)")
+                return
+            }
+            #expect(fx.model.currentError == .notPickedUp(fallback: nil), "error: \(String(describing: fx.model.currentError))")
+            #expect(failed?.canRetry == true, "\(fx.describeThread(misled))")
+            #expect(fx.session(misled)?.channelConnected == false && fx.session(misled)?.channelDropped == true, "\(fx.describe(misled))")
+            // Retry does not wait on that connection again.
+            let retryStart = Date()
+            if let id = failed?.id { await fx.model.retry(id) }
+            let retryTook = Date().timeIntervalSince(retryStart)
+            e2eLog("[mcp-without-channel] Retry: \(String(describing: fx.model.currentError)) after \(String(format: "%.1f", retryTook))s")
+            #expect(retryTook < Constants.Timeouts.channelPickupWait / 2, "Retry took \(retryTook)s")
+            #expect(fx.model.currentError == .notPickedUp(fallback: nil))
+            // Both sessions are still the processes the scenario started.
+            #expect(plainPty.isRunning && misledPty.isRunning)
         }
     }
 
@@ -371,8 +535,10 @@ import Testing
             #expect(!fx.model.threads.thread(for: sid).contains { $0.id == failedId }, "the failed entry is replaced")
             #expect(fx.model.threads.thread(for: sid).filter { $0.role == .you }.last?.delivery == .delivered)
 
-            // A refusal: no Retry, and asking for one sends nothing.
+            // A refusal: no Retry, and asking for one sends nothing. Claude Code on this Mac reopens home-folder
+            // sessions, so the refusal is the one remembered where it does not.
             let home = try await homeSession(fx)
+            fx.rememberHomeFolderRefusal()
             try fx.select(home.sessionId)
             try await fx.send(E2E.Words.reply("NO"), to: home.sessionId)
             let refused = fx.lastEntry(role: .you, of: home.sessionId)
@@ -389,6 +555,8 @@ import Testing
     @Test func sessionListTruth() async {
         await scenario("session-list") { fx in
             let home = try await homeSession(fx)
+            // As where Claude Code refuses home-folder sessions (this Mac's Claude Code reopens them).
+            fx.rememberHomeFolderRefusal()
             let (sid, short) = try await fx.startBackground("session-list", prompt: E2E.Words.readyPrompt)
             // A terminal session started with plain `claude`: no prompt is given, so it costs nothing.
             let plain = UUID().uuidString.lowercased()
