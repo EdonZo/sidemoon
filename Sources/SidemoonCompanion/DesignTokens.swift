@@ -231,6 +231,11 @@ public enum Design {
         /// The circle that holds a step's number or its tick.
         public static var mark: CGFloat { 18 * Design.zoom }
         public static var markIcon: CGFloat { 9 * Design.zoom }
+        /// The shortcut drawn large, while it is the one thing the guide asks for.
+        public static var heroKeycap: CGFloat { 44 * Design.zoom }
+        public static var heroKeycapText: CGFloat { 20 * Design.zoom }
+        public static var heroKeycapRadius: CGFloat { 10 * Design.zoom }
+        public static var heroTitle: CGFloat { 16 * Design.zoom }
     }
 
     /// The setup window.
@@ -528,6 +533,13 @@ public enum Design {
             public static let stepSend = "Send the window you are looking at"
             public static let stepReply = "Read the answer here and reply"
             public static let pickButton = "Choose session"
+            /// The one move, before anything else is explained.
+            public static let heroTitle = "Press this now, in any app"
+            public static func heroBody(session: String, seconds: Int) -> String {
+                "It sends the window you are looking at to \(session). You get \(seconds) seconds to type a note, "
+                    + "or press Return to send at once. The answer shows up here."
+            }
+            public static let heroNoSession = "First choose the session to talk to. Then press the keys above in any app."
             public static let testMessageButton = "Send a test message"
             public static let video = "Watch the 45-second video"
             public static let terminalNote = "A session you start in a terminal needs sidemoon-claude. Setup installs it."

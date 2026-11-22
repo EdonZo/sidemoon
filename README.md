@@ -1,8 +1,14 @@
 # Sidemoon
 
-A small floating companion for macOS that sends what is on your screen to a Claude Code session with one key, and shows the answer beside your work.
+Press Control-Option-A in any app: the window you are looking at goes to your Claude Code session, and the answer appears beside your work.
+
+Sidemoon is a small floating companion for macOS.
 
 ![Sidemoon: press Control-Option-A, the active window goes to a Claude Code session, and the answer appears next to the page](docs/demo.gif)
+
+**Watch a real task** (53 seconds, with narration): setting up an API key without leaving the page.
+
+[![Sidemoon tutorial: press Control-Option-A on a settings page and the answer says what to click](docs/tutorial-poster.jpg)](https://www.sidemoon.app/sidemoon-tutorial.mp4)
 
 Free and open source (MIT). Requires macOS 14 or later and [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview). Works with Claude Code only, for now.
 
