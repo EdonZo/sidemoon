@@ -63,6 +63,29 @@ public final class CompanionModel {
     public var setupPending = false
     /// The `sidemoon-claude` command from Setup's terminal step is installed. Set by the app.
     public var terminalCommandInstalled = true
+    /// Setup's "Connect every claude" is on, or cannot be offered here. Set by the app; while it is false, a session
+    /// started with plain `claude` offers turning it on.
+    public var connectsEveryClaude = true
+    /// What exists on disk: session folders, the launcher. The app passes the real checks.
+    @ObservationIgnored public let pathChecks: PathChecks
+    /// The launcher "Open in Terminal" runs.
+    @ObservationIgnored public var launcherPath = SetupPaths.standard.launcher
+    /// The session the shown error is about when the user picked it from the list without it becoming the target.
+    @ObservationIgnored private var errorSessionId: String?
+
+    /// The `claude` command "Open in Terminal" runs for a background session. The app passes where it found it.
+    @ObservationIgnored public var claudePath = Constants.Paths.claudeExecutableName
+
+    /// "Open in Terminal" on a session's row: a background session is attached to (`claude attach <short id>`),
+    /// Claude Code's own way to show one in a terminal; any other kind is reopened through the launcher as before.
+    public func terminalPlan(for id: String) -> TerminalReopen.Plan {
+        let session = sessions.first { $0.id == id }
+        if let session, session.kind == .background {
+            return TerminalReopen.attachPlan(shortId: session.agentId ?? SessionID.short(id), folder: session.cwd,
+                                             claude: claudePath, checks: pathChecks)
+        }
+        return TerminalReopen.plan(sessionId: id, folder: session?.cwd, launcher: launcherPath, checks: pathChecks)
+    }
 
     /// What reopens a session in a terminal through Sidemoon's channel, ready to paste.
     public var resumeCommand: String {
@@ -73,7 +96,22 @@ public final class CompanionModel {
     /// The next steps offered with an error. The resume command is only offered once it is installed;
     /// before that, the way to install it is.
     public func remedies(for error: CompanionError) -> [Remedy] {
-        error.remedies.map { $0 == .copyResumeCommand && !terminalCommandInstalled ? .installTerminalCommand : $0 }
+        var remedies = error.remedies.map { $0 == .copyResumeCommand && !terminalCommandInstalled ? .installTerminalCommand : $0 }
+        if error == .needsLauncher, !connectsEveryClaude, let last = remedies.indices.last {
+            // Before "Choose another session", which stays the last way out.
+            remedies.insert(.connectEveryClaude, at: last)
+        }
+        return remedies
+    }
+
+    /// "Open in Terminal" for the session the error is about: the script to open, or why not. A gone folder is
+    /// explained in place of the error; nothing is opened then.
+    public func reopenInTerminal() -> TerminalReopen.Plan {
+        let id = errorSessionId ?? targetId
+        let session = sessions.first { $0.id == id }
+        let plan = TerminalReopen.plan(sessionId: id, folder: session?.cwd, launcher: launcherPath, checks: pathChecks)
+        if case let .folderGone(folder) = plan { status.handle(.failed(.folderGone(folder))) }
+        return plan
     }
 
     // MARK: Guide
@@ -192,8 +230,14 @@ public final class CompanionModel {
     public var isAwaitingReply: Bool {
         switch status.activity {
         case .sending, .waiting: return true
-        default: return target?.state == .working
+        default: return targetIsWorking
         }
+    }
+    /// The target is working on an answer: it says so, or it is a session Sidemoon just started whose first answer
+    /// has not come yet.
+    public var targetIsWorking: Bool {
+        guard let targetId else { return false }
+        return target?.state == .working || awaitingFirstAnswer.contains(targetId)
     }
     public var showEnded: Bool {
         didSet { defaults.set(showEnded, forKey: CompanionConstants.Defaults.showEndedSessions) }
@@ -252,6 +296,7 @@ public final class CompanionModel {
     public func toggleLarge() { setLarge(!isLarge) }
 
     public func toggleSettings() {
+        guard closeNewSession() else { return }
         isShowingSettings.toggle()
         if isShowingSettings { closeSessionList() }
     }
@@ -264,6 +309,7 @@ public final class CompanionModel {
     public private(set) var highlightedSession: String?
 
     public func openSessionList() {
+        guard closeNewSession() else { return }
         isShowingSettings = false
         isPickingSession = true
         let ids = rows.map(\.id)
@@ -298,6 +344,13 @@ public final class CompanionModel {
     /// Up and Down move through it, Right or Return enters the highlighted one, Escape closes the list.
     /// Returns true when the key was used; otherwise it goes on to the text field as usual.
     public func navigate(_ key: NavigationKey) -> Bool {
+        if isCreatingSession {
+            // The form's fields take every other key; Escape leaves it (not while the session is starting).
+            if key == .escape { closeNewSession() }
+            return key == .escape
+        }
+        // Delete is for text, except on the session list while nothing is typed.
+        if key == .delete, !isPickingSession || !noteDraft.isEmpty { return false }
         if isShowingSettings {
             // Escape or Left leaves the settings; other keys do nothing there.
             if key == .escape || key == .left { closeSettings() }
@@ -310,6 +363,8 @@ public final class CompanionModel {
             case .right, .enter: enterHighlightedSession()
             case .escape: closeSessionList()
             case .left: break
+            case .delete:
+                if let id = highlightedSession, !hidden.contains(id) { hideSession(id) }
             }
             return true
         }
@@ -333,7 +388,8 @@ public final class CompanionModel {
         var ids = unreadSessions
         if status.unseenReply, let targetId { ids.insert(targetId) }
         for row in rows where row.state == .needsInput { ids.insert(row.id) }
-        return ids.count
+        // A hidden session does not count until it comes back by itself.
+        return ids.subtracting(hidden.ids).count
     }
     /// The user's size setting: 1 is the standard size.
     public private(set) var zoom: Double
@@ -380,8 +436,10 @@ public final class CompanionModel {
 
     public init(engine: CompanionEngine, capture: CaptureProvider, windowCapture: CaptureProvider? = nil,
                 store: CaptureStore = CaptureStore(), defaults: UserDefaults = .standard,
-                archive: ThreadArchive? = nil, sleeper: @escaping Sleeper = Sleepers.system) {
+                archive: ThreadArchive? = nil, sleeper: @escaping Sleeper = Sleepers.system,
+                pathChecks: PathChecks = .everythingExists) {
         self.engine = engine
+        self.pathChecks = pathChecks
         self.archive = archive
         if var saved = archive?.load() {
             saved.settleInterrupted(reason: Design.Copy.interruptedByRestart)
@@ -395,6 +453,7 @@ public final class CompanionModel {
         let savedChoice = defaults.string(forKey: CompanionConstants.Defaults.targetSession)
         self.targetId = savedChoice
         self.savedTarget = savedChoice
+        self.hidden = HiddenSessions(data: defaults.data(forKey: CompanionConstants.Defaults.hiddenSessions))
         self.isGuideOpen = !defaults.bool(forKey: CompanionConstants.Defaults.guideClosed)
         self.visibleInRecordings = defaults.bool(forKey: CompanionConstants.Defaults.visibleInRecordings)
         self.guide = GuideProgress(pickedSession: savedChoice != nil)
@@ -422,7 +481,9 @@ public final class CompanionModel {
 
     // MARK: Derived
 
-    public var rows: [SessionRow] { SessionList.rows(sessions, showEnded: showEnded) }
+    public var rows: [SessionRow] {
+        SessionList.rows(sessions, showEnded: showEnded, hidden: hidden.ids, showHidden: showHidden, checks: pathChecks)
+    }
     public var target: Session? { targetId.flatMap { id in sessions.first { $0.id == id } } }
     public var targetTitle: String {
         if let target { return SessionList.displayName(target) }
@@ -477,6 +538,7 @@ public final class CompanionModel {
 
     private func reloadSessions() {
         sessions = engine.sessions()
+        pruneHidden()
         chooseDefaultTarget()
         for s in sessions { if let r = s.lastReply { threads.appendReply(r, to: s.id, stamp: s.lastReplyAt) } }
         if let t = target {
@@ -488,15 +550,27 @@ public final class CompanionModel {
 
     /// One registry change, already on the main actor.
     func apply(_ session: Session) {
+        let previous = sessions.first { $0.id == session.id }
         if let i = sessions.firstIndex(where: { $0.id == session.id }) { sessions[i] = session } else { sessions.append(session) }
         chooseDefaultTarget()
         // Every session's replies are kept, so its thread is there when the user switches to it.
+        var newAnswer = false
         if let reply = session.lastReply {
             let before = threads.thread(for: session.id).count
             threads.appendReply(reply, to: session.id, stamp: session.lastReplyAt)
+            newAnswer = threads.thread(for: session.id).count > before
             // A fresh answer from a session the user is not looking at is marked for them.
-            if session.id != targetId, threads.thread(for: session.id).count > before { unreadSessions.insert(session.id) }
+            if session.id != targetId, newAnswer { unreadSessions.insert(session.id) }
         }
+        if hidden.contains(session.id) {
+            if HiddenSessions.revealsItself(before: previous, after: session, newAnswer: newAnswer) {
+                unhideSession(session.id)
+            } else {
+                pruneHidden()
+            }
+        }
+        // A session Sidemoon started: from here its own state, or its answer, says whether it is working.
+        if awaitingFirstAnswer.contains(session.id), newAnswer || session.state != .idle { awaitingFirstAnswer.remove(session.id) }
         guard session.id == targetId else { return }
         if session.state == .working, knownTargetState != .working { status.handle(.targetStartedWorking) }
         knownTargetState = session.state
@@ -522,21 +596,30 @@ public final class CompanionModel {
     /// back as soon as that session shows up again.
     private func chooseDefaultTarget() {
         guard !userHasActed else { return }
-        let all = SessionList.rows(sessions, showEnded: true)
+        let all = SessionList.rows(sessions, showEnded: true, hidden: hidden.ids, checks: pathChecks)
+        // A hidden session is not in `all`, so it never counts as reachable here.
         func reachable(_ id: String?) -> Bool { all.contains { $0.id == id && $0.reachable } }
         if let saved = savedTarget, reachable(saved) {
             if targetId != saved { switchTarget(to: saved, automatic: false) }
             return
         }
         // Nothing listed yet, or already on a session that can be reached.
-        guard !all.isEmpty, !reachable(targetId), let pick = SessionList.defaultTarget(sessions), pick != targetId else { return }
+        guard !all.isEmpty, !reachable(targetId),
+              let pick = SessionList.defaultTarget(sessions, hidden: hidden.ids, checks: pathChecks), pick != targetId else { return }
         switchTarget(to: pick, automatic: true)
     }
 
     /// The user's choice from the session list. A session Claude Code would refuse, or a terminal session started
     /// without sidemoon-claude, does not become the target: the reason and what to do about it are shown instead.
     public func pickSession(_ id: String) {
-        switch SessionList.rows(sessions, showEnded: true).first(where: { $0.id == id })?.reachability {
+        // Choosing a hidden session (listed while "Show hidden" is on) puts it back.
+        if hidden.contains(id) { unhideSession(id) }
+        let reachability = SessionList.rows(sessions, showEnded: true, checks: pathChecks).first(where: { $0.id == id })?.reachability
+        errorSessionId = reachability == .reachable || reachability == nil ? nil : id
+        switch reachability {
+        case .folderGone?:
+            closeSessionList()
+            status.handle(.failed(.folderGone(sessions.first { $0.id == id }?.cwd ?? "")))
         case let .blocked(blocker)?:
             closeSessionList()
             status.handle(.failed(.cannotReach(blocker, messageSaved: false, detail: nil)))
@@ -588,9 +671,209 @@ public final class CompanionModel {
         }
     }
 
+    /// No target: nothing is chosen, and nothing waits for one.
+    private func clearTarget() {
+        discardHeldCapture()
+        targetId = nil
+        targetIsAutomatic = true
+        knownTargetReply = nil
+        knownTargetState = nil
+        latestReply = nil
+        latestReplyAt = nil
+        status.unseenReply = false
+    }
+
+    // MARK: Hidden sessions
+
+    /// Sessions hidden from the list. Only Sidemoon's list changes: nothing is run against the session.
+    public private(set) var hidden: HiddenSessions
+    /// Hidden sessions are listed too, dimmed, each with Unhide. Not saved: hiding is the lasting choice.
+    public var showHidden = false
+    /// The session just hidden, while its Undo shows.
+    public private(set) var recentlyHidden: HiddenUndo?
+    @ObservationIgnored private var undoTask: Task<Void, Never>?
+
+    public var hiddenCount: Int { hidden.count }
+
+    private func saveHidden() {
+        if hidden.isEmpty {
+            defaults.removeObject(forKey: CompanionConstants.Defaults.hiddenSessions)
+        } else if let data = hidden.data {
+            defaults.set(data, forKey: CompanionConstants.Defaults.hiddenSessions)
+        }
+    }
+
+    /// Notes the hidden sessions Sidemoon still knows and forgets the long-gone ones; saved only when that changed.
+    private func pruneHidden() {
+        guard !hidden.isEmpty, hidden.prune(known: Set(sessions.map(\.id))) else { return }
+        saveHidden()
+    }
+
+    /// Hides a session from the list. Hiding the target moves the target to the default choice. "Undo" shows for
+    /// `Hidden.undoSeconds`.
+    public func hideSession(_ id: String) {
+        guard !hidden.contains(id) else { return }
+        let wasTarget = id == targetId
+        let rowIds = rows.map(\.id)
+        recentlyHidden = HiddenUndo(sessionId: id, wasTarget: wasTarget, targetWasAutomatic: targetIsAutomatic)
+        hidden.hide(id)
+        saveHidden()
+        if wasTarget {
+            if savedTarget == id {
+                savedTarget = nil
+                defaults.removeObject(forKey: CompanionConstants.Defaults.targetSession)
+            }
+            if let pick = SessionList.defaultTarget(sessions, hidden: hidden.ids, checks: pathChecks) {
+                switchTarget(to: pick, automatic: true)
+            } else {
+                clearTarget()
+            }
+        }
+        // The arrow keys stay on the row that took its place.
+        if highlightedSession == id, let index = rowIds.firstIndex(of: id) {
+            let remaining = rows.map(\.id)
+            highlightedSession = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)]
+        }
+        undoTask?.cancel()
+        let sleeper = self.sleeper
+        undoTask = Task { [weak self] in
+            await sleeper(CompanionConstants.Hidden.undoSeconds)
+            guard !Task.isCancelled, let self, self.recentlyHidden?.sessionId == id else { return }
+            self.recentlyHidden = nil
+        }
+    }
+
+    /// Puts back the session just hidden, as the target again if it was.
+    public func undoHide() {
+        guard let undo = recentlyHidden else { return }
+        undoTask?.cancel()
+        recentlyHidden = nil
+        hidden.unhide(undo.sessionId)
+        saveHidden()
+        if undo.wasTarget, sessions.contains(where: { $0.id == undo.sessionId }) {
+            switchTarget(to: undo.sessionId, automatic: undo.targetWasAutomatic)
+        }
+    }
+
+    /// Puts a hidden session back in the list (the Unhide button, or the session coming back by itself).
+    public func unhideSession(_ id: String) {
+        guard hidden.unhide(id) else { return }
+        saveHidden()
+        if recentlyHidden?.sessionId == id {
+            undoTask?.cancel()
+            recentlyHidden = nil
+        }
+    }
+
+    // MARK: New session
+
+    /// The new-session form is showing in place of the list.
+    public private(set) var isCreatingSession = false
+    public private(set) var newSession = NewSessionForm()
+    /// Picks a folder with the system's panel; set by the app.
+    @ObservationIgnored public var folderChooser: FolderChooser?
+    /// The user's home folder, where a new session gets a caution, or is not allowed (`FolderNote`).
+    @ObservationIgnored public var homeFolder = FileManager.default.homeDirectoryForCurrentUser.path
+    /// Claude Code on this Mac refuses to reopen home-folder sessions; read when the form opens.
+    public private(set) var homeFolderRefused = false
+    /// Sessions Sidemoon started whose first answer has not come yet: the working row shows for them until their
+    /// own state takes over.
+    public private(set) var awaitingFirstAnswer: Set<String> = []
+
+    /// The first message as typed. Fixed while the session starts.
+    public var newSessionMessage: String {
+        get { newSession.message }
+        set { if !newSession.isStarting { newSession.message = newValue } }
+    }
+
+    /// Folders to offer first: those of the sessions Sidemoon knows, the last one used first.
+    public var recentFolders: [String] {
+        RecentFolders.list(sessions: sessions, lastUsed: defaults.string(forKey: CompanionConstants.Defaults.newSessionFolder),
+                           home: homeFolder, checks: pathChecks)
+    }
+
+    /// What the form says about the chosen folder, if anything.
+    public var newSessionFolderNote: FolderNote? {
+        FolderNote.of(newSession.folder, home: homeFolder, homeRefused: homeFolderRefused, checks: pathChecks)
+    }
+
+    public var canStartNewSession: Bool { newSession.canStart(note: newSessionFolderNote) }
+
+    /// Opens the form, with the last folder used (or the most recent one) chosen.
+    public func openNewSession() {
+        guard !isCreatingSession else { return }
+        homeFolderRefused = engine.homeFolderRefused()
+        newSession = NewSessionForm(folder: recentFolders.first)
+        isShowingSettings = false
+        isPickingSession = false
+        highlightedSession = nil
+        isCreatingSession = true
+        openBubble()
+    }
+
+    /// Closes the form. Not while the session is starting: returns false then.
+    @discardableResult
+    public func closeNewSession() -> Bool {
+        guard isCreatingSession else { return true }
+        guard !newSession.isStarting else { return false }
+        isCreatingSession = false
+        newSession = NewSessionForm()
+        return true
+    }
+
+    public func chooseNewSessionFolder(_ folder: String) { newSession.choose(folder) }
+
+    /// "Choose folder…": the system's folder panel, opening where the chosen folder is.
+    public func pickNewSessionFolder() async {
+        guard let folderChooser, !newSession.isStarting else { return }
+        if let folder = await folderChooser.chooseFolder(startingAt: newSession.folder) { newSession.choose(folder) }
+    }
+
+    /// Starts the session: `claude --bg` in the folder with the first message (and the short-replies note, as on any
+    /// message). On success it becomes the target, the message shows as sent in its thread, and its answer arrives
+    /// like any other. On failure the form says why and keeps what was typed.
+    public func startNewSession() async {
+        guard engineState == .running else { preflight(); return }
+        guard newSession.begin(note: newSessionFolderNote), let folder = newSession.folder else { return }
+        userHasActed = true
+        let text = newSession.trimmedMessage
+        let request = NewSessionRequest(folder: folder, text: text,
+                                        styleNote: shortReplies ? CompanionConstants.Messages.replyStyleNote : nil)
+        let engine = self.engine
+        let result = await Task.detached { engine.startSession(request) }.value
+        guard result.ok, let id = result.sessionId else {
+            let problem = result.failure.map(NewSessionProblem.from) ?? .failed
+            let detail = [result.failure?.description, result.detail].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+            newSession.fail(problem, detail: detail.isEmpty ? nil : detail)
+            return
+        }
+        defaults.set(folder, forKey: CompanionConstants.Defaults.newSessionFolder)
+        // The full note went with this first message; the next ones carry the tag until it is due again.
+        if shortReplies { styleNotesSent[id] = 1 }
+        sessions = engine.sessions()
+        // Before its answer, which may already be in.
+        threads.prepend(ThreadEntry(role: .you, text: text, delivery: .delivered), to: id)
+        if !threads.thread(for: id).contains(where: { $0.role == .session }) { awaitFirstAnswer(id) }
+        isCreatingSession = false
+        newSession = NewSessionForm()
+        closeSessionList()
+        selectTarget(id)
+        requestComposerFocus()
+    }
+
+    /// Shows the session as working until its own state or its answer takes over, at most the reply timeout.
+    private func awaitFirstAnswer(_ id: String) {
+        awaitingFirstAnswer.insert(id)
+        let sleeper = self.sleeper
+        Task { [weak self] in
+            await sleeper(Constants.Timeouts.replyWait)
+            self?.awaitingFirstAnswer.remove(id)
+        }
+    }
+
     // MARK: Bubble
 
-    public func toggleBubble() { isExpanded ? closeBubble() : openBubble() }
+    public func toggleBubble(){ isExpanded ? closeBubble() : openBubble() }
 
     public func openBubble() {
         isExpanded = true
@@ -646,6 +929,11 @@ public final class CompanionModel {
         case .running: break
         }
         guard targetId != nil else { status.handle(.failed(.noTarget)); return false }
+        // Its folder went away after it was chosen: say so before asking for a capture that cannot go anywhere.
+        if let target, SessionList.reachability(target, checks: pathChecks) == .folderGone {
+            status.handle(.failed(.folderGone(target.cwd ?? "")))
+            return false
+        }
         return true
     }
 
@@ -870,6 +1158,8 @@ public final class CompanionModel {
         // The session this message is for was fixed by the caller: the user may switch to another one
         // while it travels, or even before this runs.
         guard let targetId = session else { status.handle(.failed(.noTarget)); return false }
+        // From here on an error is about this session.
+        errorSessionId = nil
         status.handle(.sendBegan)
         let entry = threads.append(ThreadEntry(role: .you, text: shown, attachments: attachments, delivery: .sending), to: targetId)
         inFlight[targetId, default: 0] += 1

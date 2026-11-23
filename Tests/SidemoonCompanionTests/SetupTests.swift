@@ -79,6 +79,13 @@ private let helper = "/Applications/Sidemoon.app/Contents/Helpers/sidemoon"
 private let legacy = "/fake/home/.local/bin/sidemoon"
 private let paths = SetupPaths(home: home, channelConfig: "\(home)/Library/Application Support/Sidemoon/channel-mcp.json",
                                launcher: "\(home)/.local/bin/sidemoon-claude")
+/// The launcher Sidemoon 1.0.3 wrote.
+private let legacyLauncher = """
+    #!/bin/sh
+    # Starts Claude Code with the Sidemoon channel loaded, so captures can be sent into this session.
+    exec claude --mcp-config "$HOME/Library/Application Support/Sidemoon/channel-mcp.json" --dangerously-load-development-channels server:sidemoon "$@"
+
+    """
 private let usualLookup = ClaudeLookup(enginePath: "\(home)/.local/bin/claude", loginShellPath: "\(home)/.local/bin/claude",
                                        pathEntries: ["\(home)/.local/bin/", "/usr/bin"])
 
@@ -298,17 +305,58 @@ private struct Rig {
     // MARK: Step 4: launcher
 
     @Test func launcherScriptMatchesTheHandWrittenOne() {
-        let script = LauncherScript.content(configPath: "\(home)/Library/Application Support/Sidemoon/channel-mcp.json", home: home)
+        let script = LauncherScript.content(configPath: "\(home)/Library/Application Support/Sidemoon/channel-mcp.json",
+                                            helper: helper, home: home)
         let byHand = """
             #!/bin/sh
             # Starts Claude Code with the Sidemoon channel loaded, so captures can be sent into this session.
-            exec claude --mcp-config "$HOME/Library/Application Support/Sidemoon/channel-mcp.json" --dangerously-load-development-channels server:sidemoon "$@"
+            # Anything that does not start a session here (a subcommand, -p, --bg, --version, --help) runs plain claude, and so does every launch while Sidemoon or its settings file is missing.
+            helper='/Applications/Sidemoon.app/Contents/Helpers/sidemoon'
+            config="$HOME/Library/Application Support/Sidemoon/channel-mcp.json"
+            [ -x "$helper" ] && [ -r "$config" ] || exec claude "$@"
+            case "${1-}" in
+                agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) exec claude "$@" ;;
+            esac
+            for arg in "$@"; do
+                case "$arg" in
+                    --) break ;;
+                    -p|--print|--bg|--background|-v|--version|-h|--help|--desktop|--cloud|--environment|--cloud=*|--environment=*) exec claude "$@" ;;
+                esac
+            done
+            exec claude --mcp-config="$config" --dangerously-load-development-channels=server:sidemoon "$@"
             """
         #expect(script == byHand + "\n")
         // Without its final newline it is still the same script.
         #expect(LauncherScript.matches(Data(byHand.utf8), expected: script))
         // Outside the home directory the path is written out, with sh's special characters escaped.
-        #expect(LauncherScript.content(configPath: "/tmp/a\"$b/c.json", home: home).contains(#""/tmp/a\"\$b/c.json""#))
+        #expect(LauncherScript.content(configPath: "/tmp/a\"$b/c.json", helper: helper, home: home).contains(#""/tmp/a\"\$b/c.json""#))
+        #expect(LauncherScript.content(configPath: "/x.json", helper: "/A B/it's", home: home).contains(#"helper='/A B/it'\''s'"#))
+        // This version's script and the 1.0.3 one are both Sidemoon's; anything else is not.
+        #expect(LauncherScript.isSidemoons(Data(script.utf8)))
+        #expect(LauncherScript.isSidemoons(Data(legacyLauncher.utf8)))
+        #expect(!LauncherScript.isSidemoons(Data("#!/bin/sh\nexec claude \"$@\"\n".utf8)))
+        #expect(!LauncherScript.isSidemoons(nil))
+    }
+
+    @Test func aLauncherFromAnEarlierVersionIsReplacedWhenSetupChecks() async {
+        let rig = Rig()
+        rig.files.contents[paths.launcher] = Data(legacyLauncher.utf8)
+        rig.files.contents[paths.channelConfig] = Data(ChannelServer.mcpConfig(executablePath: helper).utf8)
+        let model = rig.model()
+        #expect(model.terminal == .launcherOutdated)
+        #expect(model.canInstallLauncher)
+        #expect(model.terminalDetail == Design.Copy.Setup.terminalLauncherOutdated)
+        await model.refresh()
+        #expect(model.terminal == .installed)
+        #expect(rig.files.text(paths.launcher) == model.launcherContent)
+        // Not outside Applications: nothing outside the app is changed from there.
+        let moved = Rig()
+        moved.files.contents[paths.launcher] = Data(legacyLauncher.utf8)
+        let away = SetupModel(helper: .found(helper), paths: paths, finder: FakeFinder(result: usualLookup), hooks: moved.hooks,
+                              files: moved.files, permission: moved.permission, relauncher: moved.relauncher,
+                              defaults: moved.defaults, location: .elsewhere("/Users/me/Downloads/Sidemoon.app"))
+        await away.refresh()
+        #expect(moved.files.writes.isEmpty)
     }
 
     @Test func installWritesConfigAndLauncher() {
@@ -346,7 +394,7 @@ private struct Rig {
     @Test func outdatedConfigIsRepairedAndTheLauncherKept() {
         let rig = Rig()
         // A hand-made install: the same launcher (no final newline), a config naming ~/.local/bin/sidemoon.
-        let byHand = LauncherScript.content(configPath: paths.channelConfig, home: home)
+        let byHand = LauncherScript.content(configPath: paths.channelConfig, helper: helper, home: home)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         rig.files.contents[paths.launcher] = Data(byHand.utf8)
         rig.files.contents[paths.channelConfig] = Data(ChannelServer.mcpConfig(executablePath: legacy).utf8)
@@ -360,16 +408,18 @@ private struct Rig {
     }
 
     @Test func terminalDerivation() {
-        #expect(SetupModel.terminal(helper: .found(helper), launcherExists: false, launcherIsOurs: false, configuredCommand: nil)
-                == .notInstalled)
-        #expect(SetupModel.terminal(helper: .found(helper), launcherExists: true, launcherIsOurs: true, configuredCommand: helper)
-                == .installed)
-        #expect(SetupModel.terminal(helper: .found(helper), launcherExists: true, launcherIsOurs: true, configuredCommand: nil)
-                == .configOutdated)
-        #expect(SetupModel.terminal(helper: .found(helper), launcherExists: true, launcherIsOurs: false, configuredCommand: helper)
-                == .foreignLauncher)
-        #expect(SetupModel.terminal(helper: .translocated, launcherExists: false, launcherIsOurs: false, configuredCommand: nil)
-                == .helperUnavailable(.translocated))
+        func derive(_ location: HelperLocation = .found(helper), exists: Bool, ours: Bool, current: Bool, config: String?) -> TerminalStatus {
+            SetupModel.terminal(helper: location, launcherExists: exists, launcherIsOurs: ours, launcherIsCurrent: current,
+                                configuredCommand: config)
+        }
+        #expect(derive(exists: false, ours: false, current: false, config: nil) == .notInstalled)
+        #expect(derive(exists: true, ours: true, current: true, config: helper) == .installed)
+        #expect(derive(exists: true, ours: true, current: true, config: nil) == .configOutdated)
+        #expect(derive(exists: true, ours: true, current: false, config: helper) == .launcherOutdated)
+        // A hand-written copy of this version's script counts as current even without the comment lines.
+        #expect(derive(exists: true, ours: false, current: true, config: helper) == .installed)
+        #expect(derive(exists: true, ours: false, current: false, config: helper) == .foreignLauncher)
+        #expect(derive(.translocated, exists: false, ours: false, current: false, config: nil) == .helperUnavailable(.translocated))
     }
 
     // MARK: First run
@@ -400,6 +450,93 @@ private struct Rig {
         #expect(locate("/work/.build/debug", exe, [legacy]) == .found(legacy))
         #expect(locate("/work/.build/debug", exe, []) == .missing("/work/.build/debug/sidemoon"))
         #expect(CompanionConstants.App.helperPathInBundle.hasPrefix("Contents/Helpers/"))
+    }
+
+    // MARK: Connect every claude
+
+    /// A setup whose shell files are in a temporary home folder (the launcher and config stay in the fakes).
+    private func shellSetup(_ rig: Rig, home: String, location: AppLocation = .applications) -> SetupModel {
+        let shell = ShellIntegration(home: home, loginShell: "/bin/zsh", launcher: paths.launcher, fileSystem: SystemShellFileSystem())
+        return SetupModel(helper: .found(helper), paths: paths, finder: FakeFinder(result: usualLookup), hooks: rig.hooks,
+                          files: rig.files, permission: rig.permission, relauncher: rig.relauncher, defaults: rig.defaults,
+                          location: location, shell: shell)
+    }
+
+    private func temporaryHome() -> String {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-setup-shell-\(UUID().uuidString)").path
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func connectEveryClaudeIsOneClickOnAndOneClickOff() throws {
+        let rig = Rig()
+        let home = temporaryHome()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try "export A=1\n".write(toFile: home + "/.zshrc", atomically: true, encoding: .utf8)
+        let model = shellSetup(rig, home: home)
+        #expect(model.canChangeShell)
+        #expect(!model.connectsEveryClaude)
+        #expect(model.shell?.state == .off)
+        #expect(model.shellDetail.contains("/.zshrc"))
+        // On installs the launcher it calls, then adds the lines (after a backup).
+        model.setConnectsEveryClaude(true)
+        #expect(model.terminal == .installed)
+        #expect(rig.files.text(paths.launcher) == model.launcherContent)
+        #expect(model.connectsEveryClaude)
+        #expect(try String(contentsOfFile: home + "/.zshrc", encoding: .utf8).contains(CompanionConstants.ShellIntegration.startMarker))
+        #expect(model.shellFeedback?.text.contains(Constants.Paths.backupSuffix) == true)
+        #expect(model.shellFeedback?.isProblem == false)
+        model.setConnectsEveryClaude(false)
+        #expect(!model.connectsEveryClaude)
+        #expect(try String(contentsOfFile: home + "/.zshrc", encoding: .utf8) == "export A=1\n")
+    }
+
+    @Test func disconnectAlsoTakesTheLinesOut() throws {
+        let rig = Rig()
+        let home = temporaryHome()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let model = shellSetup(rig, home: home)
+        model.connect()
+        model.setConnectsEveryClaude(true)
+        #expect(FileManager.default.fileExists(atPath: home + "/.zshrc"))
+        model.disconnect()
+        #expect(model.connection == .notConnected)
+        #expect(model.shell?.state == .off)
+        // Sidemoon made the file, so it is gone again.
+        #expect(!FileManager.default.fileExists(atPath: home + "/.zshrc"))
+    }
+
+    @Test func connectEveryClaudeIsNotOfferedWhereItCannotWork() throws {
+        let home = temporaryHome()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        // Someone else's file at the launcher's path: the lines would call it, so nothing is written.
+        let rig = Rig()
+        rig.files.contents[paths.launcher] = Data("#!/bin/sh\necho mine\n".utf8)
+        let foreign = shellSetup(rig, home: home)
+        #expect(!foreign.canChangeShell)
+        foreign.setConnectsEveryClaude(true)
+        #expect(!FileManager.default.fileExists(atPath: home + "/.zshrc"))
+        // Outside Applications.
+        let away = shellSetup(Rig(), home: home, location: .elsewhere("/Users/me/Downloads/Sidemoon.app"))
+        #expect(!away.canChangeShell)
+        #expect(away.shellDetail == Design.Copy.Setup.moveFirst)
+        // Without a shell integration (tests, previews): nothing is shown.
+        #expect(Rig().model().shell == nil)
+    }
+
+    @Test func aLinkedStartupFileIsExplainedAndItsLinesOffered() throws {
+        let rig = Rig()
+        let home = temporaryHome()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try "export A=1\n".write(toFile: home + "/zshrc-real", atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: home + "/.zshrc", withDestinationPath: home + "/zshrc-real")
+        let model = shellSetup(rig, home: home)
+        model.setConnectsEveryClaude(true)
+        #expect(model.shellFeedback?.isProblem == true)
+        #expect(model.shellFeedback?.text.contains("is a link to another file") == true)
+        #expect(model.shellLinesToCopy?.contains(CompanionConstants.ShellIntegration.startMarker) == true)
+        #expect(try String(contentsOfFile: home + "/zshrc-real", encoding: .utf8) == "export A=1\n")
+        #expect(!model.connectsEveryClaude)
     }
 }
 

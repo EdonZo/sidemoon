@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import SidemoonCompanion
+import SidemoonCore
 
 /// What the bubble's controls do; wired up by the panel controller.
 struct BubbleActions {
@@ -17,8 +18,10 @@ struct BubbleActions {
     var openURL: (URL) -> Void = { _ in }
     /// Opens a report, filled in, for the user to send.
     var sendFeedback: (FeedbackRoute) -> Void = { _ in }
-    /// Opens the Terminal app with this session reopened through the launcher (session id, its folder).
-    var openInTerminal: (String?, String?) -> Void = { _, _ in }
+    /// Opens the Terminal app with this script, which reopens a session through the launcher.
+    var openInTerminal: (String) -> Void = { _ in }
+    /// Opens Setup and turns on "Connect every claude".
+    var connectEveryClaude: () -> Void = {}
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -52,7 +55,7 @@ struct BubbleView: View {
     /// The thread stays on its newest entry, at the bottom. The session list starts at the top,
     /// where the most recently active session is.
     private func follow(_ proxy: ScrollViewProxy) {
-        if model.isPickingSession || model.isShowingSettings {
+        if model.isPickingSession || model.isShowingSettings || model.isCreatingSession {
             proxy.scrollTo(BubbleView.topID, anchor: .top)
         } else {
             proxy.scrollTo(BubbleView.newestID, anchor: .bottom)
@@ -81,15 +84,7 @@ struct BubbleView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         Color.clear.frame(height: 0).id(BubbleView.topID)
-                        Group {
-                            if model.isShowingSettings {
-                                SettingsView(model: model, openSetup: actions.openSetup, sendFeedback: actions.sendFeedback)
-                            } else if model.isPickingSession {
-                                SessionPicker(model: model) { model.closeSessionList() }
-                            } else {
-                                content
-                            }
-                        }
+                        page
                         .padding(.horizontal, Design.Space.bubbleHorizontal)
                         .padding(.vertical, Design.Space.bubbleVertical)
                         Color.clear.frame(height: Design.Bubble.hairline).id(BubbleView.newestID)
@@ -105,19 +100,15 @@ struct BubbleView: View {
                 .onChange(of: model.isExpanded) { follow(proxy) }
                 .onChange(of: model.targetId) { follow(proxy) }
                 .onChange(of: bodyHeight) { follow(proxy) }
-                .onChange(of: model.isPickingSession) { follow(proxy) }
-                .onChange(of: model.isShowingSettings) { follow(proxy) }
+                .onChange(of: pageKey) { follow(proxy) }
                 // The arrow keys keep the highlighted session in view.
                 .onChange(of: model.highlightedSession) { _, id in
                     if model.isPickingSession, let id { proxy.scrollTo(id) }
                 }
             }
 
-            VStack(spacing: 0) {
-                hairline
-                compose
-            }
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { bottomHeight = $0; report() }
+            bottomBar
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { bottomHeight = $0; report() }
         }
         // Reading the dragged size here makes the layout follow it as it changes.
         .frame(width: model.bubbleSize?.width ?? Design.Bubble.width)
@@ -156,6 +147,34 @@ struct BubbleView: View {
         return true
     }
 
+    /// Which page shows, as one value: a change of page moves the view to that page's start.
+    private var pageKey: [Bool] { [model.isPickingSession, model.isShowingSettings, model.isCreatingSession] }
+
+    /// What the body shows: the settings, the new-session form, the session list, or the conversation.
+    @ViewBuilder
+    private var page: some View {
+        if model.isShowingSettings {
+            SettingsView(model: model, openSetup: actions.openSetup, sendFeedback: actions.sendFeedback)
+        } else if model.isCreatingSession {
+            NewSessionView(model: model)
+        } else if model.isPickingSession {
+            SessionPicker(model: model, openInTerminal: actions.openInTerminal) { model.closeSessionList() }
+        } else {
+            content
+        }
+    }
+
+    /// The composer under its hairline. The new-session form has its own message field, so it goes while that shows.
+    @ViewBuilder
+    private var bottomBar: some View {
+        VStack(spacing: 0) {
+            if !model.isCreatingSession {
+                hairline
+                compose
+            }
+        }
+    }
+
     private var hairline: some View {
         Rectangle().fill(Color.line).frame(height: Design.Bubble.hairline)
     }
@@ -190,6 +209,8 @@ struct BubbleView: View {
             ReadoutText(state.label, color: state == .reply ? .signal : (state == .error ? .problem : .mute))
             Spacer(minLength: Design.Space.xs)
             let capturing = model.status.activity == .capturing || model.status.activity == .holding
+            // Starting a session is one click from anywhere, not only from the session list.
+            iconButton("plus", help: Design.Copy.NewSession.plusHelp, disabled: false) { model.openNewSession() }
             iconButton("viewfinder", help: Design.Copy.captureHelp, disabled: capturing, action: actions.capture)
             iconButton(model.isShowingSettings ? "xmark" : "slider.horizontal.3", help: Design.Copy.settingsHelp, disabled: false) {
                 model.toggleSettings()
@@ -339,6 +360,12 @@ struct BubbleView: View {
                             .foregroundStyle(Color.ink)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    if remedies.contains(.connectEveryClaude) {
+                        Text(copy.connectEveryClaudeNote)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             // Side by side when they fit, one under the other when they do not (a narrow or zoomed window).
@@ -395,11 +422,20 @@ struct BubbleView: View {
             switch remedy {
             case .copyResumeCommand:
                 cardButton(commandCopied ? copy.openedInTerminal : copy.openInTerminal, primary: index == 0) {
-                    actions.openInTerminal(model.targetId, model.target?.cwd)
-                    commandCopied = true
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
-                        commandCopied = false
+                    // Decided before anything opens: a gone folder is explained instead, a missing launcher installed.
+                    switch model.reopenInTerminal() {
+                    case let .open(script):
+                        actions.openInTerminal(script)
+                        commandCopied = true
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
+                            commandCopied = false
+                        }
+                    case .installLauncher:
+                        actions.openSetup()
+                        model.dismissError()
+                    case .folderGone:
+                        break
                     }
                 }
                 .help(copy.openInTerminalHelp)
@@ -412,6 +448,11 @@ struct BubbleView: View {
                 cardButton(copy.chooseAnother, primary: index == 0) {
                     model.dismissError()
                     model.openSessionList()
+                }
+            case .connectEveryClaude:
+                cardButton(copy.connectEveryClaude, primary: index == 0) {
+                    actions.connectEveryClaude()
+                    model.dismissError()
                 }
             case .runLogin:
                 EmptyView()
@@ -521,7 +562,14 @@ struct BubbleView: View {
     /// A conversation with nothing in it yet: how to start one.
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: Design.Space.m) {
-            if model.targetId == nil {
+            if model.targetId == nil, model.sessions.isEmpty {
+                // Nothing to choose from: starting one is the way in.
+                Text(Design.Copy.emptyNoSessionsAtAll)
+                    .font(.prose)
+                    .foregroundStyle(Color.mute)
+                    .fixedSize(horizontal: false, vertical: true)
+                cardButton(Design.Copy.NewSession.startButton, primary: true) { model.openNewSession() }
+            } else if model.targetId == nil {
                 Text(Design.Copy.emptyNoSession)
                     .font(.prose)
                     .foregroundStyle(Color.mute)
@@ -592,7 +640,14 @@ struct GuideCard: View {
                     Text(g.heroTitle)
                         .font(.text(Design.Guide.heroTitle, weight: .semibold))
                         .foregroundStyle(Color.ink)
-                    if model.targetId == nil {
+                    if model.targetId == nil, model.sessions.isEmpty {
+                        // A new user with no session yet: starting one here is the first step.
+                        Text(g.heroNoSessions)
+                            .font(.proseSmall)
+                            .foregroundStyle(Color.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                        smallButton(Design.Copy.NewSession.startButton) { model.openNewSession() }
+                    } else if model.targetId == nil {
                         Text(g.heroNoSession)
                             .font(.proseSmall)
                             .foregroundStyle(Color.ink)
@@ -872,38 +927,113 @@ struct AttachmentChip: View {
     }
 }
 
-/// Where captures and messages go: every live session, one click to choose, plus the size setting.
+/// Where captures and messages go: every live session, one click to choose, a way to start a new one, and the
+/// switches for ended and hidden sessions.
 struct SessionPicker: View {
     @Bindable var model: CompanionModel
+    /// Opens the Terminal app with a script (a row's "Open in Terminal").
+    var openInTerminal: (String) -> Void = { _ in }
+    /// Shows this row's actions as if the pointer were on it (previews).
+    var hoveredRow: String?
     let onPick: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: Design.Space.m) {
-            ReadoutText(Design.Copy.sendTo)
+            HStack(spacing: Design.Space.s) {
+                ReadoutText(Design.Copy.sendTo)
+                Spacer(minLength: Design.Space.s)
+                Button { model.openNewSession() } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: Design.Bubble.iconSize, weight: .semibold))
+                        .foregroundStyle(Color.ink)
+                        .frame(width: Design.Bubble.pillHeight, height: Design.Bubble.pillHeight)
+                        .overlay(RoundedRectangle(cornerRadius: Design.Radius.control)
+                            .strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .help(Design.Copy.NewSession.plusHelp)
+                .accessibilityLabel(Design.Copy.NewSession.plusHelp)
+            }
             let rows = model.rows
             if rows.isEmpty {
                 Text(Design.Copy.noSessions)
                     .font(.prose)
                     .foregroundStyle(Color.mute)
                     .fixedSize(horizontal: false, vertical: true)
+                FormButton(title: Design.Copy.NewSession.startButton, primary: true) { model.openNewSession() }
+            }
+            if let undo = model.recentlyHidden {
+                UndoHideRow(name: model.sessions.first { $0.id == undo.sessionId }.map(SessionList.displayName)
+                                ?? SessionID.short(undo.sessionId)) { model.undoHide() }
             }
             VStack(spacing: Design.Space.xxs) {
                 ForEach(rows) { row in
                     SessionRowView(row: row, selected: row.id == model.targetId, unread: model.unreadSessions.contains(row.id),
-                                   highlighted: row.id == model.highlightedSession) {
-                        model.pickSession(row.id)
-                        onPick()
-                    }
-                    .id(row.id)
+                                   highlighted: row.id == model.highlightedSession,
+                                   pick: {
+                                       model.pickSession(row.id)
+                                       onPick()
+                                   },
+                                   hide: { model.hideSession(row.id) },
+                                   unhide: { model.unhideSession(row.id) },
+                                   openInTerminal: row.isBackground ? { open(row.id) } : nil,
+                                   forceHover: row.id == hoveredRow)
+                        .id(row.id)
                 }
             }
-            Button { model.showEnded.toggle() } label: {
-                ReadoutText(model.showEnded ? Design.Copy.hideEnded : Design.Copy.showEnded, color: .ink)
+            HStack(spacing: Design.Space.l) {
+                Button { model.showEnded.toggle() } label: {
+                    ReadoutText(model.showEnded ? Design.Copy.hideEnded : Design.Copy.showEnded, color: .ink)
+                }
+                .buttonStyle(PressStyle())
+                if model.hiddenCount > 0 {
+                    Button { model.showHidden.toggle() } label: {
+                        ReadoutText(model.showHidden ? Design.Copy.Hidden.hideAgain : Design.Copy.Hidden.show(model.hiddenCount),
+                                    color: .ink)
+                    }
+                    .buttonStyle(PressStyle())
+                }
             }
-            .buttonStyle(PressStyle())
             .padding(.leading, Design.Space.m)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A background session opens with `claude attach`; a gone folder is already shown on its row.
+    private func open(_ id: String) {
+        if case let .open(script) = model.terminalPlan(for: id) { openInTerminal(script) }
+    }
+}
+
+/// Shown at the top of the list for a few seconds after a session is hidden.
+struct UndoHideRow: View {
+    let name: String
+    let undo: () -> Void
+
+    var body: some View {
+        HStack(spacing: Design.Space.m) {
+            Image(systemName: "eye.slash")
+                .font(.system(size: Design.Bubble.rowActionIcon, weight: .medium))
+                .foregroundStyle(Color.mute)
+            Text(Design.Copy.Hidden.hid(name))
+                .font(.proseSmall)
+                .foregroundStyle(Color.ink)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: Design.Space.m)
+            Button(action: undo) {
+                ReadoutText(Design.Copy.Hidden.undo, color: .paper)
+                    .padding(.horizontal, Design.Space.m)
+                    .frame(height: Design.Bubble.pillHeight)
+                    .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(Color.signal))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(PressStyle())
+        }
+        .padding(.horizontal, Design.Space.m)
+        .padding(.vertical, Design.Space.s)
+        .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous).fill(Color.paper2))
     }
 }
 
@@ -942,6 +1072,9 @@ struct SettingsView: View {
             }
             row(Design.Copy.sessions) {
                 choice(Design.Copy.showEnded, selected: model.showEnded) { model.showEnded.toggle() }
+                if model.hiddenCount > 0 {
+                    choice(Design.Copy.Hidden.showSwitch, selected: model.showHidden) { model.showHidden.toggle() }
+                }
             }
             if model.canOpenAtLogin {
                 row(Design.Copy.startup) {
@@ -1061,7 +1194,9 @@ struct SettingsView: View {
     }
 }
 
-/// One session in the picker: its name, where it runs, and what it is doing.
+/// One session in the picker: its name, where it runs, and what it is doing. Under the pointer, or on the arrow
+/// keys, its actions take the place of the state: Open in Terminal (background sessions) and Hide. A hidden one,
+/// listed while "Show hidden" is on, is dimmed and offers Unhide.
 struct SessionRowView: View {
     let row: SessionRow
     let selected: Bool
@@ -1070,38 +1205,83 @@ struct SessionRowView: View {
     /// The arrow keys are on this row.
     var highlighted = false
     let pick: () -> Void
+    var hide: () -> Void = {}
+    var unhide: () -> Void = {}
+    /// Nil where the session kind has no terminal to open from here.
+    var openInTerminal: (() -> Void)?
+    /// Shows the actions as if the pointer were on the row (previews).
+    var forceHover = false
     @State private var hovering = false
 
     var body: some View {
-        Button(action: pick) {
-            HStack(spacing: Design.Space.m) {
-                Circle()
-                    .fill(selected ? Color.signal : Color.clear)
-                    .overlay(Circle().strokeBorder(selected ? Color.clear : Color.line, lineWidth: Design.Bubble.hairline))
-                    .frame(width: Design.Bubble.errorDot, height: Design.Bubble.errorDot)
-                VStack(alignment: .leading, spacing: Design.Space.xxs) {
-                    Text(row.title)
-                        .font(.text(Design.TypeScale.body, weight: selected ? .semibold : .regular))
-                        .foregroundStyle(row.reachable ? Color.ink : Color.mute)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let folder = row.folder, folder != row.title { ReadoutText(folder).truncationMode(.middle) }
+        let active = highlighted || hovering || forceHover
+        HStack(spacing: Design.Space.m) {
+            Button(action: pick) {
+                HStack(spacing: Design.Space.m) {
+                    Circle()
+                        .fill(selected ? Color.signal : Color.clear)
+                        .overlay(Circle().strokeBorder(selected ? Color.clear : Color.line, lineWidth: Design.Bubble.hairline))
+                        .frame(width: Design.Bubble.errorDot, height: Design.Bubble.errorDot)
+                    VStack(alignment: .leading, spacing: Design.Space.xxs) {
+                        Text(row.title)
+                            .font(.text(Design.TypeScale.body, weight: selected ? .semibold : .regular))
+                            .foregroundStyle(row.reachable ? Color.ink : Color.mute)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let folder = row.folder, folder != row.title { ReadoutText(folder).truncationMode(.middle) }
+                    }
+                    .opacity(row.hidden ? Design.Bubble.hiddenOpacity : (row.reachable ? 1 : Design.Bubble.unreachableOpacity))
+                    Spacer(minLength: Design.Space.m)
+                    // The actions take the state's place, so a row never gets wider than the window. A hidden row
+                    // is dimmed and shows Unhide instead.
+                    if !active && !row.hidden { status }
                 }
-                .opacity(row.reachable ? 1 : Design.Bubble.unreachableOpacity)
-                Spacer(minLength: Design.Space.m)
-                status
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, Design.Space.m)
-            .padding(.vertical, Design.Space.m)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
-                .fill(highlighted || hovering ? Color.paper2 : Color.clear))
-            .overlay(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
-                .strokeBorder(highlighted ? Color.signal : Color.clear, lineWidth: Design.Bubble.hairline))
-            .contentShape(Rectangle())
+            .buttonStyle(PressStyle())
+            if row.hidden {
+                actionPill(Design.Copy.Hidden.unhide, help: Design.Copy.Hidden.unhideHelp, action: unhide)
+            } else if active {
+                if let openInTerminal {
+                    Button(action: openInTerminal) {
+                        Image(systemName: "apple.terminal")
+                            .font(.system(size: Design.Bubble.rowActionIcon, weight: .medium))
+                            .foregroundStyle(Color.ink)
+                            .frame(width: Design.Bubble.pillHeight, height: Design.Bubble.pillHeight)
+                            .overlay(RoundedRectangle(cornerRadius: Design.Radius.control)
+                                .strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressStyle())
+                    .help(Design.Copy.Hidden.openInTerminalHelp)
+                    .accessibilityLabel(Design.Copy.Unreachable.openInTerminal)
+                }
+                actionPill(Design.Copy.Hidden.hide, help: Design.Copy.Hidden.hideHelp, action: hide)
+            }
+        }
+        .padding(.horizontal, Design.Space.m)
+        .padding(.vertical, Design.Space.m)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+            .fill(active ? Color.paper2 : Color.clear))
+        .overlay(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+            .strokeBorder(highlighted ? Color.signal : Color.clear, lineWidth: Design.Bubble.hairline))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(named: row.hidden ? Design.Copy.Hidden.unhide : Design.Copy.Hidden.hide) { row.hidden ? unhide() : hide() }
+    }
+
+    private func actionPill(_ title: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ReadoutText(title, color: .ink)
+                .padding(.horizontal, Design.Space.m)
+                .frame(height: Design.Bubble.pillHeight)
+                .overlay(RoundedRectangle(cornerRadius: Design.Radius.control).strokeBorder(Color.line, lineWidth: Design.Bubble.hairline))
+                .contentShape(Rectangle())
         }
         .buttonStyle(PressStyle())
-        .onHover { hovering = $0 }
+        .help(help)
     }
 
     /// Plain words for what the session is doing. A busy one is still fine to pick: messages wait for it.
@@ -1113,6 +1293,8 @@ struct SessionRowView: View {
             ReadoutText(Design.Copy.stateNewReply, color: .signal)
         } else if row.reachability == .channelDropped {
             ReadoutText(Design.Copy.Unreachable.notPickedUpReason)
+        } else if row.reachability == .folderGone {
+            ReadoutText(Design.Copy.Unreachable.folderGoneReason)
         } else if !row.reachable && !row.ended {
             ReadoutText(Design.Copy.Unreachable.noChannelReason)
         } else {

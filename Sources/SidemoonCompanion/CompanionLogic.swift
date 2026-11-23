@@ -26,12 +26,15 @@ public enum CompanionError: Equatable, Sendable {
     /// Claude Code did not pass on what Sidemoon's connection sent: the session runs in a process that does not
     /// load it. `fallback`: the route Retry will take, nil when there is none.
     case notPickedUp(fallback: Route?)
+    /// The session's folder was moved or deleted, so Claude Code cannot reopen the session there.
+    case folderGone(String)
 
     public var title: String {
         switch self {
         case .notPickedUp: return Design.Copy.Unreachable.notPickedUpTitle
         case let .cannotReach(blocker, _, _, _): return Design.Copy.Unreachable.title(blocker)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelTitle
+        case .folderGone: return Design.Copy.Unreachable.folderGoneTitle
         case .noTarget: return "No session chosen"
         case .engineConflict: return "Another Sidemoon engine is running"
         case .engineFailed: return "The Sidemoon engine could not start"
@@ -52,6 +55,7 @@ public enum CompanionError: Equatable, Sendable {
         case let .cannotReach(blocker, saved, stopped, _):
             return Design.Copy.Unreachable.advice(blocker, messageSaved: saved, stoppedFirst: stopped)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelAdvice
+        case let .folderGone(folder): return Design.Copy.Unreachable.folderGoneAdvice(folder)
         case let .notPickedUp(fallback): return Design.Copy.Unreachable.notPickedUpAdvice(retryGoesInBackground: fallback == .background)
         case .noTarget:
             return "Open the menu and choose which Claude Code session should get your screenshots."
@@ -86,6 +90,7 @@ public enum CompanionError: Equatable, Sendable {
     /// What the user can do about it, shown as buttons under the advice. Empty for most errors.
     public var remedies: [Remedy] {
         if self == .needsLauncher || self == .notPickedUp(fallback: nil) { return [.copyResumeCommand, .chooseAnotherSession] }
+        if case .folderGone = self { return [.chooseAnotherSession] }
         guard case let .cannotReach(blocker, _, _, _) = self else { return [] }
         switch blocker {
         case .homeFolder, .untrustedFolder: return [.copyResumeCommand, .chooseAnotherSession]
@@ -99,6 +104,7 @@ public enum CompanionError: Equatable, Sendable {
     public var canRetry: Bool {
         if case .cannotReach = self { return false }
         if self == .needsLauncher { return false }
+        if case .folderGone = self { return false }
         return true
     }
 
@@ -135,6 +141,8 @@ public enum Remedy: Equatable, Sendable, Hashable {
     case chooseAnotherSession
     /// Words only: sign in again from the session's terminal.
     case runLogin
+    /// Turn on Setup's "Connect every claude", so the next plain `claude` typed in a terminal can be reached.
+    case connectEveryClaude
 }
 
 /// The "Try it" guide: three things to do once, each ticked when the user has really done it.
@@ -315,7 +323,8 @@ public enum HeldCaptureDecision: Equatable, Sendable {
 }
 
 /// The keys that move between the thread and the session list.
-public enum NavigationKey: Equatable, Sendable { case left, right, up, down, enter, escape }
+/// `delete` hides the highlighted session while the list shows (and the composer is empty).
+public enum NavigationKey: Equatable, Sendable { case left, right, up, down, enter, escape, delete }
 
 // MARK: - Session list
 
@@ -329,6 +338,10 @@ public struct SessionRow: Identifiable, Equatable, Sendable {
     public let reachability: Reachability
     public let ended: Bool
     public let state: SessionState
+    /// Hidden from the list by the user; only listed while "Show hidden" is on.
+    public var hidden = false
+    /// A `claude --bg` session: "Open in Terminal" attaches to it.
+    public var isBackground = false
     /// Whether a message can get to it at all. A busy session still counts: messages wait for it.
     public var reachable: Bool { reachability == .reachable }
     /// Why Claude Code would refuse it; nil when nothing is known to stand in the way.
@@ -356,6 +369,8 @@ public enum Reachability: Equatable, Sendable {
     case channelDropped
     /// A background session Claude Code would not reopen.
     case blocked(ResumeBlocker)
+    /// Not running with the channel, and its folder no longer exists: nothing can reopen it.
+    case folderGone
 }
 
 public enum SessionList {
@@ -383,34 +398,43 @@ public enum SessionList {
 
     /// Whether a message can get to the session at all: over a route open now, or by waiting for a
     /// background session to finish its turn. Only a terminal session started without the channel cannot.
-    public static func isReachable(_ s: Session) -> Bool { reachability(s) == .reachable }
+    public static func isReachable(_ s: Session, checks: PathChecks = .everythingExists) -> Bool {
+        reachability(s, checks: checks) == .reachable
+    }
 
-    /// The channel reaches a session wherever it runs; a background session is out of reach when Claude Code
-    /// would refuse to reopen it.
-    public static func reachability(_ s: Session) -> Reachability {
+    /// The channel reaches a session wherever it runs; any other route reopens it in its folder, so a session whose
+    /// folder is gone is out of reach, and a background session is when Claude Code would refuse to reopen it.
+    public static func reachability(_ s: Session, checks: PathChecks = .everythingExists) -> Reachability {
         if s.channelConnected { return .reachable }
+        if let cwd = s.cwd, !cwd.isEmpty, !checks.folderExists(cwd) { return .folderGone }
         if s.kind == .background, let blocker = s.blocker { return .blocked(blocker) }
         if !s.routes.isEmpty || s.kind == .background { return .reachable }
         return s.channelDropped ? .channelDropped : .needsChannel
     }
 
-    /// The session to talk to when none is chosen: the most recently active one that can be reached.
-    public static func defaultTarget(_ sessions: [Session]) -> String? {
-        rows(sessions, showEnded: true).first { $0.reachable && !$0.ended }?.id
-            ?? rows(sessions, showEnded: true).first { $0.reachable }?.id
+    /// The session to talk to when none is chosen: the most recently active one that can be reached and is not
+    /// hidden.
+    public static func defaultTarget(_ sessions: [Session], hidden: Set<String> = [], checks: PathChecks = .everythingExists) -> String? {
+        let all = rows(sessions, showEnded: true, hidden: hidden, checks: checks)
+        return all.first { $0.reachable && !$0.ended }?.id ?? all.first { $0.reachable }?.id
     }
 
-    /// Picker rows: ended sessions hidden unless asked for, most recently active first.
-    public static func rows(_ sessions: [Session], showEnded: Bool) -> [SessionRow] {
+    /// Picker rows: ended sessions left out unless asked for, hidden ones unless "Show hidden" is on, most recently
+    /// active first.
+    public static func rows(_ sessions: [Session], showEnded: Bool, hidden: Set<String> = [], showHidden: Bool = false,
+                            checks: PathChecks = .everythingExists) -> [SessionRow] {
         sessions
-            .filter { showEnded || $0.state != .ended }
+            .filter { (showEnded || $0.state != .ended) && (showHidden || !hidden.contains($0.id)) }
             .sorted { a, b in
                 let ta = a.activityAt ?? .distantPast, tb = b.activityAt ?? .distantPast
                 return ta != tb ? ta > tb : a.id < b.id
             }
             .map { s in
-                SessionRow(id: s.id, title: displayName(s), folder: folderName(s), stateText: stateText(s.state),
-                           reachability: reachability(s), ended: s.state == .ended, state: s.state)
+                var row = SessionRow(id: s.id, title: displayName(s), folder: folderName(s), stateText: stateText(s.state),
+                                     reachability: reachability(s, checks: checks), ended: s.state == .ended, state: s.state)
+                row.hidden = hidden.contains(s.id)
+                row.isBackground = s.kind == .background
+                return row
             }
     }
 }

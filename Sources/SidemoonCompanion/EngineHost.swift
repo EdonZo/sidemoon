@@ -16,6 +16,10 @@ public protocol CompanionEngine: AnyObject, Sendable {
     func subscribe(_ handler: @escaping @Sendable (Session) -> Void)
     /// Blocking; call it off the main thread.
     func send(_ request: SendRequest) -> SendResult
+    /// Starts a new background session with its first message. Blocking (a few seconds); call it off the main thread.
+    func startSession(_ request: NewSessionRequest) -> NewSessionResult
+    /// Claude Code on this Mac has refused to reopen a background session in the home folder (`HomeFolderMemory`).
+    func homeFolderRefused() -> Bool
 }
 
 /// Runs the stage 1 Engine inside the app process, so no `sidemoon serve` is needed.
@@ -62,4 +66,8 @@ public final class InProcessEngine: CompanionEngine, @unchecked Sendable {
     }
 
     public func send(_ request: SendRequest) -> SendResult { engine.send(request) }
+
+    public func startSession(_ request: NewSessionRequest) -> NewSessionResult { engine.startSession(request) }
+
+    public func homeFolderRefused() -> Bool { engine.registry.homeFolderMemory.refused }
 }

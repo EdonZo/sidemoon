@@ -17,7 +17,7 @@ enum MascotState: Equatable {
         case .failed: self = .error
         case .idle:
             // A new answer comes first; otherwise the mark shows the session working, whoever asked.
-            if model.status.unseenReply { self = .reply } else { self = model.target?.state == .working ? .waiting : .idle }
+            if model.status.unseenReply { self = .reply } else { self = model.targetIsWorking ? .waiting : .idle }
         }
     }
 

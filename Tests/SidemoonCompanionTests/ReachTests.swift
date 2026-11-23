@@ -410,3 +410,112 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         #expect(CompanionConstants.Defaults.savedKeys.contains(CompanionConstants.Defaults.guideClosed))
     }
 }
+
+// MARK: Sessions whose folder is gone, and plain-claude sessions
+
+/// Every folder exists except this one; the launcher is installed.
+private let gone = "/Users/someone/deleted-project"
+private let goneChecks = PathChecks(folderExists: { $0 != gone }, isExecutable: { _ in true })
+
+@MainActor
+private func checkedModel(_ engine: FakeEngine, checks: PathChecks = goneChecks) -> CompanionModel {
+    let store = CaptureStore(directory: FileManager.default.temporaryDirectory
+        .appendingPathComponent("sidemoon-reach-\(UUID().uuidString)", isDirectory: true))
+    return CompanionModel(engine: engine, capture: FakeCapture(), windowCapture: FakeCapture(), store: store,
+                          defaults: UserDefaults(suiteName: "sidemoon-reach-\(UUID().uuidString)")!, sleeper: quickSleeper,
+                          pathChecks: checks)
+}
+
+@MainActor
+@Suite struct FolderGoneTests {
+    private func inGoneFolder(_ id: String, age: TimeInterval, kind: SessionKind = .background, channel: Bool = false) -> Session {
+        var s = session(id, age: age, channel: channel, kind: kind)
+        s.cwd = gone
+        return s
+    }
+
+    @Test func aSessionWhoseFolderIsGoneIsGreyedAndNeverTheDefault() {
+        let list = [inGoneFolder(first, age: 1), session(second, age: 9)]
+        let rows = SessionList.rows(list, showEnded: true, checks: goneChecks)
+        #expect(rows.map(\.reachability) == [.folderGone, .reachable])
+        #expect(SessionList.defaultTarget(list, checks: goneChecks) == second)
+        #expect(SessionList.defaultTarget([inGoneFolder(first, age: 1)], checks: goneChecks) == nil)
+        // Running with the channel, it is reached where it runs: the folder does not matter.
+        #expect(SessionList.reachability(inGoneFolder(first, age: 1, channel: true), checks: goneChecks) == .reachable)
+        // Without checks (the default), nothing changes.
+        #expect(SessionList.reachability(inGoneFolder(first, age: 1)) == .reachable)
+        #expect(!Design.Copy.Unreachable.folderGoneReason.isEmpty)
+    }
+
+    @Test func pickingItExplainsAndOpensNothing() {
+        let engine = FakeEngine()
+        engine.list = [session(second, age: 9), inGoneFolder(first, age: 1, kind: .interactive)]
+        let m = checkedModel(engine)
+        m.startEngine()
+        #expect(m.targetId == second)
+        m.pickSession(first)
+        #expect(m.currentError == .folderGone(gone))
+        #expect(m.targetId == second)
+        let error = CompanionError.folderGone(gone)
+        #expect(error.title == Design.Copy.Unreachable.folderGoneTitle)
+        #expect(error.advice.contains(gone))
+        #expect(error.remedies == [.chooseAnotherSession])
+        #expect(!error.canRetry)
+    }
+
+    @Test func openInTerminalChecksBeforeOpening() async {
+        let engine = FakeEngine()
+        var plain = session(first, age: 1, kind: .interactive)
+        plain.cwd = "/Users/someone/api-server"
+        engine.list = [session(second, age: 9), plain]
+        let m = checkedModel(engine)
+        m.startEngine()
+        // Picked from the list without becoming the target: Open in Terminal reopens the one picked.
+        m.pickSession(first)
+        #expect(m.currentError == .needsLauncher)
+        guard case let .open(script) = m.reopenInTerminal() else { Issue.record("expected a script"); return }
+        #expect(script.contains(first))
+        #expect(script.contains("cd '/Users/someone/api-server'"))
+        // The folder went away meanwhile: explained instead.
+        var moved = plain
+        moved.cwd = gone
+        engine.emit(moved)
+        let deadline = Date().addingTimeInterval(2)
+        while m.sessions.first(where: { $0.id == first })?.cwd != gone, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(m.reopenInTerminal() == .folderGone(gone))
+        #expect(m.currentError == .folderGone(gone))
+        // No launcher: the way forward is installing it.
+        let bare = checkedModel(engine, checks: PathChecks(folderExists: { _ in true }, isExecutable: { _ in false }))
+        bare.startEngine()
+        #expect(bare.reopenInTerminal() == .installLauncher)
+    }
+
+    @Test func aChosenSessionWhoseFolderWentAwayIsExplainedBeforeASend() async {
+        let engine = FakeEngine()
+        engine.list = [session(second, age: 9)]
+        let m = checkedModel(engine)
+        m.startEngine()
+        m.selectTarget(second)
+        var moved = session(second, age: 9)
+        moved.cwd = gone
+        engine.emit(moved)
+        let deadline = Date().addingTimeInterval(2)
+        while m.target?.cwd != gone, Date() < deadline { try? await Task.sleep(nanoseconds: 10_000_000) }
+        await m.sendTestMessage()
+        #expect(m.currentError == .folderGone(gone))
+        #expect(engine.sent.isEmpty)
+    }
+
+    @Test func aPlainClaudeSessionOffersConnectingEveryClaudeWhileItIsOff() {
+        let m = checkedModel(FakeEngine())
+        #expect(m.remedies(for: .needsLauncher) == [.copyResumeCommand, .chooseAnotherSession])
+        m.connectsEveryClaude = false
+        #expect(m.remedies(for: .needsLauncher) == [.copyResumeCommand, .connectEveryClaude, .chooseAnotherSession])
+        m.terminalCommandInstalled = false
+        #expect(m.remedies(for: .needsLauncher) == [.installTerminalCommand, .connectEveryClaude, .chooseAnotherSession])
+        // Only for plain-claude sessions.
+        #expect(!m.remedies(for: .notPickedUp(fallback: nil)).contains(.connectEveryClaude))
+    }
+}

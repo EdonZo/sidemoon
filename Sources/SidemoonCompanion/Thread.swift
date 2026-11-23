@@ -75,6 +75,14 @@ public struct Threads: Equatable, Sendable, Codable {
         return entry.id
     }
 
+    /// Adds an entry at the start of a conversation: the first message of a session Sidemoon started, whose answer
+    /// can arrive before Sidemoon learns the session's id.
+    @discardableResult
+    public mutating func prepend(_ entry: ThreadEntry, to session: String) -> UUID {
+        entries[session, default: []].insert(entry, at: 0)
+        return entry.id
+    }
+
     /// Records a reply once. The same reply is reported several times: by the send that asked for it,
     /// by the session's hook, and again whenever the session is seen anew (a resumed session
     /// re-announces its previous reply). `stamp` is when the reply's turn ended, when known; it is what

@@ -11,6 +11,9 @@ public final class Engine: @unchecked Sendable {
 
     /// How long an idle session has to show it picked up a channel delivery (`Constants.Timeouts.channelPickupWait`).
     let pickupWait: TimeInterval
+    /// Arguments added to every `claude --bg` that starts a new session. Empty in the app; the end-to-end tests
+    /// pass their own (project settings only, a small model, a name).
+    let newSessionArguments: [String]
 
     final class ChannelLink: @unchecked Sendable {
         let conn: LineConnection
@@ -34,11 +37,12 @@ public final class Engine: @unchecked Sendable {
 
     public init(socketPath: String = Constants.Paths.socketPath, runner: ClaudeRunner = SystemClaudeRunner(),
                 registry: SessionRegistry = SessionRegistry(homeFolderMemory: .supportFolder()),
-                pickupWait: TimeInterval = Constants.Timeouts.channelPickupWait) {
+                pickupWait: TimeInterval = Constants.Timeouts.channelPickupWait, newSessionArguments: [String] = []) {
         self.socketPath = socketPath
         self.runner = runner
         self.registry = registry
         self.pickupWait = pickupWait
+        self.newSessionArguments = newSessionArguments
     }
 
     // MARK: Lifecycle
@@ -113,6 +117,10 @@ public final class Engine: @unchecked Sendable {
                                   wait: msg["wait"] as? Bool ?? false,
                                   filePaths: msg["files"] as? [String] ?? [])
             _ = conn.writeJSON(send(req).dictionary)
+        case Constants.Ops.newSession:
+            let req = NewSessionRequest(folder: msg["folder"] as? String ?? "", text: msg["text"] as? String ?? "",
+                                        name: msg["name"] as? String)
+            _ = conn.writeJSON(startSession(req).dictionary)
         default:
             _ = conn.writeJSON(["ok": false, "error": "unknown op"])
         }
@@ -438,6 +446,54 @@ public final class Engine: @unchecked Sendable {
             if let id = tokens.first(where: { $0.count == Constants.ClaudeCLI.shortIdLength }) { return id.lowercased() }
         }
         return nil
+    }
+
+    // MARK: New session
+
+    /// Starts a new background session with its first message: `claude --bg -- "<message>"` in the folder. Returns
+    /// once Claude Code lists the session, with its full id; the answer arrives through the hooks like any other.
+    /// Touches no other session. Seen with Claude Code 2.1.330: it prints `backgrounded · <short id> · <name>` within
+    /// about a second, `--session-id` is ignored with `--bg`, the short id is the start of the full one, and
+    /// `claude agents` lists the session at once.
+    public func startSession(_ req: NewSessionRequest) -> NewSessionResult {
+        let text = req.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .failed(.emptyMessage) }
+        var isDirectory: ObjCBool = false
+        guard let folder = PathPolicy.absolute(req.folder),
+              FileManager.default.fileExists(atPath: folder, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return .failed(.folderMissing(req.folder))
+        }
+        // It would start, but no message could reach it again on this Mac.
+        if ResumeCheck.isHomeFolder(folder, home: registry.home), registry.homeFolderMemory.refused { return .failed(.homeFolderRefused) }
+        guard runner.isInstalled else { return .failed(.claudeNotFound) }
+
+        let prompt = [text, req.styleNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let cli = Constants.ClaudeCLI.self
+        let args = [cli.backgroundFlag] + newSessionArguments + (req.name.map { [cli.nameFlag, $0] } ?? [])
+            + [cli.endOfOptions, prompt]
+        let r = runner.run(args, cwd: folder, stdin: nil, timeout: Constants.Timeouts.newSessionStart)
+        let output = (r.stdoutText + r.stderrText).trimmingCharacters(in: .whitespacesAndNewlines)
+        let said = String(output.prefix(Constants.Limits.failureDetailCharacters))
+        if r.timedOut { return .failed(.timedOut, detail: said) }
+        guard r.status == 0 else {
+            if let refusal = ResumeCheck.classify(output) {
+                if refusal.blocker == .homeFolder { registry.homeFolderResume(refused: true) }
+                return .failed(.refused(refusal.blocker), detail: said)
+            }
+            // The process could not be launched at all: no claude where the runner looked.
+            if r.status < 0 && !runner.isInstalled { return .failed(.claudeNotFound, detail: said) }
+            return .failed(.failed(status: r.status), detail: said)
+        }
+        guard let short = Engine.backgroundedId(in: output) else { return .failed(.notConfirmed, detail: said) }
+        // Listed: the registry then knows it as a background session in its folder, so it is reachable at once.
+        let deadline = Date().addingTimeInterval(Constants.Timeouts.newSessionVerify)
+        while Date() < deadline {
+            if let listed = refreshAgents()?.first(where: { $0.agentId == short }) {
+                return NewSessionResult(sessionId: listed.sessionId, failure: nil, detail: said)
+            }
+            Thread.sleep(forTimeInterval: Constants.Timeouts.pollInterval)
+        }
+        return .failed(.notConfirmed, detail: "\(said)\n`claude agents` did not list \(short) within \(Int(Constants.Timeouts.newSessionVerify))s")
     }
 
     // MARK: Route c: headless

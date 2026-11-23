@@ -50,9 +50,11 @@ extension SetupModel {
         let helper = HelperLocator.locate(bundlePath: Bundle.main.bundlePath, executablePath: Bundle.main.executablePath,
                                           legacyPath: Constants.Paths.legacyCLIPath,
                                           isExecutable: { FileManager.default.isExecutableFile(atPath: $0) })
-        return SetupModel(helper: helper, paths: .standard, finder: SystemClaudeFinder(), hooks: SystemHooksService(),
+        let paths = SetupPaths.standard
+        return SetupModel(helper: helper, paths: paths, finder: SystemClaudeFinder(), hooks: SystemHooksService(),
                           files: SystemSetupFiles(), permission: SystemScreenCapturePermission(),
-                          relauncher: BundleRelauncher(), defaults: defaults, location: .current)
+                          relauncher: BundleRelauncher(), defaults: defaults, location: .current,
+                          shell: .system(launcher: paths.launcher))
     }
 }
 
@@ -73,6 +75,8 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
     private let companion: CompanionModel
     /// Runs after Start, once the window has closed.
     var onStart: () -> Void = {}
+    /// Runs after "Start a session here": as `onStart`, then the new-session form opens.
+    var onStartWithSession: () -> Void = {}
     /// The move to Applications, from the steps that wait for it.
     var onMove: () -> Void = {}
     private var window: NSWindow?
@@ -134,6 +138,7 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
                 NSPasteboard.general.setString(text, forType: .string)
             },
             start: { [weak self] in self?.start() },
+            startWithSession: { [weak self] in self?.start(withSession: true) },
             moveToApplications: { [weak self] in self?.onMove() })) { [weak self] height in self?.fit(height) }
             // A new size or theme redraws everything from the tokens.
             .id("\(companion.zoom)-\(companion.theme.rawValue)"))
@@ -188,11 +193,11 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func start() {
+    private func start(withSession: Bool = false) {
         if setup.offersOpenAtLogin { companion.setOpensAtLogin(setup.openAtLoginChoice) }
         setup.finish()
         window?.close()
-        onStart()
+        if withSession { onStartWithSession() } else { onStart() }
     }
 
     // MARK: NSWindowDelegate
@@ -216,6 +221,7 @@ struct SetupActions {
     var openURL: (URL) -> Void
     var copy: (String) -> Void
     var start: () -> Void
+    var startWithSession: () -> Void = {}
     var moveToApplications: () -> Void = {}
 }
 
@@ -298,10 +304,13 @@ struct SetupContent: View {
                     command(model.launcherResumeCommand)
                 }
                 if let warning = model.pathWarning { paragraph(warning) }
+                if model.shell != nil { shellChoice }
                 paragraph(C.terminalPreview)
                 if model.canInstallLauncher {
                     buttons {
-                        primary(model.terminal == .configOutdated ? C.repair : C.install) { model.installLauncher() }
+                        primary(model.terminal == .configOutdated ? C.repair : (model.terminal == .launcherOutdated ? C.update : C.install)) {
+                        model.installLauncher()
+                    }
                     }
                 }
             }
@@ -315,6 +324,29 @@ struct SetupContent: View {
     }
 
     // MARK: Pieces
+
+    /// "Connect every claude": a switch, what it changes, and what went wrong with a file.
+    private var shellChoice: some View {
+        VStack(alignment: .leading, spacing: Design.Space.m) {
+            Toggle(isOn: Binding(get: { model.connectsEveryClaude }, set: { model.setConnectsEveryClaude($0) })) {
+                Text(C.shellTitle).font(.prose).foregroundStyle(Color.ink)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(!model.canChangeShell)
+            paragraph(model.shellDetail)
+            if model.connectsEveryClaude || model.shell?.state == .partial {
+                paragraph(C.shellConfirmNote)
+            } else if model.canChangeShell, model.terminal != .installed {
+                paragraph(C.shellNeedsLauncher)
+            }
+            feedback(model.shellFeedback)
+            if let lines = model.shellLinesToCopy {
+                buttons { secondary(C.copyLines) { actions.copy(lines) } }
+            }
+        }
+        .padding(.top, Design.Space.xs)
+    }
 
     private var hairline: some View {
         Rectangle().fill(Color.line).frame(height: Design.Bubble.hairline)
@@ -460,6 +492,8 @@ struct SetupContent: View {
                     paragraph(C.openAtLoginAfterMove)
                 }
                 Spacer()
+                secondary(C.startWithSession, action: actions.startWithSession)
+                    .help(C.startWithSessionHelp)
                 primary(C.start, action: actions.start)
                     .keyboardShortcut(.defaultAction)
             }

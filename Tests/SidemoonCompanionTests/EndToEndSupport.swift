@@ -29,6 +29,8 @@ enum E2E {
     static var helper: String { env[Variable.helper] ?? "" }
     static var homeSession: String? { env[Variable.homeSession].flatMap { $0.isEmpty ? nil : $0 } }
 
+    /// The name (after the prefix) of a session the engine starts itself (the `create` scenario).
+    static let createdName = "create"
     /// The smallest model, and one-line prompts, keep a full run cheap.
     static let model = "haiku"
     /// Every throwaway session's name starts with this, so it is easy to tell apart from real ones.
@@ -81,6 +83,11 @@ enum E2E {
         static let termVariable = "TERM"
         static let termValue = "xterm-256color"
         static let exitGrace: TimeInterval = 10
+        static let zsh = "/bin/zsh"
+        static let interactiveFlag = "-i"
+        /// What Claude Code prints for a channel passed with --mcp-config only; logged, not a failure.
+        static let noServerWarning = "no MCP server configured with that name"
+        static let zdotdirVariable = "ZDOTDIR"
     }
 }
 
@@ -202,11 +209,30 @@ final class GuardedEngine: CompanionEngine, @unchecked Sendable {
         }
         return inner.send(request)
     }
+
+    /// Only in this run's scratch folder. The new session is written to the ledger at once, and may then be sent to.
+    func startSession(_ request: NewSessionRequest) -> NewSessionResult {
+        guard request.folder.hasPrefix(E2E.run + "/") else {
+            return NewSessionResult(sessionId: nil, failure: .failed(status: -1),
+                                    detail: "e2e guard: refusing to start a session outside this run's folder")
+        }
+        let r = inner.startSession(request)
+        if let id = r.sessionId {
+            ClaudeCLI.appendToLedger(E2E.Ledger.background, SessionID.short(id))
+            allow(id)
+        }
+        return r
+    }
+
+    func homeFolderRefused() -> Bool { inner.homeFolderRefused() }
 }
 
 /// One engine per test process, on the overridden socket. It is never stopped: the process ends instead.
 enum SharedEngine {
-    static let engine = InProcessEngine()
+    /// A session it starts loads only the scratch project's settings, runs on the small model and is named as a
+    /// throwaway, like the ones the scenarios start themselves.
+    static let engine = InProcessEngine(engine: Engine(newSessionArguments: E2E.settingSources
+        + ["--model", E2E.model, Constants.ClaudeCLI.nameFlag, "\(E2E.namePrefix)-\(E2E.createdName)"]))
 }
 
 // MARK: - One scenario's world
@@ -293,6 +319,11 @@ final class Fixture {
         return (a.sessionId, short)
     }
 
+    /// A background session the model started (through the engine): stopped and removed with the others.
+    func adoptBackground(_ short: String) {
+        if !backgroundSessions.contains(short) { backgroundSessions.append(short) }
+    }
+
     /// Waits until the session's first turn is over and the test engine knows it.
     func waitUntilIdle(_ sessionId: String, short: String, reply word: String? = nil) async throws {
         try await waitForBlocking("\(short) to finish its turn", timeout: E2E.Timeout.firstAnswer,
@@ -349,6 +380,21 @@ final class Fixture {
         return pty
     }
 
+    /// Plain `claude`, typed in an interactive zsh whose startup file has "Connect every claude" on. `zdotdir` holds
+    /// that .zshrc (the real home folder is never touched). The session is the zsh's child, so its pid is in the
+    /// ledger too once known.
+    func startWrappedTerminal(_ label: String, sessionId: String, zdotdir: String) throws -> PseudoTerminal {
+        let args = E2E.settingSources + ["--model", E2E.model, "-n", "\(E2E.namePrefix)-\(label)", "--session-id", sessionId]
+        let command = ([Constants.Paths.claudeExecutableName] + args).map(ShellQuote.single).joined(separator: " ")
+        let pty = try PseudoTerminal(executable: E2E.Terminal.zsh, arguments: [E2E.Terminal.interactiveFlag, E2E.shellCommandFlag, command],
+                                     cwd: project, environment: [E2E.Terminal.zdotdirVariable: zdotdir])
+        ClaudeCLI.appendToLedger(E2E.Ledger.process, "\(pty.pid) \(E2E.namePrefix)-\(label)")
+        terminals.append(pty)
+        guarded.allow(sessionId)
+        e2eLog("[\(name)] started zsh \(pty.pid) running plain claude for session \(sessionId)")
+        return pty
+    }
+
     /// Stands in for a refused home-folder resume seen earlier on this Mac (Claude Code here reopens them), so the
     /// scenarios can check what Sidemoon does where Claude Code refuses. Only the test engine's own support
     /// folder is written; cleanup forgets it. The list greys such sessions from the next `claude agents` reading.
@@ -378,7 +424,7 @@ final class PseudoTerminal: @unchecked Sendable {
     var pid: Int32 { process.processIdentifier }
     var isRunning: Bool { process.isRunning }
 
-    init(executable: String, arguments: [String], cwd: String) throws {
+    init(executable: String, arguments: [String], cwd: String, environment extra: [String: String] = [:]) throws {
         var m: Int32 = -1, s: Int32 = -1
         var size = winsize(ws_row: E2E.Terminal.rows, ws_col: E2E.Terminal.columns, ws_xpixel: 0, ws_ypixel: 0)
         guard openpty(&m, &s, nil, nil, &size) == 0 else { throw E2EFailure("openpty failed: \(String(cString: strerror(errno)))") }
@@ -389,6 +435,7 @@ final class PseudoTerminal: @unchecked Sendable {
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         var env = LoginEnvironment.shared
         env[E2E.Terminal.termVariable] = E2E.Terminal.termValue
+        env.merge(extra) { $1 }
         process.environment = env
         process.standardInput = slave
         process.standardOutput = slave

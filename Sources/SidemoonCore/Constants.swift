@@ -132,6 +132,11 @@ public enum Constants {
         public static let loginEnvironment: TimeInterval = 10
         /// Grace period after terminating a login shell that overran its budget.
         public static let loginEnvironmentTerminateGrace: TimeInterval = 2
+        /// How long `claude --bg "<message>"` may take to print the new session's id. Seen with Claude Code
+        /// 2.1.330: about a second.
+        public static let newSessionStart: TimeInterval = 30
+        /// After that: how long the new session has to show up in `claude agents` (seen: at once).
+        public static let newSessionVerify: TimeInterval = 30
     }
 
     // MARK: Environment given to `claude`
@@ -179,6 +184,12 @@ public enum Constants {
         /// Words in `claude --resume --bg` output that mean a copy was started instead.
         public static let forkIndicators = ["copy", "fork", "new session"]
         public static let backgroundedMarker = "backgrounded"
+        /// Ends the options, so a message that starts with a dash is not read as a flag (seen to work with `--bg`).
+        public static let endOfOptions = "--"
+        /// Names a new session.
+        public static let nameFlag = "-n"
+        /// `claude attach <short id>` opens a background session in a terminal.
+        public static let attachCommand = "attach"
         public static let shortIdLength = 8
         /// Flags a user adds to an interactive launch so the Sidemoon channel loads.
         public static let channelLaunchFlags = ["--mcp-config", "--dangerously-load-development-channels"]
@@ -261,5 +272,7 @@ public enum Constants {
         public static let channelAck = "channel.ack"
         public static let sessions = "sessions"
         public static let send = "send"
+        /// Starts a new background session with a first message.
+        public static let newSession = "session.new"
     }
 }

@@ -7,7 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // The panels never activate Sidemoon, so the front-most app is the one the user is working in.
     let model = CompanionModel(engine: InProcessEngine(), capture: ScreencaptureProvider(),
                                windowCapture: ActiveWindowCaptureProvider { NSWorkspace.shared.frontmostApplication?.processIdentifier },
-                               archive: ThreadArchive())
+                               archive: ThreadArchive(), pathChecks: .system)
     private var panels: PanelController!
     private let hotKeys = HotKeyCenter()
     private var failedHotKeys: [HotKeySpec] = []
@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Decides whether an error offers the resume command or the way to install it.
         let installed = setup.terminal == .installed
         if model.terminalCommandInstalled != installed { model.terminalCommandInstalled = installed }
+        // Offered with a plain-claude session only while it is off and could be turned on.
+        let connectsEvery = setup.connectsEveryClaude || !setup.canChangeShell
+        if model.connectsEveryClaude != connectsEvery { model.connectsEveryClaude = connectsEvery }
     }
 
     /// Opens the setup window (first launch, the menu, the settings).
@@ -49,6 +52,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onStart = { [unowned self] in
             model.presentAfterSetup()
             panels.reveal()
+        }
+        // The optional last step: start the first session from here, so nothing has to be typed in a terminal.
+        controller.onStartWithSession = { [unowned self] in
+            model.presentAfterSetup()
+            panels.reveal()
+            model.openNewSession()
         }
         controller.onMove = { [unowned self] in offerMove() }
         return controller
@@ -114,11 +123,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openURL: { NSWorkspace.shared.open($0) },
             sendFeedback: { FeedbackSender.send($0) },
-            openInTerminal: { TerminalOpener.open(sessionId: $0, folder: $1) }))
+            openInTerminal: { TerminalOpener.open(script: $0) },
+            connectEveryClaude: { [unowned self] in
+                showSetup()
+                setupWindow?.setup.setConnectsEveryClaude(true)
+                syncConnection()
+            }))
 
         // A copy outside Applications never registers itself to open at login: the setting would point at it.
         model.loginItem = location.maySetUp ? SystemLoginItem() : nil
         model.updater = SparkleUpdater()
+        // "Choose folder…" in the new-session form, and the claude "Open in Terminal" attaches with.
+        model.folderChooser = FolderPanel()
+        model.claudePath = SystemClaudeRunner.locateClaude()
         // Never shown (the app has no menu bar), but it is what makes Command-C and friends work in Setup.
         NSApp.mainMenu = EditShortcut.menu()
         model.startEngine()

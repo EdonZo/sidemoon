@@ -327,6 +327,7 @@ final class PanelController {
             _ = model.isExpanded
             _ = model.isEditingNote
             _ = model.isPickingSession
+            _ = model.isCreatingSession
             _ = model.zoom
             _ = model.theme
             _ = model.isLarge
@@ -400,8 +401,8 @@ final class PanelController {
         if model.isExpanded {
             placeBubble()
             bubble.orderFrontRegardless()
-            // The session list is driven by the arrow keys, so it needs the keyboard too.
-            if wantsKeyOnOpen || (model.isPickingSession && !bubble.isKeyWindow) { bubble.makeKey() }
+            // The session list is driven by the arrow keys, and the new-session form is typed in: both need the keyboard.
+            if wantsKeyOnOpen || ((model.isPickingSession || model.isCreatingSession) && !bubble.isKeyWindow) { bubble.makeKey() }
         } else {
             bubble.orderOut(nil)
         }

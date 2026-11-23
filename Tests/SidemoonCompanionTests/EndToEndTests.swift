@@ -393,6 +393,52 @@ import Testing
         }
     }
 
+    // MARK: 6a
+
+    /// "Connect every claude": plain `claude` typed in zsh goes through the block and the launcher, gets the channel
+    /// (the flags in their one-word form, followed by the session's own arguments), and a message is delivered over it.
+    @Test func wrappedPlainClaude() async {
+        await scenario("wrapped") { fx in
+            let configPath = try channelConfig("wrapped")
+            // The launcher and a zsh startup folder in the scratch run folder, as Setup would write them.
+            let launcher = "\(E2E.run)/wrapped-bin/\(Constants.Paths.launcherName)"
+            let zdotdir = "\(E2E.run)/wrapped-zsh"
+            try FileManager.default.createDirectory(atPath: (launcher as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: zdotdir, withIntermediateDirectories: true)
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            try LauncherScript.content(configPath: configPath, helper: E2E.helper, home: home)
+                .write(toFile: launcher, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: CompanionConstants.Setup.launcherPermissions)],
+                                                  ofItemAtPath: launcher)
+            let shell = ShellIntegration(home: zdotdir, loginShell: E2E.Terminal.zsh, launcher: launcher, fileSystem: SystemShellFileSystem())
+            let report = shell.enable()
+            #expect(report.changed == ["\(zdotdir)/\(CompanionConstants.ShellIntegration.zshFile)"], "\(report)")
+
+            let sid = UUID().uuidString.lowercased()
+            let pty = try fx.startWrappedTerminal("wrapped", sessionId: sid, zdotdir: zdotdir)
+            defer {
+                // The session runs under zsh: end it directly too.
+                if let pid = fx.session(sid)?.pid { kill(pid, SIGTERM) }
+            }
+            try await waitFor("the channel to connect", timeout: E2E.Timeout.terminalStart,
+                              observed: { "\(fx.describe(sid)); screen: \(pty.tail)" }) {
+                fx.session(sid)?.channelConnected == true
+            }
+            if let pid = fx.session(sid)?.pid { ClaudeCLI.appendToLedger(E2E.Ledger.process, "\(pid) \(E2E.namePrefix)-wrapped") }
+            let confirmed = pty.asked(E2E.Terminal.developmentChannelsChoice)
+            let warned = pty.text.contains(E2E.Terminal.noServerWarning)
+            e2eLog("[wrapped] connected; development-channels question asked: \(confirmed); "
+                + "\"no MCP server configured\" shown: \(warned)")
+            #expect(confirmed, "the per-launch question was expected; screen: \(pty.tail)")
+            try fx.select(sid)
+            #expect(fx.model.target?.routes.first == .channel)
+            try await fx.send(E2E.Words.reply("PLUM"), to: sid)
+            let reply = fx.lastEntry(role: .session, of: sid)?.text ?? ""
+            #expect(fx.model.currentError == nil, "error: \(String(describing: fx.model.currentError)); screen: \(pty.tail)")
+            #expect(reply.uppercased().contains("PLUM"), "reply was: \(reply); screen: \(pty.tail)")
+        }
+    }
+
     // MARK: 6b
 
     /// A terminal session started with only `--mcp-config`, as Claude Code starts the process that hosts a session
@@ -589,6 +635,56 @@ import Testing
             fx.model.dismissError()
             fx.model.pickSession(sid)
             #expect(fx.model.targetId == sid && fx.model.currentError == nil)
+        }
+    }
+
+    // MARK: 10
+
+    /// A session started from the companion: the form's Start runs `claude --bg` in a fresh project folder, the new
+    /// session becomes the target with the first message in its thread, its answer arrives through the hooks, and a
+    /// second message reaches the same session.
+    @Test func createSession() async {
+        await scenario("create") { fx in
+            let model = fx.model
+            model.openNewSession()
+            model.chooseNewSessionFolder(fx.project)
+            model.newSessionMessage = E2E.Words.reply("FIG")
+            #expect(model.canStartNewSession, "note: \(String(describing: model.newSessionFolderNote))")
+            let started = Date()
+            await model.startNewSession()
+            let took = Date().timeIntervalSince(started)
+            guard let sid = model.targetId, model.newSession.problem == nil else {
+                throw E2EFailure("not started: \(String(describing: model.newSession.problem)) \(model.newSession.problemDetail ?? "")")
+            }
+            let short = SessionID.short(sid)
+            fx.adoptBackground(short)
+            e2eLog("[create] started \(short) (\(sid)) in \(String(format: "%.1f", took))s; \(fx.describe(sid)); "
+                + "awaiting=\(model.isAwaitingReply)")
+            #expect(!model.isCreatingSession)
+            #expect(fx.session(sid)?.kind == .background, "\(fx.describe(sid))")
+            #expect(fx.session(sid)?.cwd == fx.project, "\(fx.describe(sid))")
+            let first = model.threads.thread(for: sid).first
+            #expect(first?.role == .you && first?.text == E2E.Words.reply("FIG") && first?.delivery == .delivered,
+                    "\(fx.describeThread(sid))")
+            // The first answer comes through the Stop hook, like any other.
+            try await waitFor("the first answer in the thread", timeout: E2E.Timeout.firstAnswer,
+                              observed: { "\(fx.describeThread(sid)); \(fx.describe(sid))" }) {
+                fx.lastEntry(role: .session, of: sid)?.text.uppercased().contains("FIG") == true
+            }
+            e2eLog("[create] first answer after \(String(format: "%.1f", Date().timeIntervalSince(started)))s: \(fx.describeThread(sid))")
+            #expect(model.currentError == nil, "error: \(String(describing: model.currentError))")
+            // The second message goes to the same session.
+            try await fx.waitUntilIdle(sid, short: short)
+            try await fx.send(E2E.Words.reply("KIWI"), to: sid)
+            let reply = fx.lastEntry(role: .session, of: sid)?.text ?? ""
+            e2eLog("[create] second reply \(reply.prefix(80)); \(fx.describeThread(sid))")
+            #expect(model.currentError == nil, "error: \(String(describing: model.currentError))")
+            #expect(fx.lastEntry(role: .you, of: sid)?.delivery == .delivered, "\(fx.describeThread(sid))")
+            #expect(reply.uppercased().contains("KIWI"), "reply was: \(reply)")
+            let listed = await Task.detached { ClaudeCLI.agents() }.value.filter { $0.cwd == fx.project }
+            #expect(listed.map(\.sessionId) == [sid], "sessions in the project: \(listed.map { ClaudeCLI.describe($0) })")
+            #expect(listed.first?.name == "\(E2E.namePrefix)-\(E2E.createdName)", "\(listed.map { $0.name ?? "-" })")
+            #expect(TranscriptReader.contains(listed.first?.transcriptPath ?? "", "KIWI"), "KIWI is not in the transcript")
         }
     }
 }
