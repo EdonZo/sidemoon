@@ -112,8 +112,19 @@ extension Engine {
     /// `send` blocks for seconds here; on a thread of its own it holds up none of the pool other tests share
     /// (some of them wait on `DispatchQueue.global()`).
     func sending(_ request: SendRequest) async -> SendResult {
+        await timedSending(request).result
+    }
+
+    /// The same, with how long `send` itself took, measured on the thread that ran it. Measured around the `await`
+    /// instead, it also counts the wait for a free thread to carry on the test, which was seen to take almost 4 s
+    /// while the shell tests filled the pool with processes they wait for.
+    func timedSending(_ request: SendRequest) async -> (result: SendResult, seconds: TimeInterval) {
         await withCheckedContinuation { done in
-            Thread.detachNewThread { done.resume(returning: self.send(request)) }
+            Thread.detachNewThread {
+                let started = Date()
+                let result = self.send(request)
+                done.resume(returning: (result, Date().timeIntervalSince(started)))
+            }
         }
     }
 }
@@ -134,10 +145,9 @@ extension Engine {
         #expect(await waitUntil { e.registry.session(sid)?.channelDropped == true })
         #expect(e.registry.session(sid)?.channelConnected == false)
         #expect(e.registry.session(sid)?.routes == [])
-        let started = Date()
-        let r = await e.sending(SendRequest(session: sid, text: "hi", wait: true))
+        let (r, took) = await e.timedSending(SendRequest(session: sid, text: "hi", wait: true))
         #expect(r.failure == .channelIgnored(fallback: nil))
-        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(took < 1, "took \(took)s")
         #expect(helper.deliveries.isEmpty)
     }
 
@@ -148,9 +158,7 @@ extension Engine {
         let helper = try FakeHelper(socket: e.socketPath, role: nil)
         defer { cleanup(e, helper, dir) }
         #expect(await waitUntil { e.registry.session(sid)?.channelConnected == true })
-        let started = Date()
-        let r = await e.sending(SendRequest(session: sid, text: "hi", wait: true))
-        let took = Date().timeIntervalSince(started)
+        let (r, took) = await e.timedSending(SendRequest(session: sid, text: "hi", wait: true))
         #expect(r.failure == .channelIgnored(fallback: nil))
         #expect(took >= e.pickupWait && took < e.pickupWait + 5, "took \(took)s")
         #expect(helper.deliveries.count == 1)

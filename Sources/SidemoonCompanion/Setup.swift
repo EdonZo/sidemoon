@@ -217,22 +217,52 @@ public enum MoveToApplications {
 // MARK: The launcher
 
 public enum LauncherScript {
-    /// The `sidemoon-claude` script: starts `claude` with the channel config loaded. A config under the home directory
-    /// is named after `$HOME`, so the script reads the same for every user.
-    public static func content(configPath: String, home: String) -> String {
+    /// The `sidemoon-claude` script: starts `claude` with the channel config loaded. It is the one place that decides
+    /// which invocations get the channel: everything that does not start an interactive session here, and every
+    /// launch while the helper or the config is missing, runs plain `claude` with the arguments unchanged. So
+    /// `sidemoon-claude <anything>` is always safe, and the shell integration only has to call it.
+    ///
+    /// A config under the home directory is named after `$HOME`. The flags are written in their `--flag=value` form:
+    /// both take several values, and in the two-word form Claude Code would read a prompt that follows as one more
+    /// config or channel name ("entries must be tagged").
+    public static func content(configPath: String, helper: String, home: String) -> String {
         let s = CompanionConstants.Setup.self
-        let config: String
-        if configPath.hasPrefix(home + "/") {
-            config = s.homeVariable + escaped(String(configPath.dropFirst(home.count)))
-        } else {
-            config = escaped(configPath)
-        }
+        let l = CompanionConstants.Launcher.self
+        let claude = Constants.Paths.claudeExecutableName
+        let plain = "exec \(claude) \"$@\""
+        let config = homeRelative(configPath, home: home)
         let flags = Constants.ClaudeCLI.channelLaunchFlags
         // channelLaunchFlags is [mcp-config flag, channel flag].
         let mcpFlag = flags.first ?? "", channelFlag = flags.last ?? ""
-        let exec = "exec \(Constants.Paths.claudeExecutableName) \(mcpFlag) \"\(config)\" \(channelFlag) "
-            + "\(Constants.ClaudeCLI.channelLaunchValue) \"$@\""
-        return [s.launcherShebang, s.launcherComment, exec].joined(separator: "\n") + "\n"
+        let separator = String(Constants.ClaudeCLI.flagValueSeparator)
+        let flagPatterns = l.passThroughFlags + l.passThroughValueFlags.map { $0 + separator + "*" }
+        let lines = [
+            s.launcherShebang,
+            s.launcherComment,
+            s.launcherPassThroughComment,
+            "\(l.helperVariable)=\(ShellQuote.single(helper))",
+            "\(l.configVariable)=\"\(config)\"",
+            "[ -x \"$\(l.helperVariable)\" ] && [ -r \"$\(l.configVariable)\" ] || \(plain)",
+            "case \"${1-}\" in",
+            "    \(l.passThroughSubcommands.joined(separator: "|"))) \(plain) ;;",
+            "esac",
+            "for arg in \"$@\"; do",
+            "    case \"$arg\" in",
+            "        \(l.endOfOptions)) break ;;",
+            "        \(flagPatterns.joined(separator: "|"))) \(plain) ;;",
+            "    esac",
+            "done",
+            "exec \(claude) \(mcpFlag)\(separator)\"$\(l.configVariable)\" "
+                + "\(channelFlag)\(separator)\(Constants.ClaudeCLI.channelLaunchValue) \"$@\"",
+        ]
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// A path for inside double quotes in sh, under the home directory written from `$HOME`.
+    static func homeRelative(_ path: String, home: String) -> String {
+        path.hasPrefix(home + "/")
+            ? CompanionConstants.Setup.homeVariable + escaped(String(path.dropFirst(home.count)))
+            : escaped(path)
     }
 
     /// Escapes what is special inside double quotes in sh.
@@ -249,6 +279,15 @@ public enum LauncherScript {
     public static func matches(_ data: Data?, expected: String) -> Bool {
         guard let data, let text = String(data: data, encoding: .utf8) else { return false }
         return text.trimmingCharacters(in: .whitespacesAndNewlines) == expected.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A launcher Sidemoon wrote, this version's or an earlier one: it starts with the shebang and the comment every
+    /// Sidemoon launcher has had. Anything else at the launcher's path is the user's and is never replaced.
+    public static func isSidemoons(_ data: Data?) -> Bool {
+        guard let data, let text = String(data: data, encoding: .utf8) else { return false }
+        let s = CompanionConstants.Setup.self
+        let lines = text.split(separator: "\n", maxSplits: 2, omittingEmptySubsequences: false)
+        return lines.count >= 2 && lines[0] == s.launcherShebang && lines[1] == s.launcherComment
     }
 
     /// The `command` the channel config runs, or nil when it is not a Sidemoon channel config.
@@ -326,6 +365,8 @@ public enum CaptureStatus: Equatable, Sendable {
 public enum TerminalStatus: Equatable, Sendable {
     case notInstalled
     case installed
+    /// The launcher is one an earlier version of Sidemoon wrote; Setup replaces it with this version's.
+    case launcherOutdated
     /// The launcher is there, but the channel config is missing or runs another copy of Sidemoon.
     case configOutdated
     /// Something else is already at the launcher's path.
@@ -359,6 +400,11 @@ public final class SetupModel {
     public private(set) var launcherOnPath = true
     public private(set) var connectionFeedback: SetupFeedback?
     public private(set) var terminalFeedback: SetupFeedback?
+    /// "Connect every claude": the shell startup files, or nil when this setup does not offer it.
+    public private(set) var shell: ShellIntegrationStatus?
+    public private(set) var shellFeedback: SetupFeedback?
+    /// The lines to add by hand to a file Sidemoon would not change (a link, a read-only file); nil when none.
+    public private(set) var shellLinesToCopy: String?
     public private(set) var requestedCapture = false
     /// The Ready section's "open at login" tick, applied when Start is pressed. Shown only when offered.
     public var openAtLoginChoice = true
@@ -377,11 +423,13 @@ public final class SetupModel {
     @ObservationIgnored private let permission: ScreenCapturePermission
     @ObservationIgnored private let relauncher: AppRelauncher
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let shellIntegration: ShellIntegration?
     @ObservationIgnored private var lookupInFlight = false
 
     public init(helper: HelperLocation, paths: SetupPaths, finder: ClaudeFinder, hooks: HooksService, files: SetupFiles,
                 permission: ScreenCapturePermission, relauncher: AppRelauncher, defaults: UserDefaults = .standard,
-                location: AppLocation = .applications) {
+                location: AppLocation = .applications, shell: ShellIntegration? = nil) {
+        self.shellIntegration = shell
         self.helper = helper
         self.paths = paths
         self.location = location
@@ -407,6 +455,8 @@ public final class SetupModel {
     /// Re-checks every step. The `claude` lookup runs off the main thread; one at a time.
     public func refresh() async {
         refreshLocal()
+        // A launcher an earlier version wrote is brought up to date whenever Setup checks.
+        if terminal == .launcherOutdated, !needsMove { installLauncher() }
         guard !lookupInFlight else { return }
         lookupInFlight = true
         let finder = self.finder
@@ -423,9 +473,13 @@ public final class SetupModel {
                                            isExecutable: files.isExecutable)
         let granted = permission.isGranted()
         capture = granted ? .granted : (requestedCapture ? .pendingRelaunch : .notGranted)
+        let launcher = files.read(paths.launcher)
         terminal = SetupModel.terminal(helper: helper, launcherExists: files.exists(paths.launcher),
-                                       launcherIsOurs: LauncherScript.matches(files.read(paths.launcher), expected: launcherContent),
+                                       launcherIsOurs: LauncherScript.isSidemoons(launcher),
+                                       launcherIsCurrent: LauncherScript.matches(launcher, expected: launcherContent),
                                        configuredCommand: LauncherScript.configuredCommand(files.read(paths.channelConfig)))
+        let next = shellIntegration?.status()
+        if next != shell { shell = next }
     }
 
     func apply(_ found: ClaudeLookup) {
@@ -464,11 +518,13 @@ public final class SetupModel {
         return isExecutable(other) ? .otherCopy(other) : .missingCopy(other)
     }
 
-    static func terminal(helper: HelperLocation, launcherExists: Bool, launcherIsOurs: Bool,
+    /// `launcherIsOurs`: written by some version of Sidemoon. `launcherIsCurrent`: exactly this version's script.
+    static func terminal(helper: HelperLocation, launcherExists: Bool, launcherIsOurs: Bool, launcherIsCurrent: Bool,
                          configuredCommand: String?) -> TerminalStatus {
-        if launcherExists, !launcherIsOurs { return .foreignLauncher }
+        if launcherExists, !launcherIsOurs, !launcherIsCurrent { return .foreignLauncher }
         guard let helperPath = helper.path else { return .helperUnavailable(helper) }
         guard launcherExists else { return .notInstalled }
+        guard launcherIsCurrent else { return .launcherOutdated }
         return configuredCommand == helperPath ? .installed : .configOutdated
     }
 
@@ -519,7 +575,9 @@ public final class SetupModel {
     /// Connect and screen capture are what the companion needs; terminal sessions are optional.
     public var requiredStepsDone: Bool { connectionState == .done && captureState == .done }
 
-    public var canInstallLauncher: Bool { !needsMove && (terminal == .notInstalled || terminal == .configOutdated) }
+    public var canInstallLauncher: Bool {
+        !needsMove && (terminal == .notInstalled || terminal == .configOutdated || terminal == .launcherOutdated)
+    }
     public var canRelaunch: Bool { relauncher.canRelaunch }
 
     // MARK: Words for the current state
@@ -578,6 +636,7 @@ public final class SetupModel {
         case .notInstalled: return c.terminalChanges(launcherDisplayPath, config: configDisplayPath)
         case .installed: return c.terminalInstalled
         case .configOutdated: return c.terminalConfigOutdated
+        case .launcherOutdated: return c.terminalLauncherOutdated
         case .foreignLauncher: return c.terminalForeign(launcherDisplayPath)
         case let .helperUnavailable(location): return helperProblem(location)
         }
@@ -612,7 +671,7 @@ public final class SetupModel {
         refreshLocal()
     }
 
-    /// Removes Sidemoon's hooks (and only those), after a backup.
+    /// Removes Sidemoon's hooks (and only those), after a backup, and Sidemoon's lines from the shell startup files.
     public func disconnect() {
         do {
             let outcome = try hooks.uninstall()
@@ -620,6 +679,7 @@ public final class SetupModel {
         } catch {
             connectionFeedback = SetupFeedback(Design.Copy.Setup.failed("\(error)"), isProblem: true)
         }
+        if shell?.withBlock.isEmpty == false { setConnectsEveryClaude(false) }
         refreshLocal()
     }
 
@@ -646,13 +706,17 @@ public final class SetupModel {
     }
 
     /// The launcher script as it should be.
-    public var launcherContent: String { LauncherScript.content(configPath: paths.channelConfig, home: paths.home) }
+    public var launcherContent: String {
+        LauncherScript.content(configPath: paths.channelConfig, helper: helper.path ?? "", home: paths.home)
+    }
 
-    /// Writes the channel config (Sidemoon's own file, always brought up to date) and the launcher. A different
-    /// file already at the launcher's path is never replaced.
+    /// Writes the channel config (Sidemoon's own file, always brought up to date) and the launcher, replacing a
+    /// launcher an earlier version of Sidemoon wrote. A different file already at the launcher's path is never replaced.
     public func installLauncher() {
         guard !needsMove, let helperPath = helper.path else { return }
-        if files.exists(paths.launcher), !LauncherScript.matches(files.read(paths.launcher), expected: launcherContent) {
+        let existing = files.read(paths.launcher)
+        let current = LauncherScript.matches(existing, expected: launcherContent)
+        if files.exists(paths.launcher), !current, !LauncherScript.isSidemoons(existing) {
             terminalFeedback = SetupFeedback(Design.Copy.Setup.terminalForeign(launcherDisplayPath), isProblem: true)
             refreshLocal()
             return
@@ -661,7 +725,7 @@ public final class SetupModel {
             try files.createDirectory(paths.channelConfigDirectory, permissions: Int(Constants.Permissions.directory))
             let config = ChannelServer.mcpConfig(executablePath: helperPath) + "\n"
             try files.write(Data(config.utf8), to: paths.channelConfig, permissions: Int(Constants.Permissions.imageFile))
-            if !files.exists(paths.launcher) {
+            if !current {
                 try files.createDirectory(paths.launcherDirectory, permissions: Int(CompanionConstants.Setup.launcherPermissions))
                 try files.write(Data(launcherContent.utf8), to: paths.launcher,
                                 permissions: Int(CompanionConstants.Setup.launcherPermissions))
@@ -671,6 +735,75 @@ public final class SetupModel {
             terminalFeedback = SetupFeedback(Design.Copy.Setup.failed("\(error)"), isProblem: true)
         }
         refreshLocal()
+    }
+
+    // MARK: Connect every claude
+
+    /// The switch can be used: offered here, Sidemoon in Applications, and a launcher that is or can be Sidemoon's.
+    public var canChangeShell: Bool {
+        shell != nil && !needsMove && helper.path != nil && terminal != .foreignLauncher
+    }
+
+    /// The switch is on (every file it goes in has the current lines).
+    public var connectsEveryClaude: Bool { shell?.state == .on }
+
+    /// The files the switch changes, for display.
+    public var shellFiles: [String] {
+        let files = shell.map { ($0.targets + $0.withBlock).map(\.file.path) } ?? []
+        var seen: Set<String> = []
+        return files.filter { seen.insert($0).inserted }.map(paths.display)
+    }
+
+    public var shellDetail: String {
+        let c = Design.Copy.Setup.self
+        guard let shell else { return "" }
+        if needsMove, shell.state != .on { return c.moveFirst }
+        if shell.targets.isEmpty, shell.withBlock.isEmpty { return c.shellNoShell }
+        switch shell.state {
+        case .off: return c.shellExplain(shellFiles)
+        case .on: return c.shellOn(shellFiles)
+        case .partial: return c.shellPartial
+        }
+    }
+
+    /// One click on, one click off. On also installs (or updates) the launcher the lines call.
+    public func setConnectsEveryClaude(_ on: Bool) {
+        guard let shellIntegration else { return }
+        shellLinesToCopy = nil
+        if on {
+            guard canChangeShell else { return }
+            if terminal != .installed { installLauncher() }
+            guard terminal == .installed else {
+                shellFeedback = terminalFeedback ?? SetupFeedback(terminalDetail, isProblem: true)
+                refreshLocal()
+                return
+            }
+        }
+        let report = on ? shellIntegration.enable() : shellIntegration.disable()
+        shellFeedback = feedback(for: report)
+        if let skipped = report.skipped.first(where: { $0.reason == .obstacle(.symlink) || $0.reason == .obstacle(.unwritable) }),
+           let file = shellIntegration.candidates().first(where: { $0.path == skipped.path }), on {
+            shellLinesToCopy = shellIntegration.block(for: file)
+        }
+        refreshLocal()
+    }
+
+    private func feedback(for report: ShellChangeReport) -> SetupFeedback? {
+        let c = Design.Copy.Setup.self
+        let problems = report.skipped.map { skip -> String in
+            let file = paths.display(skip.path)
+            switch skip.reason {
+            case .obstacle(.symlink): return c.shellLink(file)
+            case .obstacle(.unwritable): return c.shellUnwritable(file)
+            case .obstacle(.unreadable): return c.shellUnreadable(file)
+            case .obstacle(.notAFile): return c.shellNotAFile(file)
+            case .obstacle(.foreignFunction): return c.shellForeignFunction(file)
+            case .obstacle(.malformed): return c.shellMalformed(file)
+            case let .failed(reason): return c.shellFailed(file, reason: reason)
+            }
+        }
+        if !problems.isEmpty { return SetupFeedback(problems.joined(separator: " "), isProblem: true) }
+        return report.backups.isEmpty ? nil : SetupFeedback(c.backupsSaved(report.backups.map(paths.display)))
     }
 }
 

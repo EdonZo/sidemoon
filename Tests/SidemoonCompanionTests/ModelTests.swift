@@ -27,6 +27,19 @@ final class FakeEngine: CompanionEngine, @unchecked Sendable {
         }
         return reply(request)
     }
+    /// What starting a new session does; by default it fails as not confirmed.
+    var onStart: @Sendable (NewSessionRequest) -> NewSessionResult = { _ in
+        NewSessionResult(sessionId: nil, failure: .notConfirmed, detail: nil)
+    }
+    var homeRefused = false
+    private(set) var startRequests: [NewSessionRequest] = []
+    func startSession(_ request: NewSessionRequest) -> NewSessionResult {
+        lock.withLock { startRequests.append(request) }
+        return onStart(request)
+    }
+    func homeFolderRefused() -> Bool { homeRefused }
+    var started: [NewSessionRequest] { lock.withLock { startRequests } }
+
     func emit(_ s: Session) {
         lock.withLock {
             if let i = list.firstIndex(where: { $0.id == s.id }) { list[i] = s } else { list.append(s) }

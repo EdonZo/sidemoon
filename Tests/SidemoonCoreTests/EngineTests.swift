@@ -90,18 +90,24 @@ func agents(status: String, state: String, running: Bool = true, cwd: String = "
         #expect(r.sessionId(forPid: 10)?.hasPrefix("8c1d") == true)
     }
 
+    /// The two Stops come from a thread of its own: work queued on `DispatchQueue.global()` was seen not to run for
+    /// over 5 s while the full suite kept every core busy, so the waiter timed out with nothing applied. And a waiter
+    /// is woken before the registry tells its observers about that Stop, so the count is waited for, not read at once.
     @Test func stopWaiterSeesLaterStopOnlyAndEmitsChanges() {
         let r = SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in true })
         let seen = LockedCount()
         r.subscribe { _ in seen.add() }
         let token = r.expectStop(sessionId: sid)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.1)
             r.apply(hook("Stop", other))
             r.apply(hook("Stop", sid, extra: ["last_assistant_message": "hello"]))
         }
         let e = r.wait(token, timeout: 5)
         #expect(e?.sessionId == sid)
         #expect(e?.lastAssistantMessage == "hello")
+        let deadline = Date().addingTimeInterval(5)
+        while seen.value < 2, Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
         #expect(seen.value == 2)
     }
 

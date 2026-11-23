@@ -45,10 +45,12 @@ home|homeFolderSession|yes|Home-folder session: answered here; refused before an
 never-answered|neverAnsweredSession|no|Session stopped before its first answer: refused, untouched
 ended|endedSession|no|Ended session: resumed headlessly and answers
 channel|terminalChannelSession|no|Terminal session with the channel: delivered, never restarted
+wrapped|wrappedPlainClaude|no|Plain claude in zsh with Connect every claude on: through the launcher, delivered over the channel
 mcp-without-channel|mcpWithoutChannel|no|Helper loaded without the channel flag: not claimed, a send fails fast
 attachments|imageAndFile|no|A capture with one word and a dropped text file reach the session
 retry|retryAfterFailure|yes|A failed send then Retry succeeds; no Retry for a refusal
-session-list|sessionListTruth|yes|Session list reachability matches what Claude Code says'
+session-list|sessionListTruth|yes|Session list reachability matches what Claude Code says
+create|createSession|no|New session from the companion: started in a fresh folder, answered, then a second message to it'
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 

@@ -56,6 +56,27 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
         ]
     }()
 
+    /// A background session whose folder was deleted.
+    static let goneFolder = "/Users/me/Projects/old-prototype"
+    static let folderGone: Session = {
+        var s = Session(id: "00000000-0000-4000-8000-000000000201")
+        s.name = "old-prototype"
+        s.cwd = goneFolder
+        s.kind = .background
+        s.lastEventAt = Date().addingTimeInterval(-15)
+        return s
+    }()
+
+    /// A terminal session started with plain claude.
+    static let plainTerminal: Session = {
+        var s = Session(id: "00000000-0000-4000-8000-000000000202")
+        s.name = "notes"
+        s.cwd = "/Users/me/Projects/notes"
+        s.kind = .interactive
+        s.lastEventAt = Date().addingTimeInterval(-10)
+        return s
+    }()
+
     private let list: [Session]
     private let delay: TimeInterval
     private let failure: DeliveryError?
@@ -80,6 +101,16 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
         Thread.sleep(forTimeInterval: delay)
         return SendResult(ok: true, sessionId: request.session, route: .channel, reply: "Team.", error: nil, detail: nil)
     }
+
+    /// What starting a new session does in the previews: fails this way, or takes `delay` and starts nothing.
+    var startFailure: NewSessionError?
+    var homeRefused = false
+    func startSession(_ request: NewSessionRequest) -> NewSessionResult {
+        if let startFailure { return NewSessionResult(sessionId: nil, failure: startFailure, detail: Preview.startDetail) }
+        Thread.sleep(forTimeInterval: delay)
+        return NewSessionResult(sessionId: nil, failure: .notConfirmed, detail: nil)
+    }
+    func homeFolderRefused() -> Bool { homeRefused }
 }
 
 /// Stand-ins for the setup's side effects, so previews never touch the real system.
@@ -275,6 +306,7 @@ enum Preview {
             }
         }
         renderReachability(to: dir)
+        renderNewSessionAndHidden(to: dir)
         // Terminal is always dark, whatever the system.
         let theme = Design.theme
         Design.theme = .terminal
@@ -289,6 +321,8 @@ enum Preview {
 
     /// What Claude Code said, as the Details of a refused send show it.
     nonisolated static let refusalDetail = "resume exited 1: Workspace not trusted. The home directory is trusted one session at a time."
+    /// What `claude --bg` printed, as the new-session form's Details show it.
+    nonisolated static let startDetail = "claude --bg exited 1\nError: Workspace not trusted. Run claude in this folder once to trust it."
 
     /// The error cards, the greyed picker rows, the guide (fresh, half done, done) and the empty conversation,
     /// in each theme. Paper is drawn light, Terminal dark, Mono both.
@@ -301,9 +335,11 @@ enum Preview {
         let session = PreviewEngine.session.id
 
         /// A model on its own settings, so a preview never writes to the app's.
-        func model(_ engine: PreviewEngine, theme: Design.Theme, guide: Bool = false) -> CompanionModel {
+        func model(_ engine: PreviewEngine, theme: Design.Theme, guide: Bool = false,
+                   checks: PathChecks = .everythingExists) -> CompanionModel {
             let defaults = UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard
-            let m = CompanionModel(engine: engine, capture: ScreencaptureProvider(), store: scratch, defaults: defaults)
+            let m = CompanionModel(engine: engine, capture: ScreencaptureProvider(), store: scratch, defaults: defaults,
+                                   pathChecks: checks)
             m.setTheme(theme)
             m.startEngine()
             if !guide { m.dismissGuide() }
@@ -330,6 +366,23 @@ enum Preview {
                 settle()
                 bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("error-\(name)-\(look).png"))
             }
+
+            // A session whose folder was deleted: greyed in the list, and the card that explains it.
+            let goneChecks = PathChecks(folderExists: { $0 != PreviewEngine.goneFolder }, isExecutable: { _ in true })
+            let gone = model(PreviewEngine(sessions: PreviewEngine.withUnreachable + [PreviewEngine.folderGone]), theme: theme,
+                             checks: goneChecks)
+            gone.selectTarget(session)
+            gone.openSessionList()
+            bubbleSnapshot(gone, actions: noop, dark: dark, to: dir.appendingPathComponent("picker-folder-gone-\(look).png"))
+            gone.pickSession(PreviewEngine.folderGone.id)
+            bubbleSnapshot(gone, actions: noop, dark: dark, to: dir.appendingPathComponent("error-folder-gone-\(look).png"))
+
+            // A plain-claude terminal session while "Connect every claude" is off: the switch is offered.
+            let plain = model(PreviewEngine(sessions: [PreviewEngine.session, PreviewEngine.plainTerminal]), theme: theme)
+            plain.connectsEveryClaude = false
+            plain.selectTarget(session)
+            plain.pickSession(PreviewEngine.plainTerminal.id)
+            bubbleSnapshot(plain, actions: noop, dark: dark, to: dir.appendingPathComponent("error-plain-claude-\(look).png"))
 
             // The picker with the sessions that cannot be reached greyed out.
             let picking = model(PreviewEngine(sessions: PreviewEngine.withUnreachable), theme: theme)
@@ -381,17 +434,136 @@ enum Preview {
         Design.theme = .paper
     }
 
+    // MARK: New session and hidden sessions
+
+    /// The "+" and a row's actions, the new-session form in each state, Undo after hiding, the list with hidden
+    /// sessions shown, and the empty states, in each theme.
+    private static func renderNewSessionAndHidden(to dir: URL) {
+        let looks: [(Design.Theme, Bool)] = [(.paper, false), (.terminal, true), (.mono, false), (.mono, true)]
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(directory: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        let session = PreviewEngine.session.id
+        let hovered = PreviewEngine.several[2].id
+        let home = "/Users/me"
+
+        final class NoChooser: FolderChooser {
+            func chooseFolder(startingAt: String?) async -> String? { nil }
+        }
+        let chooser = NoChooser()
+
+        func model(_ engine: PreviewEngine, theme: Design.Theme) -> CompanionModel {
+            let defaults = UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard
+            let m = CompanionModel(engine: engine, capture: ScreencaptureProvider(), store: scratch, defaults: defaults)
+            m.homeFolder = home
+            m.folderChooser = chooser
+            m.setTheme(theme)
+            m.startEngine()
+            m.dismissGuide()
+            m.openBubble()
+            return m
+        }
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(settleTime)) }
+        func picker(_ m: CompanionModel, hoveredRow: String? = nil) -> some View {
+            SessionPicker(model: m, hoveredRow: hoveredRow) {}
+                .padding(.horizontal, Design.Space.bubbleHorizontal)
+                .padding(.vertical, Design.Space.bubbleVertical)
+                .frame(width: Design.Bubble.width)
+                .background(Color.paper)
+        }
+
+        for (theme, dark) in looks {
+            let look = theme == .mono ? "mono-\(dark ? "dark" : "light")" : theme.rawValue
+
+            // The list with its "+", and the actions of the row under the pointer.
+            let listed = model(PreviewEngine(sessions: PreviewEngine.several), theme: theme)
+            listed.selectTarget(session)
+            snapshot(picker(listed, hoveredRow: hovered), dark: dark, to: dir.appendingPathComponent("new-picker-hover-\(look).png"))
+
+            // Just hidden: Undo at the top. Then the list with the hidden ones shown.
+            listed.openSessionList()
+            listed.hideSession(PreviewEngine.several[3].id)
+            listed.hideSession(hovered)
+            bubbleSnapshot(listed, actions: noop, dark: dark, to: dir.appendingPathComponent("hidden-undo-\(look).png"))
+            listed.showHidden = true
+            bubbleSnapshot(listed, actions: noop, dark: dark, to: dir.appendingPathComponent("hidden-shown-\(look).png"))
+
+            // No sessions at all: the guide, the companion and the list offer starting one.
+            let guided = CompanionModel(engine: PreviewEngine(sessions: []), capture: ScreencaptureProvider(), store: scratch,
+                                        defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard)
+            guided.setTheme(theme)
+            guided.startEngine()
+            guided.openBubble()
+            bubbleSnapshot(guided, actions: noop, dark: dark, to: dir.appendingPathComponent("new-none-guide-\(look).png"))
+            let none = model(PreviewEngine(sessions: []), theme: theme)
+            bubbleSnapshot(none, actions: noop, dark: dark, to: dir.appendingPathComponent("new-none-\(look).png"))
+            none.openSessionList()
+            bubbleSnapshot(none, actions: noop, dark: dark, to: dir.appendingPathComponent("new-none-list-\(look).png"))
+
+            // The form: empty (nothing to offer yet), then filled with the recent folders.
+            none.openNewSession()
+            bubbleSnapshot(none, actions: noop, dark: dark, to: dir.appendingPathComponent("new-form-empty-\(look).png"))
+            let filled = model(PreviewEngine(sessions: PreviewEngine.several, delay: PreviewEngine.answerDelay), theme: theme)
+            filled.openNewSession()
+            filled.newSessionMessage = "Find out why the sign-up test fails and fix it"
+            bubbleSnapshot(filled, actions: noop, dark: dark, to: dir.appendingPathComponent("new-form-filled-\(look).png"))
+            // The home folder: a caution, or not allowed where this Mac refuses it.
+            filled.chooseNewSessionFolder(home)
+            bubbleSnapshot(filled, actions: noop, dark: dark, to: dir.appendingPathComponent("new-form-home-\(look).png"))
+            let refusing = PreviewEngine(sessions: PreviewEngine.several)
+            refusing.homeRefused = true
+            let refused = model(refusing, theme: theme)
+            refused.openNewSession()
+            refused.chooseNewSessionFolder(home)
+            refused.newSessionMessage = "Tidy my downloads"
+            bubbleSnapshot(refused, actions: noop, dark: dark, to: dir.appendingPathComponent("new-form-home-refused-\(look).png"))
+            // Starting.
+            filled.chooseNewSessionFolder(PreviewEngine.several[1].cwd ?? home)
+            Task { await filled.startNewSession() }
+            settle()
+            bubbleSnapshot(filled, actions: noop, dark: dark, to: dir.appendingPathComponent("new-form-starting-\(look).png"))
+
+            // Each way it can fail, with Details open on the first.
+            let failures: [(String, NewSessionError)] = [
+                ("untrusted", .refused(.untrustedFolder)), ("login", .refused(.loginNeeded)), ("home", .homeFolderRefused),
+                ("not-found", .claudeNotFound), ("folder-missing", .folderMissing("/Users/me/Projects/old")),
+                ("timed-out", .timedOut), ("not-confirmed", .notConfirmed), ("failed", .failed(status: 1)),
+            ]
+            for (name, failure) in failures {
+                let engine = PreviewEngine(sessions: PreviewEngine.several)
+                engine.startFailure = failure
+                let m = model(engine, theme: theme)
+                m.openNewSession()
+                m.newSessionMessage = "Find out why the sign-up test fails and fix it"
+                Task { await m.startNewSession() }
+                settle()
+                bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("new-error-\(name)-\(look).png"))
+            }
+        }
+        Design.theme = .paper
+    }
+
     // MARK: Setup
 
     nonisolated static let helper = "/Applications/Sidemoon.app/Contents/Helpers/sidemoon"
 
     /// `diskImage`: opened straight from the disk image, so the steps that change things point to the move.
-    enum SetupVariant: String, CaseIterable { case fresh, attention, done, diskImage }
+    /// `shellOff` and `shellOn`: everything done, with "Connect every claude" off and on (in a scratch home folder).
+    enum SetupVariant: String, CaseIterable { case fresh, attention, done, diskImage, shellOff, shellOn }
+
+    /// A scratch home folder with a .zshrc and fish's folder, as on a Mac that has both shells.
+    static func scratchHome() -> String {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-preview-home-\(UUID().uuidString)").path
+        try? FileManager.default.createDirectory(atPath: home + "/.config/fish", withIntermediateDirectories: true)
+        try? "export PATH=\"$HOME/.local/bin:$PATH\"\n".write(toFile: home + "/.zshrc", atomically: true, encoding: .utf8)
+        return home
+    }
 
     private static func setupModel(_ variant: SetupVariant) -> SetupModel {
         let paths = SetupPaths(home: "/Users/me", channelConfig: "/Users/me/Library/Application Support/Sidemoon/channel-mcp.json",
                                launcher: "/Users/me/.local/bin/sidemoon-claude")
-        let launcher = Data(LauncherScript.content(configPath: paths.channelConfig, home: paths.home).utf8)
+        let launcher = Data(LauncherScript.content(configPath: paths.channelConfig, helper: helper, home: paths.home).utf8)
         let files: [String: Data]
         let hooks: PreviewHooks.Mode
         switch variant {
@@ -401,18 +573,34 @@ enum Preview {
         case .attention:
             files = [paths.launcher: Data("#!/bin/sh\nexec something-else\n".utf8)]
             hooks = .otherCopy
-        case .done:
+        case .done, .shellOff, .shellOn:
             files = [paths.launcher: launcher, paths.channelConfig: Data(ChannelServer.mcpConfig(executablePath: helper).utf8)]
             hooks = .ours
         case .diskImage:
             files = [:]
             hooks = .none
         }
-        let model = SetupModel(helper: .found(helper), paths: paths, finder: PreviewClaudeFinder(usual: variant != .attention),
-                               hooks: PreviewHooks(mode: hooks), files: PreviewFiles(contents: files),
-                               permission: PreviewPermission(granted: variant == .done), relauncher: PreviewRelauncher(),
+        // The switch writes real files, so it gets a scratch home; the paths shown are still "~/…".
+        var shell: ShellIntegration?
+        if variant == .shellOff || variant == .shellOn {
+            let scratch = scratchHome()
+            shell = ShellIntegration(home: scratch, loginShell: "/bin/zsh", launcher: scratch + "/.local/bin/sidemoon-claude",
+                                     fileSystem: SystemShellFileSystem())
+        }
+        let shown = shell.map { SetupPaths(home: $0.home, channelConfig: $0.home + "/Library/Application Support/Sidemoon/channel-mcp.json",
+                                          launcher: $0.launcher) } ?? paths
+        let shownFiles = shell == nil ? files : [
+            shown.launcher: Data(LauncherScript.content(configPath: shown.channelConfig, helper: helper, home: shown.home).utf8),
+            shown.channelConfig: Data(ChannelServer.mcpConfig(executablePath: helper).utf8),
+        ]
+        let model = SetupModel(helper: .found(helper), paths: shown, finder: PreviewClaudeFinder(usual: variant != .attention),
+                               hooks: PreviewHooks(mode: hooks), files: PreviewFiles(contents: shownFiles),
+                               permission: PreviewPermission(granted: variant != .fresh && variant != .attention && variant != .diskImage),
+                               relauncher: PreviewRelauncher(),
                                defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard,
-                               location: variant == .diskImage ? .diskImage("/Volumes/Sidemoon/Sidemoon.app") : .applications)
+                               location: variant == .diskImage ? .diskImage("/Volumes/Sidemoon/Sidemoon.app") : .applications,
+                               shell: shell)
+        if variant == .shellOn { model.setConnectsEveryClaude(true) }
         if variant == .attention { model.requestCapture() }
         Task { await model.refresh() }
         return model

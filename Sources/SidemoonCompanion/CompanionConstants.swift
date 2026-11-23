@@ -53,8 +53,8 @@ public enum CompanionConstants {
         public static let legacyBundleIdentifier = "dev.tagalong.companion"
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
-        public static let version = "1.0.3"
-        public static let build = "8"
+        public static let version = "1.0.4"
+        public static let build = "9"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
@@ -123,13 +123,68 @@ public enum CompanionConstants {
         public static let launcherPermissions: Int16 = 0o755
         /// The first line of the launcher script; the remaining lines are built from the constants.
         public static let launcherShebang = "#!/bin/sh"
+        /// The second line of every launcher Sidemoon ever wrote (1.0.3 and later): a file starting with the shebang
+        /// and this line is Sidemoon's own, and Setup replaces it when it is not the current script.
         public static let launcherComment = "# Starts Claude Code with the Sidemoon channel loaded, so captures can be sent into this session."
+        public static let launcherPassThroughComment = "# Anything that does not start a session here (a subcommand, -p, --bg, --version, --help) runs "
+            + "plain claude, and so does every launch while Sidemoon or its settings file is missing."
         public static let homeVariable = "$HOME"
         public static let pathSeparator: Character = ":"
         /// Relaunch: a shell waits for this process to exit, then opens the app again.
         public static let relaunchShell = "/bin/sh"
         public static let relaunchScript = "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \"$2\""
         public static let relaunchScriptName = "sidemoon-relaunch"
+    }
+
+    /// Which `claude` invocations the launcher passes through unchanged, without the channel flags. Taken from
+    /// `claude --help` of Claude Code 2.1.330: everything that does not start an interactive session in this terminal.
+    public enum Launcher {
+        /// A first argument naming one of these runs a command, not a session (aliases included).
+        public static let passThroughSubcommands = [
+            "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp", "plugin",
+            "plugins", "purge", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview", "update", "upgrade",
+        ]
+        /// Any of these, anywhere before `--`, means no interactive session here: print mode, a background session,
+        /// version and help, and sessions opened in the desktop app or the cloud.
+        public static let passThroughFlags = [
+            "-p", "--print", "--bg", "--background", "-v", "--version", "-h", "--help", "--desktop", "--cloud", "--environment",
+        ]
+        /// Of those, the ones that may also be written `--flag=value`.
+        public static let passThroughValueFlags = ["--cloud", "--environment"]
+        /// Arguments after this one are never read as flags.
+        public static let endOfOptions = "--"
+        /// The shell variables the script uses.
+        public static let helperVariable = "helper"
+        public static let configVariable = "config"
+    }
+
+    /// "Connect every claude": a marked block in the shell startup files that sends the plain `claude` command
+    /// through the launcher.
+    public enum ShellIntegration {
+        public static let startMarker = "# >>> sidemoon >>>"
+        public static let endMarker = "# <<< sidemoon <<<"
+        public static let comment = "# Added by Sidemoon: claude starts through sidemoon-claude, so Sidemoon can send to it. "
+            + "Turn it off in Sidemoon's Setup."
+        public static let functionName = "claude"
+        public static let zshFile = ".zshrc"
+        public static let bashFile = ".bashrc"
+        /// The files a bash login shell (what Terminal opens) reads, first found wins.
+        public static let bashLoginFiles = [".bash_profile", ".bash_login", ".profile"]
+        /// Shared with other shells (sh, dash): the block there only runs under bash.
+        public static let sharedProfileFile = ".profile"
+        public static let configFolder = ".config"
+        public static let fishFolder = "fish"
+        /// Fish loads a function from this file the first time the command is typed.
+        public static let fishFunctionFile = "functions/claude.fish"
+        public static let fishDescription = "Claude Code, started through sidemoon-claude so Sidemoon can send to it"
+        /// The login shell's file name, as the account database names it.
+        public static let zshName = "zsh"
+        public static let bashName = "bash"
+        public static let fishName = "fish"
+        /// A file being written is first written next to it under this name, then moved into place.
+        public static let temporarySuffix = ".sidemoon-tmp-"
+        public static let newFilePermissions: Int16 = 0o644
+        public static let newDirectoryPermissions: Int16 = 0o755
     }
 
     public enum HotKeys {
@@ -145,6 +200,7 @@ public enum CompanionConstants {
     public enum NavigationKeys {
         public static let byKeyCode: [UInt16: NavigationKey] = [
             0x7B: .left, 0x7C: .right, 0x7D: .down, 0x7E: .up, 0x24: .enter, 0x4C: .enter, 0x35: .escape,
+            0x33: .delete, 0x75: .delete,
         ]
     }
 
@@ -243,6 +299,25 @@ public enum CompanionConstants {
         public static let noteCountdownTick: TimeInterval = 0.1
     }
 
+    /// Starting a new background session from the companion.
+    public enum NewSession {
+        /// Folders offered before "Choose folder…".
+        public static let recentFolders = 5
+    }
+
+    /// Sessions hidden from the list (never stopped or removed).
+    public enum Hidden {
+        /// How long "Undo" stays in the list after a session is hidden.
+        public static let undoSeconds: TimeInterval = 6
+        /// Hidden sessions remembered; the ones hidden longest ago are forgotten first.
+        public static let maxEntries = 200
+        /// A hidden session Sidemoon has not seen for this long is forgotten (it was removed, or its conversation
+        /// is long over). Kept a while, since sessions only show up again once they report or are listed.
+        public static let forgetAfter: TimeInterval = 30 * 24 * 60 * 60
+        /// How often "still seen" is written down for a hidden session that is listed.
+        public static let seenRefresh: TimeInterval = 24 * 60 * 60
+    }
+
     public enum Capture {
         public static let tool = "/usr/sbin/screencapture"
         /// -i interactive region selection (Escape cancels), -x no sound.
@@ -281,10 +356,14 @@ public enum CompanionConstants {
         public static let guideClosed = "guideClosed"
         /// The companion's panels show up in screen recordings and screen sharing. Off unless the user turns it on.
         public static let visibleInRecordings = "visibleInRecordings"
+        /// The sessions hidden from the list (`HiddenSessions`, as JSON).
+        public static let hiddenSessions = "hiddenSessions"
+        /// The folder the last new session was started in.
+        public static let newSessionFolder = "newSessionFolder"
         /// Every key above that holds a saved setting; these are carried over from the legacy domain once.
         public static let savedKeys = [
             theme, zoom, largeWindow, bubbleWidth, bubbleHeight, shortReplies, showEndedSessions, targetSession, mascotOriginX, mascotOriginY, setupSeen,
-            guideClosed, visibleInRecordings,
+            guideClosed, visibleInRecordings, hiddenSessions, newSessionFolder,
         ]
     }
 }

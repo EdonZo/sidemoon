@@ -12,10 +12,18 @@ public struct ProcessResult: Sendable {
 /// Runs the `claude` CLI. A protocol so delivery logic can be tested without real sessions.
 public protocol ClaudeRunner: Sendable {
     func run(_ args: [String], cwd: String?, stdin: Data?, timeout: TimeInterval) -> ProcessResult
+    /// Whether the `claude` command is there to run.
+    var isInstalled: Bool { get }
+}
+
+extension ClaudeRunner {
+    public var isInstalled: Bool { true }
 }
 
 public struct SystemClaudeRunner: ClaudeRunner {
     public let executable: String
+
+    public var isInstalled: Bool { FileManager.default.isExecutableFile(atPath: executable) }
 
     public init(executable: String? = nil) {
         self.executable = executable ?? SystemClaudeRunner.locateClaude()

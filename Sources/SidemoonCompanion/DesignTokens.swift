@@ -218,6 +218,12 @@ public enum Design {
         public static let workingDotMinOpacity: Double = 0.25
         /// A session that cannot be reached is drawn this faint in the session list.
         public static let unreachableOpacity: Double = 0.6
+        /// A hidden session, listed while "Show hidden" is on.
+        public static let hiddenOpacity: Double = 0.5
+        /// The small symbol buttons a session row shows under the pointer.
+        public static var rowActionIcon: CGFloat { 12 * Design.zoom }
+        /// The new-session form's message field: a few lines before it scrolls.
+        public static let messageFieldLines = 1...4
     }
 
     /// The window offering to move Sidemoon into Applications.
@@ -381,6 +387,8 @@ public enum Design {
         public static let noSession = "Choose session"
         public static let empty = "Nothing yet."
         public static let emptyNoSession = "Choose the session that should see your screen."
+        public static let emptyNoSessionsAtAll = "There are no Claude Code sessions yet. Start one here: pick a folder "
+            + "and say what it should do first."
         public static func emptyHint(session: String) -> String { "show \(session) what you see." }
         public static let notePlaceholder = "Add a note, or let it send"
         public static let askPlaceholder = "Ask or reply"
@@ -392,7 +400,7 @@ public enum Design {
         public static let cancel = "Cancel"
         public static let remove = "Take it back"
         public static let sendTo = "Send to"
-        public static let noSessions = "No sessions yet. Start Claude Code and it will show up here."
+        public static let noSessions = "No sessions yet. Start one here, or start Claude Code in a terminal and it shows up here."
         public static let needsYou = "Needs you"
         public static let ended = "Ended"
         public static let showEnded = "Show ended"
@@ -513,6 +521,22 @@ public enum Design {
                 }
             }
 
+            /// A session whose folder was moved or deleted.
+            public static let folderGoneTitle = "This session's folder no longer exists"
+            public static func folderGoneAdvice(_ folder: String) -> String {
+                let named = folder.isEmpty ? "Its folder" : "Its folder, \(folder),"
+                return "\(named) was moved or deleted, so this session cannot be reopened. Choose another session."
+            }
+            /// The short reason such a session is greyed out in the session list.
+            public static let folderGoneReason = "Folder no longer exists"
+            /// Printed in Terminal, followed by the folder, when the reopen script cannot go to the session's folder.
+            public static let scriptFolderFailed = "Sidemoon could not reopen this session: its folder no longer exists:"
+
+            /// Offered with a session started with plain claude while "Connect every claude" is off.
+            public static let connectEveryClaude = "Connect every claude"
+            public static let connectEveryClaudeNote = "Connect every claude, in Setup, makes the plain claude command connect "
+                + "too, from the next terminal window you open."
+
             public static let copyCommand = "Copy the command"
             public static let openInTerminal = "Open in Terminal"
             public static let openedInTerminal = "Opened"
@@ -540,6 +564,8 @@ public enum Design {
                     + "or press Return to send at once. The answer shows up here."
             }
             public static let heroNoSession = "First choose the session to talk to. Then press the keys above in any app."
+            public static let heroNoSessions = "There is no Claude Code session yet. Start one here first, then press the "
+                + "keys above in any app."
             public static let testMessageButton = "Send a test message"
             public static let video = "Watch the 45-second video"
             public static let terminalNote = "A session you start in a terminal needs sidemoon-claude. Setup installs it."
@@ -640,6 +666,55 @@ public enum Design {
                 "\(directory) is not on your shell's PATH, so type the full path: \(launcher)"
             }
             public static let install = "Install"
+            public static let terminalLauncherOutdated = "sidemoon-claude is from an earlier version of Sidemoon. "
+                + "Update replaces it with this version's."
+            public static let update = "Update"
+
+            /// "Connect every claude": the shell startup files send the plain claude command through sidemoon-claude.
+            public static let shellTitle = "Connect every claude you start in a terminal"
+            public static func shellExplain(_ files: [String]) -> String {
+                "When this is on, typing claude in a terminal starts it through sidemoon-claude, so Sidemoon can send to "
+                    + "it. Sidemoon adds a few marked lines to \(list(files)), after saving a backup copy. Terminal windows "
+                    + "you open from then on pick it up; windows already open do not. Commands such as claude mcp, "
+                    + "claude -p or claude --bg run as before."
+            }
+            public static func shellOn(_ files: [String]) -> String {
+                "On. Terminal windows you open from now on connect claude to Sidemoon. Turning it off removes Sidemoon's "
+                    + "lines from \(list(files)) and nothing else."
+            }
+            public static let shellPartial = "Only partly on: some files have Sidemoon's lines and some do not, or have an "
+                + "older form of them. Turn it on to bring them all up to date, or off to remove them."
+            public static let shellNoShell = "Sidemoon found no zsh, bash or fish set up for you, so there is nothing to change."
+            public static let shellConfirmNote = "Each time Claude Code starts this way it asks you to confirm "
+                + "\"I am using this for local development\". Press Return to go on."
+            public static let shellNeedsLauncher = "Turning this on also installs the sidemoon-claude command."
+            public static func shellLink(_ file: String) -> String {
+                "\(file) is a link to another file, so Sidemoon did not change it. To connect claude there, copy the lines "
+                    + "and add them to that file yourself."
+            }
+            public static func shellUnwritable(_ file: String) -> String {
+                "Sidemoon is not allowed to change \(file), so it did not. Copy the lines and add them yourself."
+            }
+            public static func shellUnreadable(_ file: String) -> String { "\(file) could not be read, so Sidemoon left it alone." }
+            public static func shellNotAFile(_ file: String) -> String { "\(file) is not a plain file, so Sidemoon left it alone." }
+            public static func shellForeignFunction(_ file: String) -> String {
+                "\(file) already holds a claude command of your own, so Sidemoon left it alone."
+            }
+            public static func shellMalformed(_ file: String) -> String {
+                "\(file) has only one of the two lines that mark Sidemoon's block, so Sidemoon left it alone. Remove the "
+                    + "lines starting with \"# >>> sidemoon\" or \"# <<< sidemoon\" by hand, then try again."
+            }
+            public static func shellFailed(_ file: String, reason: String) -> String { "\(file) could not be changed: \(reason)" }
+            public static func backupsSaved(_ paths: [String]) -> String {
+                paths.count == 1 ? backupSaved(paths[0]) : "Backups saved at \(list(paths))."
+            }
+            public static let copyLines = "Copy the lines"
+
+            /// "a", "a and b", "a, b and c".
+            static func list(_ items: [String]) -> String {
+                guard let last = items.last else { return "" }
+                return items.count == 1 ? last : items.dropLast().joined(separator: ", ") + " and " + last
+            }
 
             public static func helperMissing(_ path: String) -> String {
                 "A part of Sidemoon is missing (\(path)). Download Sidemoon again."
@@ -652,6 +727,9 @@ public enum Design {
             public static let readyExplain = "Use these shortcuts in any app. Click the companion to read the answers. "
                 + "You can open this window again from the companion's right-click menu."
             public static let start = "Start"
+            /// Optional: finish Setup and start the first session from Sidemoon itself.
+            public static let startWithSession = "Start a session here"
+            public static let startWithSessionHelp = "Finishes setup and opens a small form: pick a folder and say what the session should do first. Nothing to type in a terminal."
         }
 
         /// The window that offers to move Sidemoon into the Applications folder.
@@ -667,6 +745,86 @@ public enum Design {
             public static let noWritableFolder = "Neither Applications folder can be written to. Drag Sidemoon into "
                 + "Applications in the Finder instead."
             public static func failed(_ reason: String) -> String { "The move did not work: \(reason)" }
+        }
+
+        /// Starting a new session from the companion.
+        public enum NewSession {
+            /// The "+" beside "Send to".
+            public static let plusHelp = "Start a new session"
+            /// The main action where there are no sessions at all.
+            public static let startButton = "Start a new session"
+            public static let heading = "New session"
+            public static let folder = "Folder"
+            public static let message = "First message"
+            public static let chooseFolder = "Choose or create a folder…"
+            public static let chooseFolderHelp = "Pick any folder on this Mac, or make a new one there with New Folder"
+            public static let noFolderYet = "Pick the folder the session should work in."
+            /// How the home folder is named in the list of folders.
+            public static let homeFolderName = "Home folder"
+            public static let messagePlaceholder = "What should it do first?"
+            public static let start = "Start"
+            public static let tryAgain = "Try again"
+            public static let starting = "Starting…"
+            public static let returnStarts = "Return starts · Esc cancels"
+            /// Under the starting row: why there is no Cancel.
+            public static let startingNote = "Claude Code is starting the session in the background. This takes a few seconds."
+            /// The folder panel.
+            public static let panelMessage = "Choose the folder the new session should work in. New Folder, at the bottom left, makes one here."
+            public static let panelPrompt = "Choose"
+            /// One line under the folders, about the chosen one.
+            public static let homeCaution = "Your home folder works, but a project folder is the safer choice."
+            public static let homeRefused = "Claude Code on this Mac does not reopen sessions in your home folder, "
+                + "so Sidemoon could not send to this one again. Choose a project folder."
+            public static let folderMissing = "This folder no longer exists. Choose another one."
+
+            public static func problemTitle(_ problem: NewSessionProblem) -> String {
+                switch problem {
+                case .folderMissing: return "That folder no longer exists"
+                case .homeFolderRefused: return "Not in your home folder on this Mac"
+                case .claudeNotFound: return "Claude Code was not found"
+                case .untrustedFolder: return "Claude Code does not trust this folder yet"
+                case .loginNeeded: return "Claude Code needs a login"
+                case .timedOut: return "Claude Code took too long to start it"
+                case .notConfirmed: return "The new session did not show up"
+                case .failed: return "The session could not be started"
+                }
+            }
+
+            public static func problemAdvice(_ problem: NewSessionProblem) -> String {
+                switch problem {
+                case .folderMissing: return "It was moved or deleted. Choose another folder."
+                case .homeFolderRefused: return homeRefused
+                case .claudeNotFound:
+                    return "Sidemoon could not find the claude command. Install Claude Code, or open Setup to see where "
+                        + "Sidemoon looks for it, then try again."
+                case .untrustedFolder:
+                    return "Open a terminal in this folder, type claude once and answer yes when it asks whether you trust "
+                        + "the folder. Then try again here."
+                case .loginNeeded: return "Type claude in a terminal and sign in with /login, then try again here."
+                case .timedOut:
+                    return "Sidemoon stopped waiting. Look at the session list in a moment: if the session is not there, try again."
+                case .notConfirmed:
+                    return "Claude Code said it started a session, but Sidemoon could not find it. Look at the session list "
+                        + "in a moment, or try again."
+                case .failed: return "Claude Code stopped with an error. Details says what it printed."
+                }
+            }
+        }
+
+        /// Hiding sessions from the list. Nothing is done to the session itself.
+        public enum Hidden {
+            public static let hide = "Hide"
+            public static let hideHelp = "Hide this session from the list. Nothing happens to the session, and it comes "
+                + "back by itself when it answers or needs you. Delete key."
+            public static let unhide = "Unhide"
+            public static let unhideHelp = "Put this session back in the list"
+            public static let undo = "Undo"
+            public static func hid(_ name: String) -> String { "Hid \(name)" }
+            public static func show(_ count: Int) -> String { "Show hidden (\(count))" }
+            public static let hideAgain = "Hide them again"
+            /// The settings switch.
+            public static let showSwitch = "Show hidden"
+            public static let openInTerminalHelp = "Open this session in the Terminal app. It keeps running in the background."
         }
 
         public static let recording = "Recording"
