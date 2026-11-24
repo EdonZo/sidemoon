@@ -6,9 +6,11 @@ Sidemoon is a small floating companion for macOS.
 
 ![Sidemoon: press Control-Option-A, the active window goes to a Claude Code session, and the answer appears next to the page](docs/demo.gif)
 
-**Watch a real task** (53 seconds, with narration): setting up an API key without leaving the page.
+**A real task**: stuck on a settings page while setting up an API key, one key press, and the answer says what to click.
 
-[![Sidemoon tutorial: press Control-Option-A on a settings page and the answer says what to click](docs/tutorial-poster.jpg)](https://www.sidemoon.app/sidemoon-tutorial.mp4)
+[![Sidemoon on a real task: press Control-Option-A on a settings page and the answer says what to click](docs/tutorial.gif)](https://www.sidemoon.app/sidemoon-tutorial.mp4)
+
+[Watch the full 53 seconds with narration](https://www.sidemoon.app/sidemoon-tutorial.mp4)
 
 Free and open source (MIT). Requires macOS 14 or later and [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview). Works with Claude Code only, for now.
 
