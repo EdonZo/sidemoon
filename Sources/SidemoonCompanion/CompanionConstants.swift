@@ -53,8 +53,8 @@ public enum CompanionConstants {
         public static let legacyBundleIdentifier = "dev.tagalong.companion"
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
-        public static let version = "1.0.4"
-        public static let build = "9"
+        public static let version = "1.0.5"
+        public static let build = "10"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
