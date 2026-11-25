@@ -11,13 +11,17 @@ final class CompanionPanel: NSPanel {
     override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
 
+    /// Every Space, and on top of full-screen apps.
+    static let everySpaceBehavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+    /// Used only while a panel is being ordered in, to bring it to the desktop the user is on.
+    static let activeSpaceBehavior: NSWindow.CollectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
+
     init(size: CGSize) {
         super.init(contentRect: CGRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         isFloatingPanel = true
         level = .statusBar
-        // Every Space, and on top of full-screen apps.
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        collectionBehavior = Self.everySpaceBehavior
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = true
         isOpaque = false
@@ -414,7 +418,22 @@ final class PanelController {
         bubble.isVisible && bubble.isOnActiveSpace && screenFrames.contains { $0.intersects(bubble.frame) }
     }
 
-    /// Spaces changed (a full-screen app opened or closed): an open bubble comes along to the new one.
+    /// Puts the bubble in front of the user on the desktop they are looking at. A panel that joins every
+    /// space can still come up on the desktop where it was last used (seen with several desktops, and after a
+    /// full-screen app), leaving the mascot here and its window somewhere else. Moving it to the active
+    /// space for the moment it is ordered in brings it here; it then joins every space again.
+    private func showBubbleOnActiveSpace() {
+        guard !bubble.isVisible || !bubble.isOnActiveSpace else {
+            bubble.orderFrontRegardless()
+            return
+        }
+        bubble.orderOut(nil)
+        bubble.collectionBehavior = CompanionPanel.activeSpaceBehavior
+        bubble.orderFrontRegardless()
+        DispatchQueue.main.async { [weak self] in self?.bubble.collectionBehavior = CompanionPanel.everySpaceBehavior }
+    }
+
+    /// Spaces changed (another desktop, or a full-screen app opened or closed): an open bubble comes along.
     func spaceChanged() {
         guard model.isExpanded, !isBubbleShowing else { return }
         syncBubble()
@@ -423,7 +442,7 @@ final class PanelController {
     private func syncBubble() {
         if model.isExpanded {
             placeBubble()
-            bubble.orderFrontRegardless()
+            showBubbleOnActiveSpace()
             // The session list is driven by the arrow keys, and the new-session form is typed in: both need the keyboard.
             if wantsKeyOnOpen || ((model.isPickingSession || model.isCreatingSession) && !bubble.isKeyWindow) { bubble.makeKey() }
         } else {
