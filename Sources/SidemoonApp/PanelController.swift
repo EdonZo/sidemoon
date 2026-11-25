@@ -221,6 +221,13 @@ final class PanelController {
         let host = MascotHostView(model: model)
         host.onClick = { [weak self] in
             guard let self else { return }
+            // The model can say "open" while the window is not showing: a full-screen space it sat on has
+            // closed, or a display went away. A click then shows it, rather than closing what nobody can see.
+            if model.isExpanded, !isBubbleShowing {
+                wantsKeyOnOpen = true
+                syncBubble()
+                return
+            }
             // Opened by hand, the bubble takes the keyboard: type straight away, or use the arrows.
             wantsKeyOnOpen = !model.isExpanded
             model.toggleBubble()
@@ -251,6 +258,10 @@ final class PanelController {
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
                                                queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.snapMascot() }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil,
+                                                          queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.spaceChanged() }
         }
         syncBubble()
     }
@@ -396,6 +407,18 @@ final class PanelController {
 
     private var wasEditingNote = false
     private var wantsKeyOnOpen = false
+
+    /// Whether the bubble is really in front of the user: ordered in, on the space they are looking at, and
+    /// on a screen that exists.
+    private var isBubbleShowing: Bool {
+        bubble.isVisible && bubble.isOnActiveSpace && screenFrames.contains { $0.intersects(bubble.frame) }
+    }
+
+    /// Spaces changed (a full-screen app opened or closed): an open bubble comes along to the new one.
+    func spaceChanged() {
+        guard model.isExpanded, !isBubbleShowing else { return }
+        syncBubble()
+    }
 
     private func syncBubble() {
         if model.isExpanded {
