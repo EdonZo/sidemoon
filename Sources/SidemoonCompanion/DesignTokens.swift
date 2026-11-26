@@ -333,11 +333,26 @@ public enum Design {
         /// After Setup, and when Sidemoon is opened again, the lens swells and glows a few times so the eye finds it.
         public static let attentionPulses = 3
         public static let attentionPulseDuration: TimeInterval = 0.45
-        /// The badge that counts sessions with something waiting for the user.
-        public static var badgeSize: CGFloat { 17 * Design.zoom }
-        public static var badgeText: CGFloat { 10 * Design.zoom }
-        public static let badgeRing: CGFloat = 1.5
-        public static let badgePulseScale: CGFloat = 1.14
+        /// The badge that counts sessions with something waiting for the user: a circle for one digit, a pill for
+        /// two characters ("9+"), its ring and shadow setting it off the lens and the desktop behind.
+        public static var badgeSize: CGFloat { 18 * Design.zoom }
+        public static var badgeText: CGFloat { 11 * Design.zoom }
+        /// Room either side of the number, so "9+" sits inside the pill instead of touching its ring.
+        public static var badgePadding: CGFloat { 4.5 * Design.zoom }
+        public static var badgeRing: CGFloat { 1.5 * Design.zoom }
+        public static var badgeShadowRadius: CGFloat { 1.5 * Design.zoom }
+        public static let badgeShadowOpacity: Double = 0.35
+        /// Where the badge's centre sits: on the lens's upper right, this many grid units outside its rim, so it
+        /// overlaps the rim without covering the companion dot resting there (`restAngle`).
+        public static let badgeRimOffset: CGFloat = 5
+        public static let badgeAngle: Double = -45
+        /// The badge centre's offset from the lens centre, in points.
+        public static var badgeOffset: CGSize {
+            let distance = (discRadius + badgeRimOffset) * drawnSize / grid
+            let radians = badgeAngle * .pi / 180
+            return CGSize(width: distance * cos(radians), height: distance * sin(radians))
+        }
+        public static let badgePulseScale: CGFloat = 1.1
         public static let badgePulseDuration: TimeInterval = 0.9
         /// Counts above this show as this number and a plus.
         public static let badgeMaxCount = 9
@@ -467,6 +482,7 @@ public enum Design {
                 case .untrustedFolder: return "This session's folder is not trusted yet"
                 case .noTranscript: return "This session never answered"
                 case .loginNeeded: return "This session needs a login"
+                case .waitingInTerminal: return "This session is waiting for you in Terminal"
                 }
             }
 
@@ -484,9 +500,16 @@ public enum Design {
                         + "Choose another session, or start a new one."
                 case .loginNeeded:
                     why = "Claude Code is signed out, or its sign-in has expired, so the session cannot answer until you sign in again."
+                case .waitingInTerminal:
+                    why = waitingInTerminalAdvice
                 }
                 return [why, stoppedFirst ? stoppedNote : nil, messageSaved ? savedNote : nil].compactMap { $0 }.joined(separator: " ")
             }
+
+            /// A session that has not started because Claude Code asks something first (a new MCP server, say). Also
+            /// shown when a session Sidemoon just started turns out to be waiting like that.
+            public static let waitingInTerminalAdvice = "Claude Code is asking a question in this session before it can start. "
+                + "Open it in Terminal and answer it, then send again."
 
             public static let savedNote = "Claude Code kept your message and will pass it on the next time this session starts."
             /// Claude Code refused only after Sidemoon had stopped the running session to deliver the message.
@@ -518,6 +541,7 @@ public enum Design {
                 case .untrustedFolder: return "Folder not trusted yet"
                 case .noTranscript: return "Never answered"
                 case .loginNeeded: return "Needs a login"
+                case .waitingInTerminal: return "Waiting for you in Terminal"
                 }
             }
 
@@ -541,6 +565,8 @@ public enum Design {
             public static let openInTerminal = "Open in Terminal"
             public static let openedInTerminal = "Opened"
             public static let openInTerminalHelp = "Opens the Terminal app and reopens this session there. Nothing to type."
+            /// "Open in Terminal" for a session waiting on a question: it shows the session itself, question and all.
+            public static let attachInTerminalHelp = "Opens the Terminal app on this session, where Claude Code's question is waiting."
             public static let installCommand = "Install the terminal command"
             public static let installCommandNote = "The command is not installed yet. Setup installs it in one click."
             public static let chooseAnother = "Choose another session"
@@ -748,12 +774,43 @@ public enum Design {
         }
 
         /// Starting a new session from the companion.
+        /// Screenshots and files that were not there when it came to sending them.
+        public enum Captures {
+            public static let missingTitle = "The screenshot was no longer available"
+            public static let missingAdvice = "Nothing was sent. Capture it again, then send."
+            public static let fileMissingTitle = "A file was no longer available"
+            public static let fileMissingAdvice = "It was moved, deleted or cannot be read. Attach it again, then send."
+            /// Under a failed message whose screenshots are gone and that had no words of its own: nothing was sent.
+            public static let goneNothingSent = "The screenshots were no longer available, so nothing was sent. Capture again."
+            /// After Retry sent the words of a message whose screenshots were gone.
+            public static let goneSentWords = "The screenshots were no longer available, so only your words were sent."
+        }
+
+        /// General, and the chats started with "+": conversations with no folder.
+        public enum Chat {
+            /// The built-in conversation's name.
+            public static let general = "General"
+            /// Its empty state: what a chat can and cannot do.
+            public static let readOnlyNote = "This chat can look at what you send and answer. It cannot change files or run commands."
+            /// Shown in the conversation when Claude Code no longer had the earlier conversation.
+            public static let startedOver = "Claude Code no longer had the earlier conversation, so this chat started over from this message."
+            /// The state text of a chat in the list.
+            public static let kind = "chat"
+        }
+
         public enum NewSession {
             /// The "+" beside "Send to".
-            public static let plusHelp = "Start a new session"
+            public static let plusHelp = "Start a new chat"
             /// The main action where there are no sessions at all.
-            public static let startButton = "Start a new session"
-            public static let heading = "New session"
+            public static let startButton = "Start a new chat"
+            /// The form without a folder: a new chat.
+            public static let chatHeading = "New chat"
+            /// The secondary control that reveals the folder choice, and the one that hides it again.
+            public static let workInFolder = "Work in a folder…"
+            public static let workInFolderHelp = "Start a Claude Code session that works in one of your folders and can change files there"
+            public static let noFolder = "Just chat, no folder"
+            public static let chatNote = "A chat needs no folder. It can look at what you send and answer, nothing more."
+            public static let heading = "New session in a folder"
             public static let folder = "Folder"
             public static let message = "First message"
             public static let chooseFolder = "Choose or create a folder…"

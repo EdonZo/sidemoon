@@ -75,6 +75,18 @@ public struct Threads: Equatable, Sendable, Codable {
         return entry.id
     }
 
+    /// Adds an entry right after another one (or at the end when that one is gone): a note about a message that must
+    /// come before its answer, which may already be there.
+    @discardableResult
+    public mutating func insert(_ entry: ThreadEntry, after id: UUID, in session: String) -> UUID {
+        guard var list = entries[session], let index = list.firstIndex(where: { $0.id == id }) else {
+            return append(entry, to: session)
+        }
+        list.insert(entry, at: index + 1)
+        entries[session] = list
+        return entry.id
+    }
+
     /// Adds an entry at the start of a conversation: the first message of a session Sidemoon started, whose answer
     /// can arrive before Sidemoon learns the session's id.
     @discardableResult

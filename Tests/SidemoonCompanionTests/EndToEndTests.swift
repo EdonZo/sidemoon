@@ -638,6 +638,54 @@ import Testing
         }
     }
 
+    // MARK: 11
+
+    /// General, with nothing chosen: a capture and a question go out as one `claude -p` run, a follow-up continues
+    /// the same Claude Code conversation (it remembers the image), and nothing is left running or listed twice.
+    @Test func generalChat() async throws {
+        let word = "OTTER"
+        let files = "\(E2E.run)/files"
+        try FileManager.default.createDirectory(atPath: files, withIntermediateDirectories: true)
+        let image = URL(fileURLWithPath: "\(files)/general-word.png")
+        try TestImage.write(word: word, to: image)
+        await scenario("general", image: image) { fx in
+            let general = Constants.Chat.generalId
+            fx.guarded.allow(general)
+            let model = fx.model
+            guard model.targetId == general else { throw E2EFailure("with nothing chosen the target is \(model.targetId ?? "-"), not General") }
+            let chats = SharedEngine.engine.engine.chats
+            let began = Date()
+            await model.captureAndSend(note: "What single word is written in this image? Reply with only that word.")
+            let firstTook = Date().timeIntervalSince(began)
+            let seen = fx.lastEntry(role: .session, of: general)?.text ?? ""
+            #expect(model.currentError == nil, "error: \(String(describing: model.currentError))")
+            #expect(seen.uppercased().contains(word), "reply was: \(seen); \(fx.describeThread(general))")
+            #expect(fx.store.files().isEmpty, "the capture file should be deleted after delivery")
+            let conversation = chats.chat(general)?.claudeSessionId
+            #expect(conversation != nil, "no conversation id was kept")
+            let again = Date()
+            await model.sendMessage("Which word was in the image I sent you? Reply with only that word.")
+            let secondTook = Date().timeIntervalSince(again)
+            let remembered = fx.lastEntry(role: .session, of: general)?.text ?? ""
+            #expect(model.currentError == nil, "error: \(String(describing: model.currentError))")
+            #expect(remembered.uppercased().contains(word), "follow-up reply was: \(remembered); \(fx.describeThread(general))")
+            #expect(chats.chat(general)?.claudeSessionId == conversation, "the follow-up did not continue the same conversation")
+            #expect(!model.thread.contains { $0.text == Design.Copy.Chat.startedOver }, "it started over: \(fx.describeThread(general))")
+            // Listed once, as General; the runs' own sessions never show.
+            let folder = SharedEngine.engine.engine.chatFolder
+            #expect(model.sessions.filter { $0.id == general }.count == 1)
+            #expect(!model.sessions.contains { ChatFolder.contains($0.cwd, folder: folder) }, "a run's session is listed")
+            #expect(model.thread.filter { $0.role == .session }.count == 2, "\(fx.describeThread(general))")
+            // Nothing left running: no Claude Code process in the chat folder (listed ones that ended are only logged).
+            let listed = await Task.detached { ClaudeCLI.agents() }.value.filter { ChatFolder.contains($0.cwd, folder: folder) }
+            let running = listed.filter(\.isRunning)
+            #expect(running.isEmpty, "left running: \(listed.map { ClaudeCLI.describe($0) })")
+            e2eLog("[general] listed by claude agents in the chat folder: \(listed.map { ClaudeCLI.describe($0) })")
+            e2eLog("[general] first reply in \(String(format: "%.1f", firstTook))s, follow-up in \(String(format: "%.1f", secondTook))s; "
+                + "conversation \(conversation ?? "-")")
+        }
+    }
+
     // MARK: 10
 
     /// A session started from the companion: the form's Start runs `claude --bg` in a fresh project folder, the new
@@ -647,6 +695,7 @@ import Testing
         await scenario("create") { fx in
             let model = fx.model
             model.openNewSession()
+            model.setNewSessionInFolder(true)
             model.chooseNewSessionFolder(fx.project)
             model.newSessionMessage = E2E.Words.reply("FIG")
             #expect(model.canStartNewSession, "note: \(String(describing: model.newSessionFolderNote))")

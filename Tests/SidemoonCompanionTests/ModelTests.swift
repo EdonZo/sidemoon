@@ -23,7 +23,8 @@ final class FakeEngine: CompanionEngine, @unchecked Sendable {
     func send(_ request: SendRequest) -> SendResult {
         lock.withLock {
             requests.append(request)
-            imageExistedAtSend.append(request.imagePath.map { FileManager.default.fileExists(atPath: $0) } ?? false)
+            let images = request.allImagePaths
+            imageExistedAtSend.append(!images.isEmpty && images.allSatisfy { FileManager.default.fileExists(atPath: $0) })
         }
         return reply(request)
     }
@@ -38,6 +39,17 @@ final class FakeEngine: CompanionEngine, @unchecked Sendable {
         return onStart(request)
     }
     func homeFolderRefused() -> Bool { homeRefused }
+    private(set) var chatNames: [String] = []
+    func newChat(name: String) -> String {
+        var s = Session(id: UUID().uuidString.lowercased())
+        s.kind = .chat
+        s.name = name
+        lock.withLock {
+            chatNames.append(name)
+            list.append(s)
+        }
+        return s.id
+    }
     var started: [NewSessionRequest] { lock.withLock { startRequests } }
 
     func emit(_ s: Session) {
@@ -89,6 +101,12 @@ final class ManualSleeper: @unchecked Sendable {
     }
 }
 
+/// A capture store in a fresh temporary folder. Every model in the tests gets one: `CompanionModel` has no default
+/// store, and the support folder under a test runner is never the real one (`Constants.TestRunner`).
+func scratchStore() -> CaptureStore {
+    CaptureStore(root: FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-captures-\(UUID().uuidString)", isDirectory: true))
+}
+
 /// Returns at once: the whole grace period passes without waiting.
 private let instantSleeper: Sleeper = { _ in await Task.yield() }
 
@@ -123,13 +141,13 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(model.indicator == .error)
     }
 
-    @Test func refusesToCaptureWithoutTarget() async {
+    /// Nothing ever chosen: a capture goes to General, which needs no setup.
+    @Test func withNothingChosenACaptureGoesToGeneral() async {
         let engine = FakeEngine()
         let (model, _, _) = makeModel(engine)
         model.startEngine()
         await model.captureAndSend()
-        #expect(model.currentError == .noTarget)
-        #expect(engine.sent.isEmpty)
+        #expect(engine.sent.map(\.session) == [Constants.Chat.generalId])
     }
 
     @Test func sendDeliversImageWaitsAndDeletesCapture() async {
@@ -189,7 +207,9 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         model.selectTarget(target)
         await model.captureAndSend()
         #expect(model.currentError == .busy)
-        #expect(store.files().isEmpty)
+        // A failure Retry can fix keeps the capture for it.
+        #expect(store.files().count == 1)
+        #expect(model.thread.last.map(model.canRetry) == true)
     }
 
     @Test func showsTurnsSidemoonDidNotTrigger() async {
@@ -267,13 +287,12 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(store.files().isEmpty)
     }
 
-    @Test func activeWindowNeedsTargetToo() async {
+    @Test func activeWindowGoesToGeneralWhenNothingWasChosen() async {
         let engine = FakeEngine()
         let (model, _, _) = makeModel(engine)
         model.startEngine()
         await model.captureActiveWindowAndSend()
-        #expect(model.currentError == .noTarget)
-        #expect(engine.sent.isEmpty)
+        #expect(engine.sent.map(\.session) == [Constants.Chat.generalId])
     }
 
     // MARK: Active window held for a note
@@ -370,16 +389,15 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(model.noteDraft.isEmpty)
     }
 
-    @Test func secondHotkeyWhileHoldingIsIgnored() async {
+    /// The note shortcut while a capture waits does nothing: the capture keeps its turn.
+    @Test func noteHotkeyWhileHoldingIsIgnored() async {
         let engine = FakeEngine()
         let clock = ManualSleeper()
         let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
-        let held = model.heldCapture
-        await model.captureActiveWindowAndSend()
-        await model.captureAndSend()
+        let held = model.heldCaptures
         model.beginNote()
         #expect(engine.sent.isEmpty)
-        #expect(model.heldCapture == held)
+        #expect(model.heldCaptures == held)
         #expect(store.files().count == 1)
         #expect(model.status.activity == .holding)
         #expect(model.noteCountdown != nil)
@@ -388,6 +406,191 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         clock.releaseAll()
         #expect(engine.sent.count == 1)
         #expect(store.files().isEmpty)
+    }
+
+    // MARK: Several captures in one message
+
+    /// Pressing a capture shortcut again while a capture waits adds one to the same message, in order; the
+    /// countdown starts again from the full time; one message goes with every image and the numbered names.
+    @Test func moreCapturesWhileHoldingGoInOneMessageInOrder() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
+        let first = model.heldCaptures.urls
+        // Part of the grace period passes, then the user scrolls and presses again.
+        await settle { clock.waiting > 0 }
+        clock.releaseAll()
+        await settle { (model.noteCountdown?.elapsedTicks ?? 0) > 0 }
+        #expect((model.noteCountdown?.elapsedTicks ?? 0) > 0)
+        await model.captureActiveWindowAndSend()
+        #expect(model.noteCountdown?.elapsedTicks == 0)
+        await model.captureAndSend()
+        #expect(model.heldCaptures.count == 3)
+        #expect(model.heldCaptures.urls.first == first.first)
+        #expect(model.heldCaptures.names == ["Capture 1", "Capture 2", "Capture 3"])
+        #expect(store.files().count == 3)
+        #expect(engine.sent.isEmpty && model.status.activity == .holding)
+        let order = model.heldCaptures.urls.map(\.path)
+        model.submitHeldCapture()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.count == 1)
+        #expect(engine.sent.first?.allImagePaths == order)
+        #expect(engine.sent.first?.text == CompanionConstants.Messages.defaultCapturesText)
+        #expect(engine.existed == [true])
+        #expect(model.thread.last { $0.role == .you }?.attachments == ["Capture 1", "Capture 2", "Capture 3"])
+        #expect(store.files().isEmpty)
+    }
+
+    /// Typing a note while captures wait: another press still adds one, and the note goes with all of them.
+    /// A typed note keeps the countdown stopped.
+    @Test func captureAddedWhileTypingANoteKeepsTheNote() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, _, task) = await holdActiveWindow(engine, sleeper: clock)
+        model.noteDraft = "these two pages"
+        await model.captureActiveWindowAndSend()
+        #expect(model.heldCaptures.count == 2)
+        #expect(model.noteCountdown == nil)
+        #expect(model.noteDraft == "these two pages")
+        model.submitHeldCapture()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.first?.text == "these two pages")
+        #expect(engine.sent.first?.allImagePaths.count == 2)
+    }
+
+    /// Each chip's cross takes that capture back (its file deleted); the others keep their order and still go.
+    @Test func removingOneCaptureKeepsTheOthers() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
+        await model.captureActiveWindowAndSend()
+        await model.captureActiveWindowAndSend()
+        let urls = model.heldCaptures.urls
+        model.removeHeldCapture(urls[1])
+        #expect(model.heldCaptures.urls == [urls[0], urls[2]])
+        #expect(!FileManager.default.fileExists(atPath: urls[1].path))
+        #expect(model.heldCaptures.names == ["Capture 1", "Capture 2"])
+        model.submitHeldCapture()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.first?.allImagePaths == [urls[0].path, urls[2].path])
+        #expect(store.files().isEmpty)
+    }
+
+    /// Removing the only capture is the same as Escape: nothing is sent.
+    @Test func removingTheLastCaptureCancels() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
+        model.removeHeldCapture(model.heldCaptures.urls[0])
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.isEmpty && store.files().isEmpty && !model.isHoldingCapture)
+    }
+
+    /// At the limit a further press keeps what waits and sends nothing early.
+    @Test func atTheLimitAnotherPressDoesNothing() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
+        let limit = CompanionConstants.Capture.maxPerMessage
+        for _ in 1..<limit { await model.captureActiveWindowAndSend() }
+        #expect(model.heldCaptures.count == limit && model.heldCaptures.isFull)
+        await model.captureActiveWindowAndSend()
+        await model.captureAndSend()
+        #expect(model.heldCaptures.count == limit)
+        #expect(store.files().count == limit)
+        #expect(engine.sent.isEmpty && model.status.activity == .holding)
+        model.submitHeldCapture()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.first?.allImagePaths.count == limit)
+        #expect(store.files().isEmpty)
+    }
+
+    /// Escape with several captures waiting deletes every one of them.
+    @Test func escapeDiscardsEveryHeldCapture() async {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        let (model, store, task) = await holdActiveWindow(engine, sleeper: clock)
+        await model.captureActiveWindowAndSend()
+        model.cancelNote()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.isEmpty && store.files().isEmpty)
+    }
+
+    /// A press whose capture is cancelled (Escape on the region) leaves what waits as it was.
+    @Test func aCancelledExtraCaptureChangesNothing() async {
+        let engine = FakeEngine()
+        engine.list = [idleSession()]
+        let clock = ManualSleeper()
+        let (model, store, _) = makeModel(engine, capture: FakeCapture(cancel: true), sleeper: clock.sleeper)
+        model.startEngine()
+        model.selectTarget(target)
+        let task = Task { await model.captureActiveWindowAndSend() }
+        await settle { model.isHoldingCapture && clock.waiting > 0 }
+        await model.captureAndSend()
+        #expect(model.heldCaptures.count == 1 && store.files().count == 1)
+        #expect(model.noteCountdown != nil)
+        model.submitHeldCapture()
+        await task.value
+        clock.releaseAll()
+        #expect(engine.sent.first?.allImagePaths.count == 1)
+        #expect(engine.sent.first?.text == CompanionConstants.Messages.defaultCaptureText)
+    }
+
+    // MARK: Paste
+
+    /// An image pasted into the composer waits with what is typed, never counts down, and goes on Return.
+    @Test func pastedImageWaitsWithTheTypedTextUntilReturn() async throws {
+        let engine = FakeEngine()
+        let clock = ManualSleeper()
+        engine.list = [idleSession()]
+        let (model, store, _) = makeModel(engine, sleeper: clock.sleeper)
+        model.startEngine()
+        model.selectTarget(target)
+        model.noteDraft = "what is this error?"
+        let file = try model.newCaptureFile()
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file)
+        #expect(file.deletingLastPathComponent().path == store.directory.path)
+        let task = Task { await model.pasteImage(at: file) }
+        await settle { model.isHoldingCapture }
+        #expect(model.noteDraft == "what is this error?")
+        #expect(model.noteCountdown == nil)
+        #expect(model.heldCaptures.urls == [file])
+        // A second paste joins it.
+        let second = try model.newCaptureFile()
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: second)
+        await model.pasteImage(at: second)
+        #expect(model.heldCaptures.urls == [file, second])
+        model.submitHeldCapture()
+        await task.value
+        #expect(engine.sent.count == 1)
+        #expect(engine.sent.first?.text == "what is this error?")
+        #expect(engine.sent.first?.allImagePaths == [file.path, second.path])
+        #expect(store.files().isEmpty)
+    }
+
+    /// Pasted files wait like dropped ones but without the countdown, and are never deleted.
+    @Test func pastedFilesWaitAndAreKept() async throws {
+        let engine = FakeEngine()
+        engine.list = [idleSession()]
+        let (model, _, _) = makeModel(engine)
+        model.startEngine()
+        model.selectTarget(target)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-paste-\(UUID().uuidString).txt")
+        try Data("x".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let task = Task { await model.pasteFiles([file]) }
+        await settle { model.isHoldingCapture }
+        #expect(model.heldFiles == [file] && model.noteCountdown == nil)
+        model.submitHeldCapture()
+        await task.value
+        #expect(engine.sent.first?.filePaths == [file.path])
+        #expect(FileManager.default.fileExists(atPath: file.path))
     }
 
     @Test func targetChangeDiscardsHeldCapture() async {

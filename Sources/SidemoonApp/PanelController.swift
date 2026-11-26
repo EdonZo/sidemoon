@@ -36,9 +36,46 @@ final class CompanionPanel: NSPanel {
     /// Cut, copy, paste, select all, undo and redo. macOS delivers these through the Edit menu of the active
     /// app, and this panel is used without its app ever being active, so they are sent to the focused field here.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Command-V with an image or files on the clipboard adds them to the message; text pastes as before.
+        if event.type == .keyDown, EditShortcut.action(for: event) == EditShortcut.paste, pasteAttachment?() == true { return true }
         if super.performKeyEquivalent(with: event) { return true }
         guard event.type == .keyDown, let action = EditShortcut.action(for: event) else { return false }
         return NSApp.sendAction(action, to: nil, from: self)
+    }
+
+    /// Takes a paste whose clipboard holds an image or files; returns false for anything else (text), which then
+    /// goes to the text field. Set for the bubble only.
+    var pasteAttachment: (() -> Bool)?
+}
+
+/// Reads the clipboard for Command-V in the composer: `PasteContent` decides, this does the AppKit part.
+@MainActor
+enum ClipboardPaste {
+    /// Hands an image or files on the clipboard to the model and returns true; returns false for text.
+    static func attach(from pasteboard: NSPasteboard = .general, to model: CompanionModel) -> Bool {
+        let types = pasteboard.types?.map(\.rawValue) ?? []
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        let files = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
+        switch PasteContent.of(types: types, fileURLs: files) {
+        case .text:
+            return false
+        case let .files(urls):
+            Task { await model.pasteFiles(urls) }
+            return true
+        case let .image(type):
+            // Written where captures go, so it is deleted after sending like one.
+            guard let data = pasteboard.data(forType: NSPasteboard.PasteboardType(type)), let png = pngData(data, type: type),
+                  let file = try? model.newCaptureFile() else { return false }
+            do { try png.write(to: file, options: .withoutOverwriting) } catch { return false }
+            Task { await model.pasteImage(at: file) }
+            return true
+        }
+    }
+
+    /// PNG as it is; other image data (TIFF) converted.
+    static func pngData(_ data: Data, type: String) -> Data? {
+        if type == CompanionConstants.Paste.pngType { return data }
+        return NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
     }
 }
 
@@ -60,6 +97,7 @@ enum EditShortcut {
         "z": Selector(("undo:")),
     ]
     static let shifted: [String: Selector] = ["z": Selector(("redo:"))]
+    static let paste = #selector(NSText.paste(_:))
 
     /// The same shortcuts as an Edit menu, for the app's ordinary windows (Setup), which do activate the app.
     @MainActor
@@ -247,6 +285,11 @@ final class PanelController {
         // The panel sizes the content, not the other way round.
         bubbleHost.sizingOptions = []
         bubble.contentView = bubbleHost
+        // Only where the composer is: the new-session form and the settings take their paste as text.
+        bubble.pasteAttachment = { [weak self] in
+            guard let self, !model.isCreatingSession, !model.isShowingSettings else { return false }
+            return ClipboardPaste.attach(to: model)
+        }
 
         applyTheme()
         applySharing()

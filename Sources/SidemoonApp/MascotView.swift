@@ -83,16 +83,32 @@ struct MascotView: View {
 
     var body: some View {
         let state = MascotState(model)
-        MascotFigure(state: state, countdown: model.noteCountdown, hovering: hover?.isHovering ?? false,
-                     attention: model.attentionRequests)
-            // The badge sits on the lens's own corner; the panel around it is only clear room.
-            .overlay(alignment: .topTrailing) {
-                if model.waitingCount > 0, !model.isExpanded { MascotBadge(count: model.waitingCount) }
-            }
-            .frame(width: CompanionConstants.Layout.mascotSize, height: CompanionConstants.Layout.mascotSize)
+        MascotPanelContent(figure: MascotFigure(state: state, countdown: model.noteCountdown, hovering: hover?.isHovering ?? false,
+                                                attention: model.attentionRequests),
+                           badge: model.waitingCount > 0 && !model.isExpanded ? model.waitingCount : nil)
             .help("Sidemoon: \(state.label)")
             // A new size redraws the mark from the size tokens.
             .id("\(model.zoom)-\(model.theme.rawValue)")
+    }
+}
+
+/// What the mascot panel draws: the lens, and the waiting count on it. Shared with the preview renderer, so the
+/// badge is checked exactly where it sits in the panel.
+struct MascotPanelContent: View {
+    let figure: MascotFigure
+    /// The number on the badge; nil shows none.
+    let badge: Int?
+    /// The preview's still frames: the badge drawn at this scale, without breathing.
+    var stillBadgeScale: CGFloat?
+
+    var body: some View {
+        figure
+            // The badge sits on the lens's upper-right rim, the same place at every size; the panel around it is
+            // clear room, wide enough for the pill and its pulse.
+            .overlay {
+                if let badge { MascotBadge(count: badge, stillScale: stillBadgeScale).offset(Design.Mascot.badgeOffset) }
+            }
+            .frame(width: CompanionConstants.Layout.mascotSize, height: CompanionConstants.Layout.mascotSize)
     }
 }
 
@@ -267,20 +283,27 @@ struct MascotFigure: View {
 /// It breathes gently so it is noticed without shouting.
 struct MascotBadge: View {
     let count: Int
+    /// Drawn still at this scale (previews).
+    var stillScale: CGFloat?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var swollen = false
 
     var body: some View {
         let m = Design.Mascot.self
         Text(count > m.badgeMaxCount ? "\(m.badgeMaxCount)+" : "\(count)")
-            .font(.system(size: m.badgeText, weight: .bold, design: .rounded))
+            .font(.system(size: m.badgeText, weight: .bold, design: .rounded).monospacedDigit())
             .foregroundStyle(Color.paper)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, m.badgePadding)
             .frame(minWidth: m.badgeSize, minHeight: m.badgeSize)
             .background(Capsule().fill(Color.signal))
             .overlay(Capsule().strokeBorder(Color.paper, lineWidth: m.badgeRing))
-            .scaleEffect(swollen ? m.badgePulseScale : 1)
+            .compositingGroup()
+            .shadow(color: .black.opacity(m.badgeShadowOpacity), radius: m.badgeShadowRadius)
+            .scaleEffect(stillScale ?? (swollen ? m.badgePulseScale : 1))
             .onAppear {
-                guard !reduceMotion else { return }
+                guard !reduceMotion, stillScale == nil else { return }
                 withAnimation(.easeInOut(duration: m.badgePulseDuration).repeatForever(autoreverses: true)) { swollen = true }
             }
             .transition(.scale.combined(with: .opacity))

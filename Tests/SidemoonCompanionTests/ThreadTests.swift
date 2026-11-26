@@ -45,7 +45,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
         await model.sendMessage("  which button do I press?  ")
         #expect(engine.sent.count == 1)
         #expect(engine.sent[0].text == "which button do I press?")
-        #expect(engine.sent[0].imagePath == nil)
+        #expect(engine.sent[0].allImagePaths.isEmpty)
         #expect(engine.sent[0].filePaths.isEmpty)
         let thread = model.thread
         #expect(thread.map(\.role) == [.you, .session])
@@ -126,7 +126,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
         let deadline = Date().addingTimeInterval(2)
         while !model.isHoldingCapture, Date() < deadline { try? await Task.sleep(nanoseconds: 10_000_000) }
         #expect(model.isHoldingCapture)
-        #expect(model.heldCapture != nil)
+        #expect(model.heldCaptures.count == 1)
         model.cancelNote()
         manual.releaseAll()
         await capture.value
@@ -284,13 +284,14 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
 
     @Test func aDraftThatCannotBeSentStaysInTheField() {
         let engine = FakeEngine()
+        engine.startOutcome = .conflict
         let defaults = UserDefaults(suiteName: "sidemoon-thread-\(UUID().uuidString)")!
-        let model = CompanionModel(engine: engine, capture: FakeCapture(), defaults: defaults)
+        let model = CompanionModel(engine: engine, capture: FakeCapture(), store: scratchStore(), defaults: defaults)
         model.startEngine()
-        model.noteDraft = "nobody to send this to"
+        model.noteDraft = "nowhere to send this"
         model.submitDraft()
-        #expect(model.noteDraft == "nobody to send this to")
-        #expect(model.currentError == .noTarget)
+        #expect(model.noteDraft == "nowhere to send this")
+        #expect(model.currentError == .engineConflict)
         #expect(engine.sent.isEmpty)
     }
 
@@ -312,7 +313,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
         #expect(mode?.int16Value == 0o600)
 
         // A new run shows the same conversation; what had not gone out is marked, not left "sending" for ever.
-        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), defaults: defaults, archive: archive)
+        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), store: scratchStore(), defaults: defaults, archive: archive)
         let restored = model.threads.thread(for: "s1")
         #expect(restored.map(\.text) == ["what next?", "Open the DNS page.", "and then?"])
         #expect(restored.first { $0.id == waiting }?.delivery == .failed(Design.Copy.interruptedByRestart))
@@ -336,7 +337,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
         let defaults = UserDefaults(suiteName: "sidemoon-thread-\(UUID().uuidString)")!
         defaults.set(session, forKey: CompanionConstants.Defaults.targetSession)
 
-        let model = CompanionModel(engine: engine, capture: FakeCapture(), defaults: defaults, archive: archive)
+        let model = CompanionModel(engine: engine, capture: FakeCapture(), store: scratchStore(), defaults: defaults, archive: archive)
         model.startEngine()
         let restored = model.threads.thread(for: session)
         // The typed message can be retried; the screenshot is gone from disk, so it cannot.
@@ -375,7 +376,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
             }
         }
         let defaults = UserDefaults(suiteName: "sidemoon-thread-\(UUID().uuidString)")!
-        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), defaults: defaults)
+        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), store: scratchStore(), defaults: defaults)
         // A bare executable has nothing to register, so the setting is not offered.
         #expect(!model.canOpenAtLogin)
         model.setOpensAtLogin(true)
@@ -405,7 +406,7 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
             func checkForUpdates() { checks += 1 }
         }
         let defaults = UserDefaults(suiteName: "sidemoon-thread-\(UUID().uuidString)")!
-        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), defaults: defaults)
+        let model = CompanionModel(engine: FakeEngine(), capture: FakeCapture(), store: scratchStore(), defaults: defaults)
         // No public key yet: no updater, so nothing is offered and nothing happens.
         #expect(!model.canUpdate)
         model.checkForUpdates()
@@ -426,13 +427,13 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
     @Test func themeAndWindowChoiceAreRememberedAndSettingsYieldToTheList() {
         let engine = FakeEngine()
         let defaults = UserDefaults(suiteName: "sidemoon-thread-\(UUID().uuidString)")!
-        let model = CompanionModel(engine: engine, capture: FakeCapture(), defaults: defaults)
+        let model = CompanionModel(engine: engine, capture: FakeCapture(), store: scratchStore(), defaults: defaults)
         #expect(model.theme == .paper)
         #expect(!model.isLarge)
         model.setTheme(.terminal)
         model.setLarge(true)
         #expect(Design.Bubble.width > 400)
-        let again = CompanionModel(engine: engine, capture: FakeCapture(), defaults: defaults)
+        let again = CompanionModel(engine: engine, capture: FakeCapture(), store: scratchStore(), defaults: defaults)
         #expect(again.theme == .terminal)
         #expect(again.isLarge)
 
@@ -527,9 +528,28 @@ private func temporaryFile(named name: String, contents: String = "hello") throw
     }
 
     @Test func messageTextNamesEveryFile() {
-        let text = ImageFile.messageText(text: "look", imagePath: nil, filePaths: ["/a/one.txt", "/a/two.pdf"])
+        let text = ImageFile.messageText(text: "look", imagePaths: [], filePaths: ["/a/one.txt", "/a/two.pdf"])
         #expect(text.contains("look"))
         #expect(text.contains("/a/one.txt"))
         #expect(text.contains("/a/two.pdf"))
+    }
+
+    /// One screenshot keeps the line it always had; several are numbered in the order they were taken.
+    @Test func messageTextNumbersSeveralScreenshotsInOrder() {
+        #expect(ImageFile.messageText(text: "hi", imagePaths: ["/s/a.png"])
+                == "hi\n\n[Screenshot from Sidemoon: /s/a.png - read this image file to see it.]")
+        let text = ImageFile.messageText(text: "hi", imagePaths: ["/s/a.png", "/s/b.png", "/s/c.png"], filePaths: ["/f.txt"])
+        #expect(text == """
+            hi
+
+            [Screenshot 1 of 3 from Sidemoon: /s/a.png - read this image file to see it.]
+
+            [Screenshot 2 of 3 from Sidemoon: /s/b.png - read this image file to see it.]
+
+            [Screenshot 3 of 3 from Sidemoon: /s/c.png - read this image file to see it.]
+
+            [File from Sidemoon: /f.txt - read this file.]
+            """)
+        #expect(SendRequest(session: "s", imagePath: "/a", imagePaths: ["/b", "/c"]).allImagePaths == ["/a", "/b", "/c"])
     }
 }

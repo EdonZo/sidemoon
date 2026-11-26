@@ -71,6 +71,13 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         #expect(CompanionError.cannotReach(.loginNeeded, messageSaved: false, detail: nil).remedies
             == [.runLogin, .copyResumeCommand, .chooseAnotherSession])
         #expect(CompanionError.cannotReach(.noTranscript, messageSaved: false, detail: nil).remedies == [.chooseAnotherSession])
+        // Waiting on a question in its terminal: the way out is to show it there and answer.
+        let waiting = CompanionError.cannotReach(.waitingInTerminal, messageSaved: false, detail: nil)
+        #expect(waiting.remedies == [.attachInTerminal, .chooseAnotherSession])
+        #expect(waiting.advice == Design.Copy.Unreachable.waitingInTerminalAdvice && !waiting.canRetry)
+        #expect(CompanionError.from(.failure(.cannotResume(.waitingInTerminal, messageSaved: false))).remedies.first == .attachInTerminal)
+        #expect(SessionList.reachability({ var s = Session(id: first); s.kind = .background; s.blocker = .waitingInTerminal; return s }())
+                == .blocked(.waitingInTerminal))
         // Errors from before keep their behaviour: no remedies, and Retry where it was offered.
         #expect(CompanionError.busy.remedies.isEmpty)
         #expect(CompanionError.busy.canRetry)
@@ -143,30 +150,72 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
 
 @MainActor
 @Suite struct DefaultTargetTests {
-    @Test func picksTheMostRecentReachableSessionWhenNoneIsSaved() {
+    /// Nothing ever chosen (first launch, or the settings cleared): General, and only then. Not saved, so it is
+    /// still nothing chosen until the user picks.
+    @Test func generalWhenNothingWasEverChosen() {
         let engine = FakeEngine()
         engine.list = [session(first, age: 1, blocker: .homeFolder), session(second, age: 9)]
         let (m, d) = model(engine)
         m.startEngine()
-        #expect(m.targetId == second)
-        // Sidemoon's own pick is not saved as the user's choice.
+        #expect(m.targetId == TargetRule.general)
         #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == nil)
+        #expect(TargetRule.initial(saved: nil) == TargetRule.general && TargetRule.initial(saved: first) == first)
     }
 
-    @Test func aSavedUnreachableChoiceGivesWayWithoutBeingForgotten() async {
+    /// The owner's condition: a chosen session that cannot be reached stays the target; the send fails with its
+    /// reason, and nothing goes to General or anywhere else.
+    @Test func aSavedUnreachableChoiceStaysTheTargetAndNothingGoesElsewhere() async {
         let engine = FakeEngine()
         engine.list = [session(first, age: 1, blocker: .loginNeeded), session(second, age: 9)]
+        engine.reply = { r in .failure(.cannotResume(.loginNeeded, messageSaved: false), sessionId: r.session, route: .background) }
         let d = UserDefaults(suiteName: "sidemoon-reach-\(UUID().uuidString)")!
         d.set(first, forKey: CompanionConstants.Defaults.targetSession)
         let (m, _) = model(engine, defaults: d)
         m.startEngine()
-        #expect(m.targetId == second)
-        #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == first)
-        // The saved one can be reached again: it comes back.
-        engine.emit(session(first, age: 0))
-        let deadline = Date().addingTimeInterval(2)
-        while m.targetId != first, Date() < deadline { try? await Task.sleep(nanoseconds: 10_000_000) }
         #expect(m.targetId == first)
+        await m.sendMessage("quick question")
+        #expect(engine.sent.map(\.session) == [first])
+        #expect(m.currentError?.title == Design.Copy.Unreachable.title(.loginNeeded))
+        #expect(m.targetId == first)
+        // After the error and after it ends, still the user's choice.
+        m.dismissError()
+        var ended = session(first, age: 0, blocker: .loginNeeded)
+        ended.state = .ended
+        engine.emit(ended)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        #expect(m.targetId == first)
+        #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == first)
+    }
+
+    /// A chosen session that is gone from the list (removed, or not listed yet after a restart): no silent fallback.
+    @Test func aSavedChoiceGoneFromTheListStaysTheTarget() async {
+        let engine = FakeEngine()
+        engine.list = [session(second, age: 9)]
+        let d = UserDefaults(suiteName: "sidemoon-reach-\(UUID().uuidString)")!
+        d.set(first, forKey: CompanionConstants.Defaults.targetSession)
+        let (m, _) = model(engine, defaults: d)
+        m.startEngine()
+        #expect(m.targetId == first)
+        engine.emit(session(third, age: 0))
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        #expect(m.targetId == first)
+        await m.sendMessage("hello")
+        #expect(engine.sent.map(\.session) == [first])
+    }
+
+    /// Hiding the session that is the target hides its row; the target stays, and messages still go to it.
+    @Test func hidingTheTargetDoesNotMoveIt() {
+        let engine = FakeEngine()
+        engine.list = [session(first, age: 1), session(second, age: 9)]
+        let (m, d) = model(engine)
+        m.startEngine()
+        m.selectTarget(first)
+        m.hideSession(first)
+        #expect(m.targetId == first && d.string(forKey: CompanionConstants.Defaults.targetSession) == first)
+        #expect(!m.rows.map(\.id).contains(first))
+        // General cannot be hidden at all.
+        m.hideSession(TargetRule.general)
+        #expect(!m.hidden.contains(TargetRule.general) && !TargetRule.canHide(TargetRule.general))
     }
 
     @Test func aSavedReachableChoiceIsKept() {
@@ -196,6 +245,7 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         engine.list = [session(first, age: 1), session(second, age: 9, blocker: .homeFolder)]
         let (m, _) = model(engine)
         m.startEngine()
+        m.selectTarget(first)
         m.openSessionList()
         m.pickSession(second)
         #expect(m.targetId == first)
@@ -214,6 +264,7 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         engine.list = [session(first, age: 1), dropped]
         let (m, _) = model(engine)
         m.startEngine()
+        m.selectTarget(first)
         m.openSessionList()
         m.pickSession(second)
         #expect(m.targetId == first)
@@ -234,8 +285,7 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         let rows = Dictionary(uniqueKeysWithValues: m.rows.map { ($0.id, $0) })
         #expect(rows[second]?.reachability == .needsChannel)
         #expect(rows[second]?.reachable == false)
-        // Not Sidemoon's automatic pick either.
-        #expect(m.targetId == first)
+        m.selectTarget(first)
         m.openSessionList()
         m.pickSession(second)
         #expect(m.targetId == first)
@@ -452,7 +502,7 @@ private func checkedModel(_ engine: FakeEngine, checks: PathChecks = goneChecks)
         engine.list = [session(second, age: 9), inGoneFolder(first, age: 1, kind: .interactive)]
         let m = checkedModel(engine)
         m.startEngine()
-        #expect(m.targetId == second)
+        m.selectTarget(second)
         m.pickSession(first)
         #expect(m.currentError == .folderGone(gone))
         #expect(m.targetId == second)

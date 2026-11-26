@@ -99,7 +99,9 @@ private func startEngine(agentsJSON: String = "[]", pickupWait: TimeInterval = 1
     return (e, runner, dir)
 }
 
-private func waitUntil(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+/// Generous, as it returns as soon as the condition holds: under a full parallel run the pool that carries this
+/// loop can be held up for seconds by tests that block their threads (seen: the helper's connection noticed late).
+private func waitUntil(_ timeout: TimeInterval = 20, _ condition: () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while !condition() {
         guard Date() < deadline else { return false }
@@ -179,7 +181,7 @@ extension Engine {
         let r = await e.sending(SendRequest(session: sid, text: "hi", wait: false))
         #expect(r.failure == .channelIgnored(fallback: .background))
         #expect(e.registry.session(sid)?.routes == [.background])
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         let retry = await e.sending(SendRequest(session: sid, text: "hi", wait: false))
         #expect(retry.ok && retry.route == .background)
         #expect(runner.recorded.contains { $0.first == Constants.ClaudeCLI.resumeFlag })

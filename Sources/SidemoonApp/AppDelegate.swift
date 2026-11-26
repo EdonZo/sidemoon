@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // The panels never activate Sidemoon, so the front-most app is the one the user is working in.
     let model = CompanionModel(engine: InProcessEngine(), capture: ScreencaptureProvider(),
                                windowCapture: ActiveWindowCaptureProvider { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+                               store: CaptureStore(root: CompanionConstants.Capture.directory),
                                archive: ThreadArchive(), pathChecks: .system)
     private var panels: PanelController!
     private let hotKeys = HotKeyCenter()
@@ -189,6 +190,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeys.unregisterAll()
         // A capture still waiting for its note is deleted, never left on disk.
         model.discardHeldCapture()
+        // Kept for Retry only while Sidemoon runs: a failed message restored after a restart has no Retry.
+        model.discardKeptCaptures()
         model.flushThreads()
         model.stopEngine()
     }

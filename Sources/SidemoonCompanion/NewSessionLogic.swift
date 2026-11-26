@@ -79,7 +79,7 @@ public enum NewSessionProblem: Equatable, Sendable {
         case .refused(.loginNeeded): return .loginNeeded
         case .timedOut: return .timedOut
         case .notConfirmed: return .notConfirmed
-        case .emptyMessage, .failed, .refused(.noTranscript): return .failed
+        case .emptyMessage, .failed, .refused(.noTranscript), .refused(.waitingInTerminal): return .failed
         }
     }
 
@@ -100,6 +100,9 @@ public struct NewSessionForm: Equatable, Sendable {
     public var folder: String?
     public var message = ""
     public private(set) var phase: Phase = .editing
+    /// "Work in a folder…" is open: a Claude Code session in the chosen folder (`claude --bg`). Off, the form starts a
+    /// chat, which needs no folder.
+    public var inFolder = false
 
     public init(folder: String? = nil) { self.folder = folder }
 
@@ -116,9 +119,25 @@ public struct NewSessionForm: Equatable, Sendable {
         return nil
     }
 
-    /// A folder is chosen that may be used, there is a message, and nothing is starting already.
+    /// The name a new session gets (`claude --bg -n`): the form has no name field, and without one Claude Code names
+    /// the session after its whole first prompt, Sidemoon's short-replies note included. The folder's own name is
+    /// short and says where it works. Nil when there is no usable name (Claude Code then names it).
+    public static func defaultName(for folder: String) -> String? {
+        let name = (RecentFolders.normal(folder) as NSString).lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name == "/" ? nil : name
+    }
+
+    /// There is a message and nothing is starting already; in a folder, one is chosen that may be used.
     public func canStart(note: FolderNote?) -> Bool {
-        folder != nil && !trimmedMessage.isEmpty && !isStarting && !(note?.blocksStart ?? false)
+        guard !trimmedMessage.isEmpty, !isStarting else { return false }
+        return !inFolder || (folder != nil && !(note?.blocksStart ?? false))
+    }
+
+    /// Opens or closes the folder choice. Not while starting; an error about the last attempt no longer applies.
+    public mutating func setInFolder(_ on: Bool) {
+        guard !isStarting else { return }
+        inFolder = on
+        if case .failed = phase { phase = .editing }
     }
 
     /// A different folder is chosen: an error about the last attempt no longer applies.

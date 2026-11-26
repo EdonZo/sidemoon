@@ -8,6 +8,8 @@ public enum SessionState: String, Sendable, Codable {
 
 public enum SessionKind: String, Sendable, Codable {
     case interactive, background, unknown
+    /// A conversation Sidemoon owns (General, or a chat started with "+"): one `claude -p` run per message.
+    case chat
 }
 
 /// Delivery routes, in the order the engine prefers them.
@@ -57,7 +59,8 @@ public struct Session: Sendable, Equatable, Codable {
         var r: [Route] = []
         if channelConnected { r.append(.channel) }
         if kind == .background, state != .working { r.append(.background) }
-        if kind != .background, state == .ended { r.append(.headless) }
+        if kind != .background, kind != .chat, state == .ended { r.append(.headless) }
+        if kind == .chat, state != .working { r.append(.headless) }
         return r
     }
 

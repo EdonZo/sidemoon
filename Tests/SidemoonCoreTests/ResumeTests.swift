@@ -23,11 +23,11 @@ private func refusedOrStopped(_ runner: FakeRunner) -> Bool {
     runner.recorded.contains { $0.first == Constants.ClaudeCLI.stopCommand || $0.first == Constants.ClaudeCLI.resumeFlag }
 }
 
-private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answered: Bool? = true,
+private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answered: Bool? = true, absent: Bool = false,
                     memory: HomeFolderMemory = .inMemory()) -> Engine {
     let e = Engine(socketPath: "/tmp/unused-\(UUID().uuidString).sock", runner: runner,
-                   registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in answered }, home: home,
-                                             homeFolderMemory: memory))
+                   registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in answered },
+                                             absenceProbe: { _, _ in absent }, home: home, homeFolderMemory: memory))
     e.refreshAgents()
     return e
 }
@@ -40,7 +40,7 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
                                 resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = engine(runner)
         #expect(e.registry.session(listed)?.blocker == nil)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+        onOwnThread(after: 0.2) {
             runner.agentsJSON = agents(status: "busy", state: "working", cwd: "/Users/someone")
         }
         #expect(await e.sending(SendRequest(session: listed, text: "hi")).ok)
@@ -80,7 +80,7 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
         again.resumeOutput = "backgrounded · 0b8e8a52 · t\n"
         second.refreshAgents()
         #expect(second.registry.session(listed)?.blocker == nil)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { again.agentsJSON = agents(status: "busy", state: "working", cwd: home) }
+        onOwnThread(after: 0.2) { again.agentsJSON = agents(status: "busy", state: "working", cwd: home) }
         #expect(await second.sending(SendRequest(session: listed, text: "hi")).ok)
         #expect(!second.registry.homeFolderMemory.refused)
         #expect(!FileManager.default.fileExists(atPath: file))
@@ -99,12 +99,76 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
     }
 
     @Test func sessionThatNeverAnsweredIsRefusedWithoutStopping() {
-        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "blocked"))
+        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "done"))
         let e = engine(runner, answered: false)
         #expect(e.registry.session(listed)?.blocker == .noTranscript)
         let r = e.send(SendRequest(session: listed, text: "hi"))
         #expect(r.failure == .cannotResume(.noTranscript, messageSaved: false))
         #expect(!refusedOrStopped(runner))
+    }
+
+    /// A session Claude Code holds on a question in its terminal before its first turn (a new MCP server, a trust
+    /// prompt): listed as blocked, never answered. Seen with 2.1.330 as `state: blocked` and no pid. Resuming it
+    /// starts a new session, so it is greyed and refused before anything is run, whether it runs or not.
+    @Test func blockedSessionThatNeverAnsweredWaitsInTerminal() {
+        for running in [false, true] {
+            let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "blocked", running: running))
+            let e = engine(runner, answered: false)
+            #expect(e.registry.session(listed)?.blocker == .waitingInTerminal)
+            let r = e.send(SendRequest(session: listed, text: "hi"))
+            #expect(r.failure == .cannotResume(.waitingInTerminal, messageSaved: false))
+            #expect(!refusedOrStopped(runner))
+        }
+    }
+
+    /// The real case: no folder for its working directory yet, so the transcript check cannot tell, but no transcript
+    /// is anywhere Claude Code keeps them. Without that evidence nothing is concluded.
+    @Test func blockedSessionWithNoTranscriptAnywhereWaitsInTerminal() {
+        let blocked = agents(status: "idle", state: "blocked", running: false)
+        let sure = engine(FakeRunner(agentsJSON: blocked), answered: nil, absent: true)
+        #expect(sure.registry.session(listed)?.blocker == .waitingInTerminal)
+        let unsure = engine(FakeRunner(agentsJSON: blocked), answered: nil, absent: false)
+        #expect(unsure.registry.session(listed)?.blocker == nil)
+        // Only asked about blocked sessions: a stopped one is still left to Claude Code.
+        let stopped = engine(FakeRunner(agentsJSON: agents(status: "idle", state: "stopped", running: false)), answered: nil, absent: true)
+        #expect(stopped.registry.session(listed)?.blocker == nil)
+    }
+
+    /// Blocked after an answer is a finished turn waiting for the next message: idle and reachable.
+    @Test func blockedSessionThatAnsweredIsReachable() {
+        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "blocked", running: false),
+                                resumeOutput: "backgrounded · 0b8e8a52 · t\n")
+        let e = engine(runner, answered: true, absent: true)
+        #expect(e.registry.session(listed)?.blocker == nil)
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        #expect(e.send(SendRequest(session: listed, text: "hi")).ok)
+    }
+
+    /// Once the question is answered in the terminal the session starts and answers; the next listing frees it.
+    @Test func waitingInTerminalClearsOnceItAnswered() {
+        let runner = FakeRunner(agentsJSON: agents(status: "idle", state: "blocked", running: false))
+        let answered = LockedFlag()
+        let e = Engine(socketPath: "/tmp/unused-\(UUID().uuidString).sock", runner: runner,
+                       registry: SessionRegistry(replyReader: { _ in nil }, answerProbe: { _, _ in answered.value },
+                                                 absenceProbe: { _, _ in !answered.value }, home: "/Users/someone"))
+        e.refreshAgents()
+        #expect(e.registry.session(listed)?.blocker == .waitingInTerminal)
+        answered.value = true
+        e.refreshAgents()
+        #expect(e.registry.session(listed)?.blocker == nil)
+    }
+
+    @Test func blockerClassification() {
+        func check(_ answered: Bool?, blocked: Bool) -> ResumeBlocker? {
+            ResumeCheck.blocker(cwd: "/p", home: "/Users/someone", answered: answered, homeFolderRefused: false, blockedInTerminal: blocked)
+        }
+        #expect(check(false, blocked: true) == .waitingInTerminal)
+        #expect(check(false, blocked: false) == .noTranscript)
+        #expect(check(true, blocked: true) == nil)
+        #expect(check(nil, blocked: true) == nil)
+        // The home folder, where refused, comes first.
+        #expect(ResumeCheck.blocker(cwd: "/Users/someone", home: "/Users/someone", answered: false, homeFolderRefused: true,
+                                    blockedInTerminal: true) == .homeFolder)
     }
 
     /// Claude Code reopens a stopped session that never answered (seen in the end-to-end runs), and Sidemoon
@@ -114,7 +178,7 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
                                 resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = engine(runner, answered: false)
         #expect(e.registry.session(listed)?.blocker == nil)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         #expect(e.send(SendRequest(session: listed, text: "hi")).ok)
     }
 
@@ -151,7 +215,7 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
                                 resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = engine(runner, answered: nil)
         #expect(e.registry.session(listed)?.blocker == nil)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         #expect(e.send(SendRequest(session: listed, text: "hi")).ok)
     }
 
@@ -300,6 +364,26 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
                                         projects: projects) == .unknown)
     }
 
+    @Test func absentOnlyWhereOtherTranscriptsAre() throws {
+        let projects = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-projects-\(UUID().uuidString)").path
+        let folder = "\(projects)/-Users-someone-api-server"
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: projects) }
+        let other = "ffffffff-0000-4000-8000-000000000000"
+        let seen = "\(folder)/\(listed).jsonl"
+        let mine = "\(projects)/-Users-someone-new-folder/\(other).jsonl"
+        // No other transcript is here: this may not be where Claude Code keeps them.
+        #expect(!TranscriptReader.isAbsent(other, evidence: [seen, mine], projects: projects))
+        try Data(answer.utf8).write(to: URL(fileURLWithPath: seen))
+        #expect(TranscriptReader.isAbsent(other, evidence: [seen, mine], projects: projects))
+        // A path outside the projects folder proves nothing.
+        #expect(!TranscriptReader.isAbsent(other, evidence: [mine, "/tmp/\(listed).jsonl"], projects: projects))
+        // Its own transcript anywhere under it: not absent.
+        try Data(prompt.utf8).write(to: URL(fileURLWithPath: "\(folder)/\(other).jsonl"))
+        #expect(!TranscriptReader.isAbsent(other, evidence: [seen], projects: projects))
+        #expect(!TranscriptReader.isAbsent(other, evidence: [seen], projects: "\(projects)/absent"))
+    }
+
     @Test func neverAnsweredIsOnlyReportedWhenSure() throws {
         let projects = FileManager.default.temporaryDirectory.appendingPathComponent("sidemoon-projects-\(UUID().uuidString)").path
         let folder = "\(projects)/-Users-someone-api-server"
@@ -311,5 +395,14 @@ private func engine(_ runner: FakeRunner, home: String = "/Users/someone", answe
                                                     projects: projects) == nil)
         try Data(answer.utf8).write(to: URL(fileURLWithPath: "\(folder)/\(other).jsonl"))
         #expect(TranscriptReader.sessionHasAnswered(other, hint: nil, projects: projects) == true)
+    }
+}
+
+final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = false
+    var value: Bool {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }

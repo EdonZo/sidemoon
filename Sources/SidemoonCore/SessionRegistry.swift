@@ -15,10 +15,16 @@ public final class SessionRegistry: @unchecked Sendable {
     private let replyReader: @Sendable (HookEvent) -> String?
     private let turnProbe: @Sendable (AgentInfo) -> Bool?
     private let answerProbe: @Sendable (_ sessionId: String, _ transcriptHint: String?) -> Bool?
+    /// Whether a session surely has no transcript at all, given the transcript paths of the other listed sessions as
+    /// evidence of where Claude Code keeps them (`TranscriptReader.isAbsent`).
+    private let absenceProbe: @Sendable (_ sessionId: String, _ evidence: [String]) -> Bool
     /// Sessions known to have finished an answer. A transcript only grows, so this never has to be undone.
     private var answered: Set<String> = []
     /// When each session last reported a UserPromptSubmit hook.
     private var promptSubmittedAt: [String: Date] = [:]
+    /// Where Sidemoon's chats run (normalized). The Claude Code sessions of those runs report through the hooks like
+    /// any other; they are the chats' own business, so they are kept out of the list and out of the changes.
+    private var chatFolder: String?
     /// The user's home folder, where Claude Code on some Macs will not reopen a background session.
     public let home: String
     /// Whether this Mac's Claude Code has been seen refusing that.
@@ -38,16 +44,19 @@ public final class SessionRegistry: @unchecked Sendable {
     /// - Parameters:
     ///   - turnProbe: whether a session's last turn is still going, read from its transcript.
     ///   - answerProbe: whether a session has finished an answer yet, read from its transcript (nil: cannot tell).
+    ///   - absenceProbe: whether a session surely has no transcript anywhere (only asked about blocked sessions).
     public init(replyReader: @escaping @Sendable (HookEvent) -> String? = { TranscriptReader.reply(for: $0) },
                 turnProbe: @escaping @Sendable (AgentInfo) -> Bool? = { agent in
                     agent.transcriptPath.flatMap(TranscriptReader.turnIsOpen(transcriptPath:))
                 },
                 answerProbe: @escaping @Sendable (String, String?) -> Bool? = { TranscriptReader.sessionHasAnswered($0, hint: $1) },
+                absenceProbe: @escaping @Sendable (String, [String]) -> Bool = { TranscriptReader.isAbsent($0, evidence: $1) },
                 home: String = FileManager.default.homeDirectoryForCurrentUser.path,
                 homeFolderMemory: HomeFolderMemory = .inMemory()) {
         self.replyReader = replyReader
         self.turnProbe = turnProbe
         self.answerProbe = answerProbe
+        self.absenceProbe = absenceProbe
         self.home = home
         self.homeFolderMemory = homeFolderMemory
     }
@@ -82,7 +91,7 @@ public final class SessionRegistry: @unchecked Sendable {
     // MARK: Reading
 
     public func snapshot() -> [Session] {
-        lock.withLock { Array(sessions.values) }.sorted { ($0.activityAt ?? .distantPast) > ($1.activityAt ?? .distantPast) }
+        lock.withLock { Array(sessions.values) }.filter { !isChatRun($0) }.sorted { ($0.activityAt ?? .distantPast) > ($1.activityAt ?? .distantPast) }
     }
 
     public func session(_ id: String) -> Session? { lock.withLock { sessions[id.lowercased()] } }
@@ -96,11 +105,38 @@ public final class SessionRegistry: @unchecked Sendable {
     /// Resolves a full id or a unique prefix (e.g. the 8-character agent id).
     public func resolve(_ idOrPrefix: String) -> Session? {
         let key = idOrPrefix.lowercased()
-        return lock.withLock {
+        let found: Session? = lock.withLock {
             if let s = sessions[key] { return s }
             let matches = sessions.values.filter { $0.id.hasPrefix(key) }
             return matches.count == 1 ? matches[0] : nil
         }
+        return found.flatMap { isChatRun($0) ? nil : $0 }
+    }
+
+    // MARK: Chats
+
+    /// Keeps the Claude Code sessions run in this folder (the chats' runs) out of the list and the changes.
+    public func hideRuns(in folder: String) {
+        let normal = ChatFolder.normal(folder)
+        lock.withLock { chatFolder = normal }
+    }
+
+    /// Whether this is the Claude Code session of a chat's run, not a session of its own.
+    public func isChatRun(_ s: Session) -> Bool {
+        guard s.kind != .chat, let folder = lock.withLock({ chatFolder }) else { return false }
+        return ChatFolder.contains(s.cwd, folder: folder)
+    }
+
+    /// Adds or replaces a chat as the list shows it.
+    public func setChat(_ chat: Session) {
+        var s = chat
+        s.kind = .chat
+        let changed: Bool = lock.withLock {
+            guard sessions[s.id] != s else { return false }
+            sessions[s.id] = s
+            return true
+        }
+        if changed { emit(s) }
     }
 
     // MARK: Observing
@@ -122,6 +158,7 @@ public final class SessionRegistry: @unchecked Sendable {
     }
 
     private func emit(_ s: Session) {
+        guard !isChatRun(s) else { return }
         let handlers = lock.withLock { Array(observers.values) }
         handlers.forEach { $0(.updated(s)) }
     }
@@ -203,8 +240,13 @@ public final class SessionRegistry: @unchecked Sendable {
         let midTurn = Set(agents.filter(isMidTurn).map(\.sessionId))
         let hints = lock.withLock { agents.map { sessions[$0.sessionId]?.transcriptPath } }
         var answeredNow: [String: Bool] = [:]
+        let evidence = agents.compactMap(\.transcriptPath)
         for (a, hint) in zip(agents, hints) where a.kind == SessionKind.background.rawValue && !midTurn.contains(a.sessionId) {
-            answeredNow[a.sessionId] = hasAnswered(a.sessionId, transcriptHint: hint ?? a.transcriptPath)
+            var answered = hasAnswered(a.sessionId, transcriptHint: hint ?? a.transcriptPath)
+            // A session that never ran a turn has no folder for its working directory yet, so the transcript
+            // check cannot be sure. For a blocked one, no transcript anywhere where Claude Code keeps them is enough.
+            if answered == nil, ResumeCheck.isBlocked(a), absenceProbe(a.sessionId, evidence) { answered = false }
+            answeredNow[a.sessionId] = answered
         }
         lock.withLock {
             for a in agents {
@@ -232,13 +274,17 @@ public final class SessionRegistry: @unchecked Sendable {
                     // A session still on its first turn has not answered yet, and is not blocked for that.
                     // Only a running session is stopped before it is resumed, so only there does a missing
                     // answer matter beforehand: Claude Code reopens a stopped session that never answered.
-                    let answered = s.state == .working || !a.isRunning ? nil : answeredNow[a.sessionId] ?? nil
+                    // A blocked one that never answered is the exception, running or not: it waits on a question in
+                    // its terminal, and resuming it makes Claude Code start a new session instead.
+                    let blocked = ResumeCheck.isBlocked(a)
+                    let answered = s.state == .working || (!a.isRunning && !blocked) ? nil : answeredNow[a.sessionId] ?? nil
                     // The same goes for the home folder: a stopped one is left for Claude Code to judge, and
                     // its answer is what keeps or clears the memory of a refusal.
                     let homeRefused = a.isRunning && homeFolderMemory.refused
-                    if let seen = ResumeCheck.blocker(cwd: s.cwd ?? a.cwd, home: home, answered: answered, homeFolderRefused: homeRefused) {
+                    if let seen = ResumeCheck.blocker(cwd: s.cwd ?? a.cwd, home: home, answered: answered, homeFolderRefused: homeRefused,
+                                                      blockedInTerminal: blocked) {
                         s.blocker = seen
-                    } else if s.blocker == .homeFolder || s.blocker == .noTranscript {
+                    } else if s.blocker == .homeFolder || s.blocker == .noTranscript || s.blocker == .waitingInTerminal {
                         s.blocker = nil
                     }
                 }
