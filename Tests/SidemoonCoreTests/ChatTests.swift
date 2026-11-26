@@ -163,6 +163,29 @@ private func engine(_ runner: ChatRunner, folder: String = scratch(), book: Chat
         #expect(!seen.ids.contains(first) && seen.ids.contains(fresh))
     }
 
+    /// The chat model goes with every run, the first and the resumed ones; none means Claude Code's default.
+    @Test func theChatModelGoesWithEveryRun() {
+        let runner = ChatRunner([(0, answered("A.", session: first), ""), (0, answered("B.", session: first), ""),
+                                 (0, answered("C.", session: first), "")])
+        let e = engine(runner)
+        #expect(e.send(SendRequest(session: general, text: "one", wait: true, model: "opus")).ok)
+        #expect(e.send(SendRequest(session: general, text: "two", wait: true, model: "opus")).ok)
+        #expect(e.send(SendRequest(session: general, text: "three", wait: true)).ok)
+        let calls = runner.recorded.map(\.args)
+        func model(_ args: [String]) -> String? { args.firstIndex(of: "--model").map { args[$0 + 1] } }
+        #expect(model(calls[0]) == "opus" && model(calls[1]) == "opus" && calls[1].contains("--resume"))
+        #expect(model(calls[2]) == nil)
+    }
+
+    /// What Claude Code 2.1.332 printed for a model it cannot use (seen with an invalid name): typed, not generic.
+    @Test func aModelClaudeCodeCannotUseIsTyped() {
+        let result = #"{"type":"result","subtype":"success","is_error":true,"api_error_status":404,"result":"There's an issue with the selected model (opus). It may not exist or you may not have access to it. Run --model to pick a different model."}"#
+        let runner = ChatRunner([(1, result + "\n", #"[claude-code:unrecognized_model] {"model":"opus","query_source":"sdk"}"#)])
+        let r = engine(runner).send(SendRequest(session: general, text: "hi", wait: true, model: "opus"))
+        #expect(r.failure == .modelUnavailable("opus"))
+        #expect(r.detail?.contains("selected model") == true)
+    }
+
     /// A screenshot or file that is not there is its own typed failure, so the companion never shows the path.
     @Test func aMissingAttachmentIsTyped() {
         let e = engine(ChatRunner([]))

@@ -2,6 +2,18 @@ import AppKit
 import Carbon.HIToolbox
 import SidemoonCompanion
 
+extension HotKeySpec.Modifiers {
+    /// The modifiers of a key press, as the constants describe them (Caps Lock and the like left out).
+    init(_ flags: NSEvent.ModifierFlags) {
+        var m: HotKeySpec.Modifiers = []
+        if flags.contains(.control) { m.insert(.control) }
+        if flags.contains(.option) { m.insert(.option) }
+        if flags.contains(.shift) { m.insert(.shift) }
+        if flags.contains(.command) { m.insert(.command) }
+        self = m
+    }
+}
+
 /// Global hotkeys through Carbon's RegisterEventHotKey (no Accessibility permission needed).
 @MainActor
 final class HotKeyCenter {

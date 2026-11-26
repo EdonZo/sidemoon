@@ -98,6 +98,26 @@ public enum TranscriptReader {
         return nil
     }
 
+    /// The model id of the transcript's most recent answer (`message.model` of its last assistant record, such as
+    /// `claude-opus-5-5`): only the file's end is read (`Limits.modelProbeBytes`), so a long transcript stays cheap.
+    /// Nil when there is no file, no assistant record in that end, or only ones Claude Code wrote itself (an error).
+    public static func lastModel(transcriptPath path: String) -> String? {
+        guard let data = readTailData(path, limit: Constants.Limits.modelProbeBytes) else { return nil }
+        var lines = data.split(separator: UInt8(ascii: "\n"))
+        // The first line of a cut tail is a fragment.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue,
+           size > Constants.Limits.modelProbeBytes, !lines.isEmpty { lines.removeFirst() }
+        let t = Constants.Transcript.self
+        for line in lines.reversed() where line.range(of: t.messageHint) != nil {
+            guard let record = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  record["type"] as? String == t.assistantType, record["isSidechain"] as? Bool != true,
+                  let message = record["message"] as? [String: Any], let model = message["model"] as? String,
+                  !model.isEmpty, model != t.syntheticModel else { continue }
+            return model
+        }
+        return nil
+    }
+
     /// Whether the session has finished at least one real answer: an assistant message that ended its turn
     /// and is not an error Claude Code wrote in place of one (a failed login, for example).
     ///

@@ -145,6 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Arrow keys in the bubble: Left leaves the session for the list, Up and Down move, Right enters.
         // Caught here, before the text field, which would otherwise use them to move the caret.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [unowned self] event in
+            // Control-C in the open bubble stops the selected session; anywhere else it is left alone.
+            if CompanionConstants.InterruptKey.matches(keyCode: event.keyCode, modifiers: HotKeySpec.Modifiers(event.modifierFlags)) {
+                let used = MainActor.assumeIsolated { () -> Bool in
+                    guard event.window === panels.bubble, model.isExpanded, !model.isCreatingSession else { return false }
+                    Task { await model.interrupt() }
+                    return true
+                }
+                if used { return nil }
+            }
             let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
             guard plain, let key = CompanionConstants.NavigationKeys.byKeyCode[event.keyCode] else { return event }
             let used = MainActor.assumeIsolated { event.window === panels.bubble && model.navigate(key) }

@@ -193,8 +193,13 @@ public final class CompanionModel {
     public private(set) var isEditingNote = false
     public var noteDraft = "" {
         // Typing anything while a held capture counts down stops the countdown for good.
-        didSet { if !noteDraft.isEmpty, noteCountdown != nil { stopCountdown() } }
+        didSet {
+            if !noteDraft.isEmpty, noteCountdown != nil { stopCountdown() }
+            if holdNotice != nil, noteDraft != oldValue { holdNotice = nil }
+        }
     }
+    /// A word under the composer about what waits there: why Return did not send it. Gone once the note changes.
+    public private(set) var holdNotice: String?
     /// The captures waiting for an optional note, in the order taken; empty when none is held. A capture shortcut
     /// pressed while they wait adds another one to the same message.
     public private(set) var heldCaptures = PendingCaptures()
@@ -390,6 +395,67 @@ public final class CompanionModel {
         return false
     }
 
+    /// The model General and the other chats run with. Sessions in a folder keep their own.
+    public private(set) var chatModel: ChatModel
+
+    public func setChatModel(_ model: ChatModel) {
+        chatModel = model
+        defaults.set(model.saved, forKey: CompanionConstants.Defaults.chatModel)
+    }
+
+    /// `/model` typed in a chat: the setting changes (or is shown) here, and nothing goes to Claude Code. Shown in the
+    /// thread as the user's line and a short answer.
+    private func handleModelCommand(_ command: ChatModelCommand, typed: String, in session: String) {
+        threads.append(ThreadEntry(role: .you, text: typed, delivery: .delivered), to: session)
+        let answer: String
+        switch command {
+        case let .set(model):
+            setChatModel(model)
+            answer = Design.Copy.ChatModels.nowUsing(model.spokenName)
+        case .show:
+            answer = Design.Copy.ChatModels.current(chatModel.spokenName, choices: ChatModel.all.map(\.saved))
+        }
+        threads.append(ThreadEntry(role: .session, text: answer), to: session)
+    }
+
+    // MARK: Cancel (Control-C)
+
+    /// Goes up for a session each time the user cancels what is waiting: a message still waiting that sees it
+    /// change is not sent.
+    @ObservationIgnored private var stopCounts: [String: Int] = [:]
+    /// Kept for the views; nothing is ever stopped in a session, so it stays false.
+    public private(set) var isStopping = false
+
+    /// Whether there is something for Control-C to cancel: a message waiting its turn, or captures waiting to go.
+    /// A session at work is not something Sidemoon stops.
+    public var canStop: Bool {
+        guard let id = targetId else { return false }
+        return heldDecision != nil || threads.thread(for: id).contains { $0.delivery == .queued }
+    }
+
+    /// Control-C, or the Cancel button, for the selected session only: what has not been handed to Claude Code yet
+    /// is cancelled (messages waiting their turn, captures waiting to be sent). It never stops the session or the
+    /// answer it is working on, and a message already on its way is left alone. With nothing to cancel it clears
+    /// what is typed, like a terminal prompt.
+    public func interrupt() async {
+        guard let id = targetId else { return }
+        var acted = false
+        if heldDecision != nil {
+            discardHeldCapture()
+            acted = true
+        }
+        if threads.thread(for: id).contains(where: { $0.delivery == .queued }) {
+            stopCounts[id, default: 0] += 1
+            // Shown at once; each one's own loop then ends without sending it.
+            threads.cancelWaiting(in: id)
+            acted = true
+        }
+        if !acted { noteDraft = "" }
+    }
+
+    /// Whether the user stopped the session since `count` was read: a message waiting then is not sent.
+    private func stoppedSince(_ count: Int, _ session: String) -> Bool { stopCounts[session, default: 0] != count }
+
     /// When on, each message asks the session for a short, conversational answer to that message only.
     public var shortReplies: Bool {
         didSet { defaults.set(shortReplies, forKey: CompanionConstants.Defaults.shortReplies) }
@@ -481,6 +547,7 @@ public final class CompanionModel {
             ?? CompanionConstants.Defaults.showEndedByDefault
         self.shortReplies = defaults.object(forKey: CompanionConstants.Defaults.shortReplies) as? Bool
             ?? CompanionConstants.Defaults.shortRepliesByDefault
+        self.chatModel = ChatModel(saved: defaults.string(forKey: CompanionConstants.Defaults.chatModel)) ?? .standard
         let savedTheme = defaults.string(forKey: CompanionConstants.Defaults.theme).flatMap(Design.Theme.init(rawValue:)) ?? .paper
         let savedLarge = defaults.bool(forKey: CompanionConstants.Defaults.largeWindow)
         self.theme = savedTheme
@@ -502,7 +569,8 @@ public final class CompanionModel {
     // MARK: Derived
 
     public var rows: [SessionRow] {
-        SessionList.rows(sessions, showEnded: showEnded, hidden: hidden.ids, showHidden: showHidden, checks: pathChecks)
+        SessionList.rows(sessions, showEnded: showEnded, hidden: hidden.ids, showHidden: showHidden, checks: pathChecks,
+                         chatModel: chatModel)
     }
     public var target: Session? { targetId.flatMap { id in sessions.first { $0.id == id } } }
     public var targetTitle: String {
@@ -516,6 +584,8 @@ public final class CompanionModel {
         if let folder = SessionList.folderName(target), folder != SessionList.displayName(target) { parts.insert(folder, at: 0) }
         return parts.joined(separator: "  ·  ")
     }
+    /// The model the target answers with, for the header; nil when not known yet.
+    public var targetModel: String? { target.flatMap { SessionList.modelLabel($0, chatModel: chatModel) } }
     public var indicator: Indicator { status.indicator }
     public var currentError: CompanionError? {
         if case let .failed(e) = status.activity { return e }
@@ -981,6 +1051,12 @@ public final class CompanionModel {
     /// Return in the note field while a capture is held: sends it now, with the note if one was typed.
     public func submitHeldCapture() {
         let note = noteDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A command is sent exactly as typed and alone: the screenshots and files stay, and the user is told.
+        if SlashCommand.isCommand(note), heldDecision != nil {
+            stopCountdown()
+            holdNotice = Design.Copy.Commands.notWithAttachments
+            return
+        }
         resolveHeldCapture(.send(note: note.isEmpty ? nil : note))
     }
 
@@ -1076,6 +1152,7 @@ public final class CompanionModel {
         stopCountdown()
         isEditingNote = false
         noteDraft = ""
+        holdNotice = nil
         if decision == .discard {
             // Only the temporary captures are deleted; dropped files belong to the user.
             captures.forEach(store.remove)
@@ -1193,6 +1270,11 @@ public final class CompanionModel {
 
     /// A typed message to a session that has answered before is a reply: the guide's last step.
     private func deliverTyped(to session: String?, _ text: String) async {
+        // In a chat, /model is Sidemoon's setting: each message is a separate run, so Claude Code could not keep it.
+        if let session, sessions.first(where: { $0.id == session })?.kind == .chat, let command = ChatModelCommand.parse(text) {
+            handleModelCommand(command, typed: text, in: session)
+            return
+        }
         let isReply = threads.thread(for: session).contains { $0.role == .session }
         let sent = await deliver(to: session, text: text, shown: text, imagePaths: [], files: [], attachments: [])
         if sent.delivered, isReply { tickGuide { $0.replied = true } }
@@ -1320,6 +1402,22 @@ public final class CompanionModel {
         var delivered: Bool
         var entry: UUID?
         var error: CompanionError?
+        /// The user stopped it before it was handed over.
+        var cancelled = false
+    }
+
+    /// A message the user stopped before it went: marked so, never sent. Called before it took its turn.
+    private func cancelled(_ entry: UUID, in session: String) -> DeliveryOutcome {
+        inFlight[session, default: 1] -= 1
+        return cancelledAfterStart(entry, in: session)
+    }
+
+    /// `stillCounted`: this message is still in `inFlight`, and is taken out of it right after.
+    private func cancelledAfterStart(_ entry: UUID, in session: String, stillCounted: Bool = false) -> DeliveryOutcome {
+        threads.setDelivery(.cancelled, entry: entry, in: session)
+        let others = (inFlight[session] ?? 0) - (stillCounted ? 1 : 0)
+        if session == targetId, others <= 0, !status.activity.isFailure { status.activity = .idle }
+        return DeliveryOutcome(delivered: false, entry: entry, error: nil, cancelled: true)
     }
 
     /// One send to the target: recorded in the thread, delivered off the main thread, reply awaited.
@@ -1335,11 +1433,14 @@ public final class CompanionModel {
         status.handle(.sendBegan)
         let entry = threads.append(ThreadEntry(role: .you, text: shown, attachments: attachments, delivery: .sending), to: targetId)
         inFlight[targetId, default: 0] += 1
+        let stopCount = stopCounts[targetId, default: 0]
         // One message at a time per session; other sessions are not held up.
         while activeSends.contains(targetId) {
             threads.setDelivery(.queued, entry: entry, in: targetId)
             await sleeper(CompanionConstants.Timing.busyRetryInterval)
+            if stoppedSince(stopCount, targetId) { return cancelled(entry, in: targetId) }
         }
+        if stoppedSince(stopCount, targetId) { return cancelled(entry, in: targetId) }
         activeSends.insert(targetId)
         threads.setDelivery(.sending, entry: entry, in: targetId)
         defer {
@@ -1347,7 +1448,8 @@ public final class CompanionModel {
             inFlight[targetId, default: 1] -= 1
         }
         let request = SendRequest(session: targetId, imagePaths: imagePaths, text: text, wait: true, filePaths: files.map(\.path),
-                                  styleNote: shortReplies ? nextStyleNote(for: targetId) : nil)
+                                  styleNote: shortReplies && !SlashCommand.isCommand(text) ? nextStyleNote(for: targetId) : nil,
+                                  model: sessions.first { $0.id == targetId }?.kind == .chat ? chatModel.alias : nil)
         let engine = self.engine
         var result = await Task.detached { engine.send(request) }.value
         // A busy session is not an error: the message waits and goes out when its turn is over.
@@ -1356,6 +1458,9 @@ public final class CompanionModel {
         while !result.ok, CompanionError.from(result) == .busy, waited < CompanionConstants.Timing.busyWaitLimit {
             threads.setDelivery(.queued, entry: entry, in: targetId)
             await sleeper(CompanionConstants.Timing.busyRetryInterval)
+            // Stopped while it waited for the busy session: it is never sent.
+            // (Its turn is given back by the defer above.)
+            if stoppedSince(stopCount, targetId) { return cancelledAfterStart(entry, in: targetId, stillCounted: true) }
             waited += CompanionConstants.Timing.busyRetryInterval
             checks += 1
             // Retry once the session is seen to have stopped working, and now and then regardless.
@@ -1363,6 +1468,15 @@ public final class CompanionModel {
             if stillWorking, checks % CompanionConstants.Timing.busyRetryEvery != 0 { continue }
             threads.setDelivery(.sending, entry: entry, in: targetId)
             result = await Task.detached { engine.send(request) }.value
+        }
+        // Stopped after it was handed over: it was delivered; what was said before the stop stays, and it is marked.
+        if result.failure == .stopped {
+            threads.setDelivery(.delivered, entry: entry, in: targetId)
+            if let partial = result.reply, !partial.isEmpty { threads.appendReply(partial, to: targetId) }
+            threads.append(ThreadEntry(role: .session, text: Design.Copy.Stop.stopped), to: targetId)
+            sessions = engine.sessions()
+            if targetId == self.targetId, case .failed = status.activity {} else if targetId == self.targetId { status.activity = .idle }
+            return DeliveryOutcome(delivered: true, entry: entry, error: nil)
         }
         if result.ok {
             threads.setDelivery(.delivered, entry: entry, in: targetId)

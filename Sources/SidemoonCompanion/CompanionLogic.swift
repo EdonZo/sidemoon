@@ -32,6 +32,12 @@ public enum CompanionError: Equatable, Sendable {
     case captureMissing(detail: String?)
     /// A file to send was no longer there, or could not be read. `detail` (with its path) is only for a bug report.
     case fileMissing(detail: String?)
+    /// A command (`/model`, `/compact`) with screenshots or files: a command goes alone, exactly as typed.
+    case commandWithAttachments
+    /// Claude Code cannot use the model chats are set to. Its alias.
+    case modelUnavailable(String)
+    /// Control-C on a session in the user's terminal: Sidemoon does not signal it; the user stops it there.
+    case stopInTerminal
 
     /// What stays under a message that failed, in the thread. A failure with no words of its own keeps the
     /// engine's reason there, shortened: the error card is replaced by the next thing that happens, and without
@@ -51,6 +57,9 @@ public enum CompanionError: Equatable, Sendable {
         case .folderGone: return Design.Copy.Unreachable.folderGoneTitle
         case .captureMissing: return Design.Copy.Captures.missingTitle
         case .fileMissing: return Design.Copy.Captures.fileMissingTitle
+        case .commandWithAttachments: return Design.Copy.Commands.withAttachmentsTitle
+        case let .modelUnavailable(alias): return Design.Copy.ChatModels.unavailableTitle(ChatModel(alias: alias).title)
+        case .stopInTerminal: return Design.Copy.Stop.inTerminalTitle
         case .noTarget: return "No session chosen"
         case .engineConflict: return "Another Sidemoon engine is running"
         case .engineFailed: return "The Sidemoon engine could not start"
@@ -74,6 +83,9 @@ public enum CompanionError: Equatable, Sendable {
         case let .folderGone(folder): return Design.Copy.Unreachable.folderGoneAdvice(folder)
         case .captureMissing: return Design.Copy.Captures.missingAdvice
         case .fileMissing: return Design.Copy.Captures.fileMissingAdvice
+        case .commandWithAttachments: return Design.Copy.Commands.notWithAttachments
+        case .modelUnavailable: return Design.Copy.ChatModels.unavailableAdvice
+        case .stopInTerminal: return Design.Copy.Stop.inTerminalAdvice
         case let .notPickedUp(fallback): return Design.Copy.Unreachable.notPickedUpAdvice(retryGoesInBackground: fallback == .background)
         case .noTarget:
             return "Open the menu and choose which Claude Code session should get your screenshots."
@@ -109,6 +121,7 @@ public enum CompanionError: Equatable, Sendable {
     public var remedies: [Remedy] {
         if self == .needsLauncher || self == .notPickedUp(fallback: nil) { return [.copyResumeCommand, .chooseAnotherSession] }
         if case .folderGone = self { return [.chooseAnotherSession] }
+        if case .modelUnavailable = self { return [.useDefaultChatModel] }
         guard case let .cannotReach(blocker, _, _, _) = self else { return [] }
         switch blocker {
         case .homeFolder, .untrustedFolder: return [.copyResumeCommand, .chooseAnotherSession]
@@ -127,6 +140,7 @@ public enum CompanionError: Equatable, Sendable {
         // Sending again cannot bring back what is gone.
         if case .captureMissing = self { return false }
         if case .fileMissing = self { return false }
+        if self == .commandWithAttachments { return false }
         return true
     }
 
@@ -154,6 +168,8 @@ public enum CompanionError: Equatable, Sendable {
         // Never the path: plain words, the technical text for a bug report.
         case .imageMissing?: return .captureMissing(detail: [result.error, result.detail].compactMap { $0 }.joined(separator: "\n"))
         case .fileMissing?: return .fileMissing(detail: [result.error, result.detail].compactMap { $0 }.joined(separator: "\n"))
+        case .commandWithAttachments?: return .commandWithAttachments
+        case let .modelUnavailable(model)?: return .modelUnavailable(model)
         default: return .delivery(result.error ?? "The engine did not say why.")
         }
     }
@@ -172,6 +188,8 @@ public enum Remedy: Equatable, Sendable, Hashable {
     case connectEveryClaude
     /// Show the background session itself in Terminal (`claude attach <short id>`), where it waits on a question.
     case attachInTerminal
+    /// Set chats back to Claude Code's default model.
+    case useDefaultChatModel
 }
 
 /// The "Try it" guide: three things to do once, each ticked when the user has really done it.
@@ -204,6 +222,11 @@ public enum Activity: Equatable, Sendable {
     case sending
     case waiting
     case failed(CompanionError)
+
+    public var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 
     public var isBusy: Bool {
         switch self {
@@ -438,6 +461,13 @@ public struct SessionRow: Identifiable, Equatable, Sendable {
     public var isChat = false
     /// Everything but General can be hidden.
     public var canHide: Bool { TargetRule.canHide(id) }
+    /// The model it answers with, as people read it; nil when not known yet.
+    public var model: String?
+    /// The quiet line under the title: the folder (when it is not the title) and the model.
+    public var detail: String? {
+        let parts = [folder == title ? nil : folder, model].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: CompanionConstants.Chat.detailSeparator)
+    }
     /// Whether a message can get to it at all. A busy session still counts: messages wait for it.
     public var reachable: Bool { reachability == .reachable }
     /// Why Claude Code would refuse it; nil when nothing is known to stand in the way.
@@ -483,6 +513,74 @@ public enum TargetRule {
     public static func canHide(_ id: String) -> Bool { id != general }
 }
 
+/// The model chats run with: Claude Code's default (no `--model`), or one of `CompanionConstants.Chat.modelAliases`.
+public struct ChatModel: Hashable, Sendable {
+    /// The alias passed to `claude --model`; nil for Claude Code's default.
+    public let alias: String?
+
+    public static let standard = ChatModel(alias: nil)
+    public static var all: [ChatModel] { [standard] + CompanionConstants.Chat.modelAliases.map { ChatModel(alias: $0) } }
+
+    /// How it is saved: the alias, or the default word.
+    public var saved: String { alias ?? CompanionConstants.Chat.defaultModelWord }
+    public init(alias: String?) { self.alias = alias }
+    public init?(saved: String?) {
+        guard let saved else { return nil }
+        if saved == CompanionConstants.Chat.defaultModelWord { self = .standard; return }
+        guard CompanionConstants.Chat.modelAliases.contains(saved) else { return nil }
+        self.alias = saved
+    }
+
+    /// Its name on a button ("Opus", "Default").
+    public var title: String { alias.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? Design.Copy.ChatModels.defaultChoice }
+    /// Its name in a sentence ("Opus", "the Claude Code default").
+    public var spokenName: String { alias == nil ? Design.Copy.ChatModels.defaultName : title }
+
+    /// What the user typed after /model, matched forgivingly: case does not matter, and any form that names the family
+    /// ("opus 5.5", "claude-opus-5-5") counts. Nil when it names none.
+    public static func match(_ typed: String) -> ChatModel? {
+        let words = typed.lowercased().split { !$0.isLetter }.map(String.init)
+        if words.contains(CompanionConstants.Chat.defaultModelWord) { return .standard }
+        return CompanionConstants.Chat.modelAliases.first { words.contains($0) }.map { ChatModel(alias: $0) }
+    }
+}
+
+/// A model id as people read it: `claude-opus-5-5` is "Opus 5.5", `claude-haiku-5-5-20261001` is "Haiku 5.5". The
+/// pattern is `claude-<family>-<major>[-<minor>][-<date or anything else>]`; no list of models is kept. An id that
+/// does not fit is shown as it is, shortened when long.
+public enum ModelName {
+    public static func short(_ id: String) -> String {
+        let c = CompanionConstants.Chat.self
+        // A bracketed mark after the id (Claude Code writes `[1m]` for a long-context variant) is not part of the name.
+        let base = id.split(separator: c.idMarkStart, maxSplits: 1).first.map(String.init) ?? id
+        let parts = base.lowercased().split(separator: "-").map(String.init)
+        if parts.count >= 3, parts[0] == c.modelIdPrefix, parts[1].allSatisfy(\.isLetter), !parts[1].isEmpty,
+           let major = Int(parts[2]), parts[2].allSatisfy(\.isNumber) {
+            let family = parts[1].prefix(1).uppercased() + parts[1].dropFirst()
+            if parts.count >= 4, parts[3].allSatisfy(\.isNumber), parts[3].count <= c.minorVersionDigits, let minor = Int(parts[3]) {
+                return "\(family) \(major).\(minor)"
+            }
+            return "\(family) \(major)"
+        }
+        return id.count > c.rawModelCharacters ? String(id.prefix(c.rawModelCharacters)) + c.nameEllipsis : id
+    }
+}
+
+/// `/model` typed in a chat: Sidemoon's own setting, not sent to Claude Code (each chat message is a separate run).
+public enum ChatModelCommand: Equatable, Sendable {
+    /// Use this model from now on.
+    case set(ChatModel)
+    /// Say which model is in use and which can be chosen.
+    case show
+
+    /// Nil when the text is not a /model command.
+    public static func parse(_ text: String) -> ChatModelCommand? {
+        guard let command = SlashCommand.parse(text), command.is(Constants.SlashCommands.model) else { return nil }
+        guard !command.arguments.isEmpty, let model = ChatModel.match(command.arguments) else { return .show }
+        return .set(model)
+    }
+}
+
 /// The name of a new chat: the start of its first message.
 public enum ChatNaming {
     /// The first words of the message, on one line, cut at a word to `CompanionConstants.Chat.nameCharacters`.
@@ -515,6 +613,17 @@ public enum SessionList {
         guard s.kind != .chat, let cwd = s.cwd, !cwd.isEmpty else { return nil }
         let last = (cwd as NSString).lastPathComponent
         return last.isEmpty ? cwd : last
+    }
+
+    /// The model to show for a session: for a chat, the one chosen for chats, or with Claude Code's default the one its
+    /// last answer came from ("default" before any); for any other session, the one its last answer came from, and
+    /// nothing before it has answered.
+    public static func modelLabel(_ s: Session, chatModel: ChatModel) -> String? {
+        if s.kind == .chat {
+            if chatModel.alias != nil { return chatModel.title }
+            return s.model.map(ModelName.short) ?? Design.Copy.ChatModels.defaultLabel
+        }
+        return s.model.map(ModelName.short)
     }
 
     /// A chat says it is one while it is ready; working is working for any session.
@@ -557,7 +666,7 @@ public enum SessionList {
     /// Picker rows: ended sessions left out unless asked for, hidden ones unless "Show hidden" is on, most recently
     /// active first.
     public static func rows(_ sessions: [Session], showEnded: Bool, hidden: Set<String> = [], showHidden: Bool = false,
-                            checks: PathChecks = .everythingExists) -> [SessionRow] {
+                            checks: PathChecks = .everythingExists, chatModel: ChatModel = .standard) -> [SessionRow] {
         sessions
             .filter { (showEnded || $0.state != .ended) && (showHidden || !hidden.contains($0.id)) }
             // General first, then the most recently active.
@@ -572,6 +681,7 @@ public enum SessionList {
                 row.hidden = hidden.contains(s.id)
                 row.isBackground = s.kind == .background
                 row.isChat = s.kind == .chat
+                row.model = modelLabel(s, chatModel: chatModel)
                 return row
             }
     }

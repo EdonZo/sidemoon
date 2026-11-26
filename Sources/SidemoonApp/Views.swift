@@ -206,7 +206,19 @@ struct BubbleView: View {
             .buttonStyle(PressStyle())
             .help(Design.Copy.sessionHelp)
 
-            ReadoutText(state.label, color: state == .reply ? .signal : (state == .error ? .problem : .mute))
+            let stateText = ReadoutText(state.label, color: state == .reply ? .signal : (state == .error ? .problem : .mute))
+            // The model the session answers with, small and quiet, where it fits whole; otherwise only the state.
+            if let answeredBy = model.targetModel {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: Design.Space.s) {
+                        stateText.fixedSize()
+                        ReadoutText(answeredBy).fixedSize().help(Design.Copy.ChatModels.modelHelp)
+                    }
+                    stateText
+                }
+            } else {
+                stateText
+            }
             Spacer(minLength: Design.Space.xs)
             let capturing = model.status.activity == .capturing || model.status.activity == .holding
             // Starting a session is one click from anywhere, not only from the session list.
@@ -288,6 +300,12 @@ struct BubbleView: View {
                 .buttonStyle(PressStyle())
                 .disabled(!canSend)
                 .help(Design.Copy.sendHelp)
+            }
+            if let notice = model.holdNotice {
+                Text(notice)
+                    .font(.proseSmall)
+                    .foregroundStyle(Color.problem)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let countdown = model.noteCountdown {
                 // The bar empties as the held capture counts down to sending without a note.
@@ -441,6 +459,11 @@ struct BubbleView: View {
                     }
                 }
                 .help(copy.openInTerminalHelp)
+            case .useDefaultChatModel:
+                cardButton(Design.Copy.ChatModels.useDefault, primary: index == 0) {
+                    model.setChatModel(.standard)
+                    model.dismissError()
+                }
             case .attachInTerminal:
                 cardButton(commandCopied ? copy.openedInTerminal : copy.openInTerminal, primary: index == 0) {
                     if case let .open(script) = model.attachInTerminal() {
@@ -563,7 +586,11 @@ struct BubbleView: View {
                     ThreadEntryView(entry: entry, sessionName: model.targetTitle, layoutWidth: Design.Bubble.width,
                                     onRetry: model.canRetry(entry) ? { Task { await model.retry(entry.id) } } : nil).equatable()
                 }
-                if working { WorkingRow(sessionName: model.targetTitle) }
+                if working {
+                    // Stop, for the mouse: the same as Control-C.
+                    WorkingRow(sessionName: model.targetTitle, stopping: model.isStopping,
+                               onStop: model.canStop ? { Task { await model.interrupt() } } : nil)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             // Another session starts again from its recent end.
@@ -606,9 +633,9 @@ struct BubbleView: View {
                 Text(Design.Copy.emptyOrType)
                     .font(.proseSmall)
                     .foregroundStyle(Color.mute)
-                // A chat only looks and answers: said plainly before anything is sent.
+                // A chat only looks and answers: said plainly before anything is sent, with the model that answers.
                 if model.target?.kind == .chat {
-                    Text(Design.Copy.Chat.readOnlyNote)
+                    Text(Design.Copy.Chat.readOnlyNote + " " + Design.Copy.ChatModels.answersWith(model.chatModel.spokenName))
                         .font(.proseSmall)
                         .foregroundStyle(Color.mute)
                         .fixedSize(horizontal: false, vertical: true)
@@ -825,6 +852,16 @@ struct ThreadEntryView: View, Equatable {
                 switch entry.delivery {
                 case .sending: ReadoutText(Design.Copy.sending, color: .signal)
                 case .queued: ReadoutText(Design.Copy.queued, color: .signal)
+                case .cancelled:
+                    // Never just grey: a struck-out badge in the problem colour, so it reads as "did not go".
+                    HStack(spacing: Design.Space.xxs) {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: Design.TypeScale.code))
+                        ReadoutText(Design.Copy.Stop.cancelled, color: .problem)
+                    }
+                    .foregroundStyle(Color.problem)
+                    .padding(.horizontal, Design.Space.m)
+                    .padding(.vertical, Design.Space.xxs)
+                    .overlay(Capsule().strokeBorder(Color.problem, lineWidth: Design.Bubble.hairline))
                 case .failed, .refused:
                     ReadoutText(Design.Copy.notDelivered, color: .problem)
                     if let onRetry {
@@ -865,7 +902,8 @@ struct ThreadEntryView: View, Equatable {
             if !entry.text.isEmpty {
                 Text(entry.text)
                     .font(.prose)
-                    .foregroundStyle(Color.ink)
+                    .strikethrough(isCancelled, color: Color.mute)
+                    .foregroundStyle(isCancelled ? Color.mute : Color.ink)
                     .lineSpacing(Design.TypeScale.bodyLineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
@@ -873,24 +911,57 @@ struct ThreadEntryView: View, Equatable {
             if let reason = entry.delivery.failureReason {
                 Text(reason).font(.proseSmall).foregroundStyle(Color.mute).fixedSize(horizontal: false, vertical: true)
             }
+            if isCancelled {
+                Text(Design.Copy.Stop.cancelledNote).font(.proseSmall).foregroundStyle(Color.problem)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(Design.Bubble.entryPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous).fill(Color.sent))
-        .overlay(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
-            .strokeBorder(Color.signalSoft, lineWidth: Design.Bubble.hairline))
+        .background(RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+            .fill(isCancelled ? Color.clear : Color.sent))
+        .overlay {
+            if isCancelled {
+                // A dashed outline and no fill: an empty slot where a message would have been.
+                RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+                    .strokeBorder(Color.problem, style: StrokeStyle(lineWidth: Design.Bubble.cancelledOutline,
+                                                                    dash: Design.Bubble.cancelledDash))
+            } else {
+                RoundedRectangle(cornerRadius: Design.Radius.card, style: .continuous)
+                    .strokeBorder(Color.signalSoft, lineWidth: Design.Bubble.hairline)
+            }
+        }
     }
+
+    private var isCancelled: Bool { entry.delivery == .cancelled }
 }
 
 /// Shown at the bottom of the thread while the session is working on its answer.
 struct WorkingRow: View {
     let sessionName: String
+    var stopping = false
+    /// The Stop control beside the state; nil shows none.
+    var onStop: (() -> Void)?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: Design.Space.m) {
             ReadoutText(sessionName, color: .ink).truncationMode(.middle)
             ReadoutText(Design.Copy.working, color: .signal)
+            if let onStop {
+                Button(action: onStop) {
+                    ReadoutText(Design.Copy.Stop.button, color: .problem)
+                        .padding(.horizontal, Design.Space.s)
+                        .frame(height: Design.Bubble.pillHeight)
+                        .overlay(RoundedRectangle(cornerRadius: Design.Radius.control)
+                            .strokeBorder(Color.problem.opacity(Design.Bubble.stopOutlineOpacity), lineWidth: Design.Bubble.hairline))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .fixedSize()
+                .disabled(stopping)
+                .help(Design.Copy.Stop.help)
+            }
             if !reduceMotion {
                 TimelineView(.animation) { context in
                     let t = context.date.timeIntervalSinceReferenceDate
@@ -1087,6 +1158,18 @@ struct SettingsView: View {
                 .help(Design.Copy.actualSize)
                 stepButton("plus", help: Design.Copy.larger, disabled: model.zoom >= Design.Zoom.maximum) { model.zoomIn() }
             }
+            VStack(alignment: .leading, spacing: Design.Space.xs) {
+                row(Design.Copy.ChatModels.label) {
+                    ForEach(ChatModel.all, id: \.self) { choiceModel in
+                        choice(choiceModel.title, selected: model.chatModel == choiceModel) { model.setChatModel(choiceModel) }
+                    }
+                }
+                Text(Design.Copy.ChatModels.help)
+                    .font(.proseSmall)
+                    .foregroundStyle(Color.mute)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, Design.Bubble.settingsLabel + Design.Space.s)
+            }
             row(Design.Copy.replies) {
                 choice(Design.Copy.shortReplies, selected: model.shortReplies) { model.shortReplies.toggle() }
                     .help(Design.Copy.shortRepliesHelp)
@@ -1249,7 +1332,7 @@ struct SessionRowView: View {
                             .foregroundStyle(row.reachable ? Color.ink : Color.mute)
                             .lineLimit(1)
                             .truncationMode(.middle)
-                        if let folder = row.folder, folder != row.title { ReadoutText(folder).truncationMode(.middle) }
+                        if let detail = row.detail { ReadoutText(detail).truncationMode(.middle) }
                     }
                     .opacity(row.hidden ? Design.Bubble.hiddenOpacity : (row.reachable ? 1 : Design.Bubble.unreachableOpacity))
                     Spacer(minLength: Design.Space.m)

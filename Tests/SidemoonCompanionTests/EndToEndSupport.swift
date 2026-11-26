@@ -226,6 +226,12 @@ final class GuardedEngine: CompanionEngine, @unchecked Sendable {
 
     func homeFolderRefused() -> Bool { inner.homeFolderRefused() }
 
+    /// Only sessions this run made may be stopped.
+    func stop(_ sessionId: String) -> Engine.StopOutcome {
+        let ok = lock.withLock { allowed.contains(sessionId.lowercased()) }
+        return ok ? inner.stop(sessionId) : .notRunning
+    }
+
     /// A chat runs in this run's own support folder; it may be sent to once made.
     func newChat(name: String) -> String {
         let id = inner.newChat(name: name)
@@ -237,10 +243,11 @@ final class GuardedEngine: CompanionEngine, @unchecked Sendable {
 /// One engine per test process, on the overridden socket. It is never stopped: the process ends instead.
 enum SharedEngine {
     /// A session it starts loads only the scratch project's settings, runs on the small model and is named as a
-    /// throwaway, like the ones the scenarios start themselves.
+    /// throwaway, like the ones the scenarios start themselves. Chats get no model here: the general scenario sets the
+    /// small one with /model, which is what it checks.
     static let engine = InProcessEngine(engine: Engine(newSessionArguments: E2E.settingSources
         + ["--model", E2E.model, Constants.ClaudeCLI.nameFlag, "\(E2E.namePrefix)-\(E2E.createdName)"],
-        chatArguments: E2E.settingSources + ["--model", E2E.model]))
+        chatArguments: E2E.settingSources))
 }
 
 // MARK: - One scenario's world

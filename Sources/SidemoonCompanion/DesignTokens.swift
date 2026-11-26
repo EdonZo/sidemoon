@@ -182,6 +182,9 @@ public enum Design {
 
     /// Bubble structure.
     public enum Bubble {
+        /// The dashed outline of a message that was cancelled and never sent.
+        public static let cancelledDash: [CGFloat] = [4, 3]
+        public static let cancelledOutline: CGFloat = 1.2
         public static var width: CGFloat { Design.customBubbleSize?.width ?? (Design.isLarge ? 640 : 400) * Design.zoom }
         /// The smallest and largest window a drag can make.
         public static let customMinimum = CGSize(width: 300, height: 220)
@@ -209,6 +212,8 @@ public enum Design {
         public static var chipMaxWidth: CGFloat { 180 * Design.zoom }
         public static var sendButton: CGFloat { 24 * Design.zoom }
         public static var dropOutline: CGFloat { 2 * Design.zoom }
+        /// The Stop control in the header: outlined in the problem colour, faintly.
+        public static let stopOutlineOpacity: Double = 0.5
         /// Width of the label column in the settings.
         public static var settingsLabel: CGFloat { 76 * Design.zoom }
         /// The three dots shown while the session works on its answer.
@@ -774,6 +779,56 @@ public enum Design {
         }
 
         /// Starting a new session from the companion.
+        /// Control-C, and the Stop button, for the selected session.
+        public enum Stop {
+            public static let button = "Cancel"
+            public static let help = "Cancel the messages still waiting to go (Control-C). The session keeps working."
+            /// Under a message that was not sent because the user stopped it.
+            public static let cancelled = "Not sent"
+            /// Under a cancelled message, so it cannot be mistaken for one that went.
+            public static let cancelledNote = "Cancelled with Control-C. This message never reached the session."
+            /// In the conversation after a turn was stopped.
+            public static let stopped = "Stopped."
+            public static let inTerminalTitle = "This session runs in Terminal"
+            public static let inTerminalAdvice = "Press Esc there to stop it. Sidemoon does not interrupt a terminal session."
+        }
+
+        /// The model chats run with.
+        public enum ChatModels {
+            /// The settings row.
+            public static let label = "Chat model"
+            public static let defaultChoice = "Default"
+            public static let help = "The model General and your other chats answer with. Sessions in a folder keep the "
+                + "model they were started with."
+            /// How a model is named in sentences.
+            public static let defaultName = "the Claude Code default"
+            /// A chat on the default model before its first answer: shown where a model name goes.
+            public static let defaultLabel = "default"
+            /// On the model shown in the header.
+            public static let modelHelp = "The model this session's answers come from"
+            /// Under a chat that has said nothing yet, and shown with a chat in the header.
+            public static func answersWith(_ name: String) -> String { "Answers come from \(name)." }
+            /// After `/model <name>` in a chat.
+            public static func nowUsing(_ name: String) -> String { "Chats now use \(name)." }
+            /// After `/model` alone, or a name that matches nothing.
+            public static func current(_ name: String, choices: [String]) -> String {
+                "Chats use \(name). Type /model and one of: \(choices.joined(separator: ", "))."
+            }
+            /// Claude Code cannot use the model asked for.
+            public static func unavailableTitle(_ name: String) -> String { "\(name) is not available here" }
+            public static let unavailableAdvice = "Claude Code could not use this model for chats: it may need a newer "
+                + "Claude Code, or a plan that includes it. Go back to the Claude Code default, then send again."
+            public static let useDefault = "Use the default model"
+        }
+
+        /// Messages that are Claude Code commands, such as /model or /compact.
+        public enum Commands {
+            public static let withAttachmentsTitle = "A command goes on its own"
+            /// Under the composer when Return is pressed on a command while screenshots or files wait.
+            public static let notWithAttachments = "A command like /compact is sent on its own, exactly as typed. "
+                + "Send the screenshots with words, or remove them, then send the command."
+        }
+
         /// Screenshots and files that were not there when it came to sending them.
         public enum Captures {
             public static let missingTitle = "The screenshot was no longer available"
