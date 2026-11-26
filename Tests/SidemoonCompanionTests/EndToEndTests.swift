@@ -654,6 +654,10 @@ import Testing
             let model = fx.model
             guard model.targetId == general else { throw E2EFailure("with nothing chosen the target is \(model.targetId ?? "-"), not General") }
             let chats = SharedEngine.engine.engine.chats
+            // The chat model, set the way a user would: /model in the chat. Nothing goes to Claude Code for it.
+            await model.sendMessage("/model \(E2E.model)")
+            guard model.chatModel.alias == E2E.model else { throw E2EFailure("/model did not set the chat model: \(fx.describeThread(general))") }
+            #expect(model.thread.last?.text == Design.Copy.ChatModels.nowUsing(ChatModel(alias: E2E.model).spokenName))
             let began = Date()
             await model.captureAndSend(note: "What single word is written in this image? Reply with only that word.")
             let firstTook = Date().timeIntervalSince(began)
@@ -661,6 +665,10 @@ import Testing
             #expect(model.currentError == nil, "error: \(String(describing: model.currentError))")
             #expect(seen.uppercased().contains(word), "reply was: \(seen); \(fx.describeThread(general))")
             #expect(fx.store.files().isEmpty, "the capture file should be deleted after delivery")
+            // The run was launched with that model: its answer says which model wrote it.
+            let used = fx.session(general)?.model ?? "-"
+            #expect(used.contains(E2E.model), "answered by \(used), not \(E2E.model)")
+            #expect(model.targetModel?.lowercased().contains(E2E.model) == true, "header shows \(model.targetModel ?? "-")")
             let conversation = chats.chat(general)?.claudeSessionId
             #expect(conversation != nil, "no conversation id was kept")
             let again = Date()
@@ -675,14 +683,14 @@ import Testing
             let folder = SharedEngine.engine.engine.chatFolder
             #expect(model.sessions.filter { $0.id == general }.count == 1)
             #expect(!model.sessions.contains { ChatFolder.contains($0.cwd, folder: folder) }, "a run's session is listed")
-            #expect(model.thread.filter { $0.role == .session }.count == 2, "\(fx.describeThread(general))")
+            #expect(model.thread.filter { $0.role == .session }.count == 3, "\(fx.describeThread(general))")
             // Nothing left running: no Claude Code process in the chat folder (listed ones that ended are only logged).
             let listed = await Task.detached { ClaudeCLI.agents() }.value.filter { ChatFolder.contains($0.cwd, folder: folder) }
             let running = listed.filter(\.isRunning)
             #expect(running.isEmpty, "left running: \(listed.map { ClaudeCLI.describe($0) })")
             e2eLog("[general] listed by claude agents in the chat folder: \(listed.map { ClaudeCLI.describe($0) })")
             e2eLog("[general] first reply in \(String(format: "%.1f", firstTook))s, follow-up in \(String(format: "%.1f", secondTook))s; "
-                + "conversation \(conversation ?? "-")")
+                + "conversation \(conversation ?? "-"); model \(used)")
         }
     }
 

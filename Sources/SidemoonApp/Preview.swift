@@ -97,6 +97,7 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
     func start() throws -> EngineStartOutcome { .running }
     func stop() {}
     func sessions() -> [Session] { list + chatsLock.withLock { started } }
+    func stop(_ sessionId: String) -> Engine.StopOutcome { .stopped }
     private let chatsLock = NSLock()
     private var started: [Session] = []
     func newChat(name: String) -> String {
@@ -188,6 +189,10 @@ enum Preview {
     static let badgesOnlyVariable = "SIDEMOON_PREVIEW_BADGES_ONLY"
     /// Set to render only the kept-captures previews (quick checks of failed sends).
     static let keptOnlyVariable = "SIDEMOON_PREVIEW_KEPT_ONLY"
+    /// Set to render only the model previews (the setting, /model in a chat, models in the list and the header).
+    static let modelsOnlyVariable = "SIDEMOON_PREVIEW_MODELS_ONLY"
+    /// Set to render only the Stop previews.
+    static let stopOnlyVariable = "SIDEMOON_PREVIEW_STOP_ONLY"
     /// How long the preview's held captures wait before counting on: longer than the whole render.
     static let heldStill: TimeInterval = 3600
     /// The longest a preview waits for a send to finish.
@@ -260,6 +265,8 @@ enum Preview {
         let dir = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         if ProcessInfo.processInfo.environment[keptOnlyVariable] != nil { renderKeptCaptures(to: dir); return }
+        if ProcessInfo.processInfo.environment[modelsOnlyVariable] != nil { renderModels(to: dir); return }
+        if ProcessInfo.processInfo.environment[stopOnlyVariable] != nil { renderStop(to: dir); return }
         renderBadges(to: dir)
         if ProcessInfo.processInfo.environment[badgesOnlyVariable] != nil { return }
         var halfway = NoteCountdown()
@@ -371,6 +378,8 @@ enum Preview {
         renderNewSessionAndHidden(to: dir)
         renderChats(to: dir)
         renderKeptCaptures(to: dir)
+        renderModels(to: dir)
+        renderStop(to: dir)
         // Terminal is always dark, whatever the system.
         let theme = Design.theme
         Design.theme = .terminal
@@ -532,6 +541,96 @@ enum Preview {
 
     /// The "+" and a row's actions, the new-session form in each state, Undo after hiding, the list with hidden
     /// sessions shown, and the empty states, in each theme.
+    /// The Stop control while a message is on its way and another waits its turn, then the waiting one cancelled.
+    private static func renderStop(to dir: URL) {
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(root: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(settleTime)) }
+        for (theme, dark) in [(Design.Theme.paper, false), (.terminal, true)] {
+            let look = theme.rawValue
+            let m = CompanionModel(engine: PreviewEngine(sessions: [PreviewEngine.session]), capture: ScreencaptureProvider(),
+                                   store: scratch, defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard,
+                                   sleeper: { _ in try? await Task.sleep(for: .seconds(Preview.heldStill)) })
+            m.setTheme(theme)
+            m.startEngine()
+            m.dismissGuide()
+            m.openBubble()
+            m.selectTarget(PreviewEngine.session.id)
+            Task { await m.sendMessage("great, lets release the new version") }
+            settle()
+            Task { await m.sendMessage("/model opus") }
+            settle()
+            bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("stop-control-\(look).png"))
+            Task { await m.interrupt() }
+            settle()
+            bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("stop-cancelled-\(look).png"))
+        }
+        Design.theme = .paper
+    }
+
+    /// The Chat model setting; /model typed in General and its answer; the session list and the header with the model
+    /// each session answers with, at the standard size and at the narrowest window at the smallest size.
+    private static func renderModels(to dir: URL) {
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(root: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(settleTime)) }
+        var general = Session(id: Constants.Chat.generalId)
+        general.kind = .chat
+        general.lastEventAt = Date().addingTimeInterval(-9000)
+        let models = ["claude-opus-5-5", "claude-sonnet-5-5-20261001", "claude-haiku-5-5", "claude-fable-5-2", nil, "claude-opus-5-5"]
+        let sessions = [general] + PreviewEngine.several.enumerated().map { index, session in
+            var s = session
+            s.model = models[index % models.count]
+            return s
+        }
+        func model(theme: Design.Theme) -> CompanionModel {
+            let m = CompanionModel(engine: PreviewEngine(sessions: sessions, delay: 0), capture: ScreencaptureProvider(), store: scratch,
+                                   defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard)
+            m.setTheme(theme)
+            m.startEngine()
+            m.dismissGuide()
+            m.openBubble()
+            return m
+        }
+        for (theme, dark) in [(Design.Theme.paper, false), (.terminal, true)] {
+            let look = theme.rawValue
+            for narrow in [false, true] {
+                let size = narrow ? "narrow" : "standard"
+                let m = model(theme: theme)
+                if narrow {
+                    m.setZoom(Design.Zoom.minimum)
+                    m.resizeBubble(to: Design.Bubble.customMinimum)
+                }
+                m.setChatModel(ChatModel(alias: CompanionConstants.Chat.modelAliases[0]))
+                // A project session chosen: its model next to the state; then the list.
+                m.selectTarget(PreviewEngine.several[0].id)
+                bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("model-header-\(size)-\(look).png"))
+                m.openSessionList()
+                bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("model-list-\(size)-\(look).png"))
+                m.closeSessionList()
+                // General: /model typed, and Sidemoon's answer.
+                m.selectTarget(Constants.Chat.generalId)
+                Task { await m.sendMessage("/model sonnet") }
+                settle()
+                bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("model-command-\(size)-\(look).png"))
+                m.resetBubbleSize()
+                m.resetZoom()
+            }
+            let settings = model(theme: theme)
+            settings.setChatModel(ChatModel(alias: CompanionConstants.Chat.modelAliases[1]))
+            snapshot(SettingsView(model: settings)
+                .padding(.horizontal, Design.Space.bubbleHorizontal)
+                .padding(.vertical, Design.Space.bubbleVertical)
+                .frame(width: Design.Bubble.width)
+                .background(Color.paper), dark: dark, to: dir.appendingPathComponent("model-settings-\(look).png"))
+        }
+        Design.theme = .paper
+    }
+
     /// A failed message that kept its three screenshots, with Retry; then Retry after the screenshots were gone, with
     /// words (sent alone, with the note) and without (nothing sent).
     private static func renderKeptCaptures(to dir: URL) {

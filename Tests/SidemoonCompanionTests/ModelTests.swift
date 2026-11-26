@@ -40,6 +40,17 @@ final class FakeEngine: CompanionEngine, @unchecked Sendable {
     }
     func homeFolderRefused() -> Bool { homeRefused }
     private(set) var chatNames: [String] = []
+    /// What a stop does here, and the sessions stopped.
+    var stopOutcome: Engine.StopOutcome = .stopped
+    private(set) var stops: [String] = []
+    /// Runs inside `stop`, before it returns (a test holds a stop under way with it).
+    var stopHook: @Sendable () -> Void = {}
+    func stop(_ sessionId: String) -> Engine.StopOutcome {
+        lock.withLock { stops.append(sessionId) }
+        stopHook()
+        return stopOutcome
+    }
+    var stopped: [String] { lock.withLock { stops } }
     func newChat(name: String) -> String {
         var s = Session(id: UUID().uuidString.lowercased())
         s.kind = .chat

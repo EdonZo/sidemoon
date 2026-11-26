@@ -11,8 +11,12 @@ public struct SendRequest: Sendable {
     public var filePaths: [String]
     /// A request about how to answer this one message, added after the text. Not shown as the user's words.
     public var styleNote: String?
+    /// For a chat: the model its run uses (`--model`); nil runs Claude Code's default. Ignored for other sessions,
+    /// which keep the model they were started with.
+    public var model: String?
     public init(session: String, imagePath: String? = nil, imagePaths: [String] = [], text: String? = nil, wait: Bool = false,
-                filePaths: [String] = [], styleNote: String? = nil) {
+                filePaths: [String] = [], styleNote: String? = nil, model: String? = nil) {
+        self.model = model
         self.session = session
         self.imagePath = imagePath
         self.imagePaths = imagePaths
@@ -76,6 +80,12 @@ public struct SendResult: Sendable {
 public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
     case unknownSession(String)
     case emptyMessage
+    /// A command (`SlashCommand`) with screenshots or files: a command is sent exactly as typed, alone.
+    case commandWithAttachments
+    /// Claude Code cannot use the model a chat asked for (unknown here, or not on this plan). The model's name.
+    case modelUnavailable(String)
+    /// The user stopped it (Control-C in the companion). A message already handed over stays delivered.
+    case stopped
     case image(String)
     case file(String)
     /// An image to send is not there (any more): its path. Kept apart from other image problems so the companion
@@ -105,6 +115,9 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
         switch self {
         case let .unknownSession(s): return "unknown session: \(s) (no hook event or `claude agents` entry for it)"
         case .emptyMessage: return "nothing to send: give an image, text, or both"
+        case .commandWithAttachments: return "a command is sent on its own, without screenshots or files"
+        case let .modelUnavailable(m): return "claude code cannot use the model \(m)"
+        case .stopped: return "stopped by the user"
         case let .image(m): return "image: \(m)"
         case let .file(m): return "file: \(m)"
         case let .imageMissing(p): return "image: not a readable regular file: \(p)"

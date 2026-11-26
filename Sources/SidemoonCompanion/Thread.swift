@@ -15,12 +15,14 @@ public struct ThreadEntry: Identifiable, Equatable, Sendable, Codable {
         /// Not delivered, and sending it again as it is would fail the same way (Claude Code refused the
         /// session), so it is not offered again. The text says why in plain words.
         case refused(String)
+        /// Not sent: the user stopped it (Control-C) before it was handed to Claude Code.
+        case cancelled
 
         /// Why it did not go out, for either kind of failure.
         public var failureReason: String? {
             switch self {
             case let .failed(reason), let .refused(reason): return reason
-            case .sending, .queued, .delivered: return nil
+            case .sending, .queued, .delivered, .cancelled: return nil
             }
         }
     }
@@ -130,12 +132,18 @@ public struct Threads: Equatable, Sendable, Codable {
     public var isEmpty: Bool { entries.values.allSatisfy(\.isEmpty) }
 
     /// After a restart nothing is still on its way: what was being sent or waiting its turn did not go out.
+    /// Marks the messages of one session still waiting their turn as cancelled.
+    public mutating func cancelWaiting(in session: String) {
+        guard let list = entries[session] else { return }
+        for index in list.indices where list[index].delivery == .queued { entries[session]![index].delivery = .cancelled }
+    }
+
     public mutating func settleInterrupted(reason: String) {
         for session in entries.keys {
             for index in entries[session]!.indices {
                 switch entries[session]![index].delivery {
                 case .sending, .queued: entries[session]![index].delivery = .failed(reason)
-                case .delivered, .failed, .refused: break
+                case .delivered, .failed, .refused, .cancelled: break
                 }
             }
         }

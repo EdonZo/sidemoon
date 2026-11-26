@@ -18,6 +18,11 @@ public final class SessionRegistry: @unchecked Sendable {
     /// Whether a session surely has no transcript at all, given the transcript paths of the other listed sessions as
     /// evidence of where Claude Code keeps them (`TranscriptReader.isAbsent`).
     private let absenceProbe: @Sendable (_ sessionId: String, _ evidence: [String]) -> Bool
+    /// The model of a transcript's last answer (`TranscriptReader.lastModel`).
+    private let modelProbe: @Sendable (_ transcriptPath: String) -> String?
+    /// What was last read for each session's model, with the transcript's size and date then: read again only when
+    /// the file changed.
+    private var modelCache: [String: (path: String, size: UInt64, modified: Date, model: String?)] = [:]
     /// Sessions known to have finished an answer. A transcript only grows, so this never has to be undone.
     private var answered: Set<String> = []
     /// When each session last reported a UserPromptSubmit hook.
@@ -51,12 +56,14 @@ public final class SessionRegistry: @unchecked Sendable {
                 },
                 answerProbe: @escaping @Sendable (String, String?) -> Bool? = { TranscriptReader.sessionHasAnswered($0, hint: $1) },
                 absenceProbe: @escaping @Sendable (String, [String]) -> Bool = { TranscriptReader.isAbsent($0, evidence: $1) },
+                modelProbe: @escaping @Sendable (String) -> String? = { TranscriptReader.lastModel(transcriptPath: $0) },
                 home: String = FileManager.default.homeDirectoryForCurrentUser.path,
                 homeFolderMemory: HomeFolderMemory = .inMemory()) {
         self.replyReader = replyReader
         self.turnProbe = turnProbe
         self.answerProbe = answerProbe
         self.absenceProbe = absenceProbe
+        self.modelProbe = modelProbe
         self.home = home
         self.homeFolderMemory = homeFolderMemory
     }
@@ -79,6 +86,21 @@ public final class SessionRegistry: @unchecked Sendable {
 
     /// Whether this session is in the middle of a turn right now.
     public func isMidTurn(_ agent: AgentInfo) -> Bool { agent.isMidTurn(turnIsOpen: turnProbe) }
+
+    /// The model of the session's last answer, read from its transcript only when the file changed since last time.
+    public func model(_ sessionId: String, transcriptPath: String?) -> String? {
+        guard let path = transcriptPath,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value, let modified = attrs[.modificationDate] as? Date else {
+            return lock.withLock { modelCache[sessionId]?.model }
+        }
+        if let known = lock.withLock({ modelCache[sessionId] }), known.path == path, known.size == size, known.modified == modified {
+            return known.model
+        }
+        let model = modelProbe(path)
+        lock.withLock { modelCache[sessionId] = (path, size, modified, model) }
+        return model
+    }
 
     /// Whether the session has finished an answer: remembered once it has, else read from its transcript.
     public func hasAnswered(_ sessionId: String, transcriptHint: String?) -> Bool? {
@@ -170,6 +192,7 @@ public final class SessionRegistry: @unchecked Sendable {
     public func apply(_ e: HookEvent) -> Session {
         // Parse the transcript outside the lock: it is file IO.
         let fullReply = e.eventName == Constants.HookEvents.stop ? (replyReader(e) ?? e.lastAssistantMessage) : nil
+        let answeredWith = e.eventName == Constants.HookEvents.stop ? model(e.sessionId, transcriptPath: e.transcriptPath) : nil
         var waitersToFire: [StopWaiter] = []
         let s: Session = lock.withLock {
             var s = sessions[e.sessionId] ?? Session(id: e.sessionId)
@@ -206,6 +229,7 @@ public final class SessionRegistry: @unchecked Sendable {
                 if s.state != .ended { s.state = .idle }
                 s.lastReply = fullReply
                 s.lastReplyAt = e.receivedAt
+                if let answeredWith { s.model = answeredWith }
             case Constants.HookEvents.notification:
                 if e.notificationType == Constants.HookEvents.notificationPermission { s.state = .needsInput }
                 if e.notificationType == Constants.HookEvents.notificationIdle { s.state = .idle }
@@ -248,10 +272,16 @@ public final class SessionRegistry: @unchecked Sendable {
             if answered == nil, ResumeCheck.isBlocked(a), absenceProbe(a.sessionId, evidence) { answered = false }
             answeredNow[a.sessionId] = answered
         }
+        // The models, read only from transcripts that changed.
+        var models: [String: String] = [:]
+        for (a, hint) in zip(agents, hints) {
+            if let model = model(a.sessionId, transcriptPath: hint ?? a.transcriptPath) { models[a.sessionId] = model }
+        }
         lock.withLock {
             for a in agents {
                 var s = sessions[a.sessionId] ?? Session(id: a.sessionId)
                 let before = s
+                if let model = models[a.sessionId] { s.model = model }
                 s.kind = a.kind == SessionKind.background.rawValue ? .background : (a.kind == nil ? s.kind : .interactive)
                 s.name = a.name ?? s.name
                 s.cwd = s.cwd ?? a.cwd
@@ -362,4 +392,10 @@ public final class SessionRegistry: @unchecked Sendable {
     }
 
     public func cancelWait(_ token: UUID) { _ = lock.withLock { stopWaiters.removeValue(forKey: token) } }
+
+    /// Ends every wait for this session's next answer at once, with none: the user stopped it.
+    public func releaseWaits(sessionId: String) {
+        let waiting = lock.withLock { stopWaiters.values.filter { $0.sessionId == sessionId } }
+        waiting.forEach { $0.semaphore.signal() }
+    }
 }

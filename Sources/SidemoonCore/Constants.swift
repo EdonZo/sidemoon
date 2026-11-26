@@ -136,6 +136,8 @@ public enum Constants {
         /// Read from each end of a transcript to find a finished answer; a longer file whose ends hold none is
         /// left undecided rather than read whole.
         public static let answerProbeBytes = 256 << 10
+        /// Read from a transcript's end to find the model of its last answer.
+        public static let modelProbeBytes = 256 << 10
         /// Characters of `claude` output kept with a failure, for the Details a bug report can quote.
         public static let failureDetailCharacters = 300
         public static let listenBacklog: Int32 = 16
@@ -165,6 +167,8 @@ public enum Constants {
         /// How long `claude --bg "<message>"` may take to print the new session's id. Seen with Claude Code
         /// 2.1.330: about a second.
         public static let newSessionStart: TimeInterval = 30
+        /// A run Sidemoon interrupts (Control-C) has this long to end before it is terminated.
+        public static let interruptGrace: TimeInterval = 3
         /// After that: how long the new session has to show up in `claude agents` (seen: at once).
         public static let newSessionVerify: TimeInterval = 30
     }
@@ -221,6 +225,8 @@ public enum Constants {
         public static let endOfOptions = "--"
         /// Names a new session.
         public static let nameFlag = "-n"
+        /// Picks the model of a run (an alias such as `opus`, which Claude Code resolves to its current model).
+        public static let modelFlag = "--model"
         /// `claude attach <short id>` opens a background session in a terminal.
         public static let attachCommand = "attach"
         public static let shortIdLength = 8
@@ -261,6 +267,19 @@ public enum Constants {
         public static let allowedTools = ["Read"]
         /// Claude Code's words when the conversation a chat continues is gone; the chat then starts over.
         public static let conversationGonePhrases = ["no conversation found"]
+        /// Claude Code's words when it cannot use the model asked for. Seen with 2.1.332 for an unknown name: exit 1,
+        /// a result with is_error and "There's an issue with the selected model (<name>). It may not exist or you
+        /// may not have access to it.", and `[claude-code:unrecognized_model]` on stderr.
+        public static let modelUnavailablePhrases = ["issue with the selected model", "unrecognized_model", "model_not_found"]
+    }
+
+    /// Messages that are Claude Code commands (`SlashCommand`).
+    public enum SlashCommands {
+        public static let prefix: Character = "/"
+        /// Besides letters and digits, what a command's name may hold (`/plugin:command`, `/add-dir`).
+        public static let nameSymbols: Set<Character> = ["-", "_", ":"]
+        /// The command that picks a model.
+        public static let model = "model"
     }
 
     // MARK: Hooks

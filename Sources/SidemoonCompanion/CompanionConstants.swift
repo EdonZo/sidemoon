@@ -53,8 +53,8 @@ public enum CompanionConstants {
         public static let legacyBundleIdentifier = "dev.tagalong.companion"
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
-        public static let version = "1.0.7"
-        public static let build = "12"
+        public static let version = "1.0.8"
+        public static let build = "13"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
@@ -197,6 +197,18 @@ public enum CompanionConstants {
     }
 
     /// Virtual key codes (kVK_* in Carbon's Events.h) of the keys that move between the thread and the session list.
+    /// Control-C in the bubble stops the selected session, as in a terminal. Command-C stays Copy.
+    public enum InterruptKey {
+        /// kVK_ANSI_C.
+        public static let keyCode: UInt16 = 0x08
+        public static let modifiers: HotKeySpec.Modifiers = [.control]
+
+        /// Whether a key press is Control-C: the C key with Control and no other modifier.
+        public static func matches(keyCode: UInt16, modifiers pressed: HotKeySpec.Modifiers) -> Bool {
+            keyCode == self.keyCode && pressed == modifiers
+        }
+    }
+
     public enum NavigationKeys {
         public static let byKeyCode: [UInt16: NavigationKey] = [
             0x7B: .left, 0x7C: .right, 0x7D: .down, 0x7E: .up, 0x24: .enter, 0x4C: .enter, 0x35: .escape,
@@ -317,6 +329,21 @@ public enum CompanionConstants {
         public static let nameCharacters = 32
         /// Added where the name was cut.
         public static let nameEllipsis = "…"
+        /// The models a chat can run with besides Claude Code's default, as the aliases `claude --model` takes.
+        /// Claude Code resolves each to its current model, so no dated model id is needed here.
+        public static let modelAliases = ["opus", "sonnet", "haiku"]
+        /// Between the folder and the model under a session's name.
+        public static let detailSeparator = "  ·  "
+        /// A model id that does not read as `claude-<family>-<major>-<minor>` is shown as it is, cut to this length.
+        public static let rawModelCharacters = 20
+        /// Where a mark after a model id starts (`claude-opus-5-5[1m]`).
+        public static let idMarkStart: Character = "["
+        /// Model ids start with this.
+        public static let modelIdPrefix = "claude"
+        /// A minor version has at most this many digits; a longer number after the major one is a date.
+        public static let minorVersionDigits = 2
+        /// The word for Claude Code's default, as `/model default` and the saved setting spell it.
+        public static let defaultModelWord = "default"
     }
 
     /// Starting a new background session from the companion.
@@ -406,6 +433,8 @@ public enum CompanionConstants {
         public static let hiddenSessions = "hiddenSessions"
         /// The folder the last new session was started in.
         public static let newSessionFolder = "newSessionFolder"
+        /// The model chats run with (`ChatModel`): an alias, or the default word.
+        public static let chatModel = "chatModel"
         /// Every key above that holds a saved setting; these are carried over from the legacy domain once.
         public static let savedKeys = [
             theme, zoom, largeWindow, bubbleWidth, bubbleHeight, shortReplies, showEndedSessions, targetSession, mascotOriginX, mascotOriginY, setupSeen,

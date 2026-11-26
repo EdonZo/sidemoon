@@ -13,6 +13,8 @@ public struct ChatRecord: Codable, Equatable, Sendable {
     public var createdAt: Date
     public var lastReply: String?
     public var lastReplyAt: Date?
+    /// The model id its last answer came from.
+    public var lastModel: String?
 
     public init(id: String, name: String?, claudeSessionId: String? = nil, createdAt: Date = Date()) {
         self.id = id
@@ -33,6 +35,7 @@ public struct ChatRecord: Codable, Equatable, Sendable {
         s.lastReplyAt = lastReplyAt
         s.lastEventAt = lastReplyAt
         s.transcriptActivityAt = createdAt
+        s.model = lastModel
         return s
     }
 }
@@ -77,10 +80,11 @@ public final class ChatBook: @unchecked Sendable {
     }
 
     /// Records a run's outcome: the conversation it continues, and its answer.
-    public func update(_ id: String, claudeSessionId: String?, reply: String?, at: Date) {
+    public func update(_ id: String, claudeSessionId: String?, reply: String?, at: Date, model: String? = nil) {
         lock.withLock {
             guard let i = records.firstIndex(where: { $0.id == id }) else { return }
             records[i].claudeSessionId = claudeSessionId
+            if let model { records[i].lastModel = model }
             if let reply {
                 records[i].lastReply = reply
                 records[i].lastReplyAt = at

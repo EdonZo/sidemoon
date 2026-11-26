@@ -207,8 +207,64 @@ public final class Engine: @unchecked Sendable {
 
     // MARK: Sending
 
+    // MARK: Stopping
+
+    /// What a stop did.
+    public enum StopOutcome: Equatable, Sendable {
+        /// A turn was going and was stopped.
+        case stopped
+        /// Nothing was going on that Sidemoon can stop.
+        case notRunning
+        /// It runs in the user's terminal, which Sidemoon does not send signals to.
+        case inTerminal
+    }
+
+    /// Sessions the user asked to stop; a send to them that ends in a failure meanwhile ends as `.stopped`.
+    private var stopRequests: Set<String> = []
+    /// Sidemoon's own `claude -p` runs (chats and ended sessions), by session, so a stop can end them.
+    private var runs: [String: RunHandle] = [:]
+    /// Sessions Sidemoon is delivering to through the background route right now.
+    private var deliveringInBackground: Set<String> = []
+
+    /// Stops what is going on for one session, and nothing else: Sidemoon's own run for a chat or an ended session
+    /// (interrupted like Control-C, so its conversation stays and the next message continues it); for a background
+    /// session that is working or being delivered to, `claude stop <short id>`, which keeps its conversation. A
+    /// session in the user's terminal is never signalled.
+    public func stop(_ idOrPrefix: String) -> StopOutcome {
+        guard let s = registry.resolve(idOrPrefix) else { return .notRunning }
+        if let run = lock.withLock({ runs[s.id] }) {
+            lock.withLock { _ = stopRequests.insert(s.id) }
+            run.cancel()
+            return .stopped
+        }
+        if s.kind == .chat { return .notRunning }
+        if s.kind == .background {
+            guard let a = agent(s.id), a.isRunning else { return .notRunning }
+            let delivering = lock.withLock { deliveringInBackground.contains(s.id) }
+            let current = registry.session(s.id) ?? s
+            guard delivering || registry.isMidTurn(a) || current.state == .working else { return .notRunning }
+            lock.withLock { _ = stopRequests.insert(s.id) }
+            _ = runner.run([Constants.ClaudeCLI.stopCommand, a.agentId], cwd: nil, stdin: nil, timeout: Constants.Timeouts.cliCommand)
+            registry.releaseWaits(sessionId: s.id)
+            return .stopped
+        }
+        return s.state == .working || s.state == .needsInput ? .inTerminal : .notRunning
+    }
+
     /// Delivers an image and/or text to one session. Never falls back to a different session.
     public func send(_ req: SendRequest) -> SendResult {
+        let result = deliver(req)
+        guard let id = result.sessionId else { return result }
+        // Stopped by the user while it went: a failure meanwhile is that stop, not an error of its own.
+        let stopped = lock.withLock { stopRequests.remove(id) != nil }
+        guard stopped, !result.ok, result.failure != .stopped else { return result }
+        var r = SendResult.failure(.stopped, sessionId: id, route: result.route)
+        r.reply = result.reply
+        r.detail = result.error
+        return r
+    }
+
+    private func deliver(_ req: SendRequest) -> SendResult {
         guard var session = registry.resolve(req.session) ?? { refreshAgents(); return registry.resolve(req.session) }() else {
             return .failure(.unknownSession(req.session))
         }
@@ -225,11 +281,14 @@ public final class Engine: @unchecked Sendable {
             return .failure(e, sessionId: session.id)
         } catch { return .failure(.image("\(error)"), sessionId: session.id) }
         // A style note rides along with the message; it is never a message on its own.
-        let words = [text, req.styleNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        // A command goes exactly as typed: no style note, and nothing it could carry along.
+        let command = SlashCommand.isCommand(text)
+        if command, !req.allImagePaths.isEmpty || !files.isEmpty { return .failure(.commandWithAttachments, sessionId: session.id) }
+        let words = [text, command ? nil : req.styleNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
         let outgoing: String? = words.isEmpty ? nil : words
 
         if session.kind == .chat {
-            return sendToChat(session, images: images, files: files, text: outgoing, wait: req.wait)
+            return sendToChat(session, images: images, files: files, text: outgoing, model: req.model, wait: req.wait)
         }
         if channelLink(for: session.id) != nil {
             return sendViaChannel(session, images: images, files: files, text: outgoing, wait: req.wait)
@@ -355,6 +414,8 @@ public final class Engine: @unchecked Sendable {
     }
 
     private func sendViaBackground(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
+        lock.withLock { _ = deliveringInBackground.insert(s.id) }
+        defer { lock.withLock { _ = deliveringInBackground.remove(s.id) } }
         func fail(_ m: String) -> SendResult { .failure(.background(m), sessionId: s.id, route: .background) }
         guard let a = agent(s.id), a.kind == SessionKind.background.rawValue else {
             return fail("`claude agents` no longer lists this session as a background session")
@@ -395,7 +456,10 @@ public final class Engine: @unchecked Sendable {
         }
         var prompt = ImageFile.messageText(text: text, imagePaths: imagePaths, filePaths: filePaths)
         // The stop below ends whatever the finished turn left running, so the session is told.
-        if a.isRunning, a.status == Constants.ClaudeCLI.busyStatus { prompt += "\n\n" + Constants.ClaudeCLI.backgroundWorkNote }
+        // Not after a command, which would take the note as its arguments.
+        if a.isRunning, a.status == Constants.ClaudeCLI.busyStatus, !SlashCommand.isCommand(prompt) {
+            prompt += "\n\n" + Constants.ClaudeCLI.backgroundWorkNote
+        }
 
         // 1. Stop it: resuming a running session forks a copy instead of continuing it.
         let stoppedFirst = a.isRunning
@@ -565,8 +629,16 @@ public final class Engine: @unchecked Sendable {
         let args = [Constants.ClaudeCLI.printFlag, Constants.ClaudeCLI.resumeFlag, s.id] + Constants.ClaudeCLI.headlessFlags
 
         let run: @Sendable () -> SendResult = { [self] in
-            let r = runner.run(args, cwd: cwd, stdin: input, timeout: Constants.Timeouts.headlessRun)
+            let handle = RunHandle()
+            lock.withLock { runs[s.id] = handle }
+            defer { lock.withLock { if runs[s.id] === handle { runs[s.id] = nil } } }
+            let r = runner.run(args, cwd: cwd, stdin: input, timeout: Constants.Timeouts.headlessRun, handle: handle)
             let parsed = Engine.parseStream(r.stdout)
+            if handle.cancelled {
+                var stopped = SendResult.failure(.stopped, sessionId: s.id, route: .headless)
+                stopped.reply = parsed.text
+                return stopped
+            }
             if let sid = parsed.sessionId, sid != s.id {
                 return .failure(.forked(original: s.id, copy: sid), sessionId: s.id, route: .headless)
             }
@@ -593,7 +665,8 @@ public final class Engine: @unchecked Sendable {
     /// with the images inline and the files copied into the chat folder where the run may read them. Only reading
     /// is allowed (`Constants.Chat.allowedTools`). When Claude Code no longer has the conversation, a fresh one starts
     /// and the result says so. Nothing is left running afterwards.
-    private func sendToChat(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
+    private func sendToChat(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, model: String?,
+                            wait: Bool) -> SendResult {
         @Sendable func fail(_ m: String) -> SendResult { .failure(.headless(m), sessionId: s.id, route: .headless) }
         guard let record = chats.chat(s.id) else { return .failure(.unknownSession(s.id)) }
         guard runner.isInstalled else { return fail("the claude command was not found") }
@@ -617,11 +690,23 @@ public final class Engine: @unchecked Sendable {
 
         let run: @Sendable () -> SendResult = { [self] in
             defer { lock.withLock { _ = runningChats.remove(s.id) } }
-            var (r, parsed) = runChat(resume: record.claudeSessionId, input: input)
+            var (r, parsed, handle) = runChat(s.id, resume: record.claudeSessionId, model: model, input: input)
             var startedOver = false
-            if record.claudeSessionId != nil, Engine.conversationGone(r, parsed) {
-                (r, parsed) = runChat(resume: nil, input: input)
+            if record.claudeSessionId != nil, !handle.cancelled, Engine.conversationGone(r, parsed) {
+                (r, parsed, handle) = runChat(s.id, resume: nil, model: model, input: input)
                 startedOver = true
+            }
+            // Stopped: the conversation stays (the next message continues it), with what was said before the stop.
+            if handle.cancelled {
+                let now = Date()
+                let conversation = parsed.sessionId ?? (startedOver ? nil : record.claudeSessionId)
+                chats.update(s.id, claudeSessionId: conversation, reply: nil, at: now, model: parsed.model)
+                var after = registry.session(s.id) ?? record.session
+                after.state = .idle
+                registry.setChat(after)
+                var stopped = SendResult.failure(.stopped, sessionId: s.id, route: .headless)
+                stopped.reply = parsed.text
+                return stopped
             }
             let output = (r.stdoutText + r.stderrText).trimmingCharacters(in: .whitespacesAndNewlines)
             let now = Date()
@@ -631,6 +716,11 @@ public final class Engine: @unchecked Sendable {
                 registry.setChat(after)
                 let said = "claude exited \(r.status)\(r.timedOut ? " (timed out)" : ""): "
                     + String((parsed.result ?? output).prefix(Constants.Limits.failureDetailCharacters))
+                if let model, Engine.modelUnavailable(r, parsed) {
+                    var failed = SendResult.failure(.modelUnavailable(model), sessionId: s.id, route: .headless)
+                    failed.detail = said
+                    return failed
+                }
                 if let refusal = ResumeCheck.classify(parsed.result ?? output), refusal.blocker == .loginNeeded {
                     var failed = SendResult.failure(.cannotResume(.loginNeeded, messageSaved: false), sessionId: s.id, route: .headless)
                     failed.detail = said
@@ -638,7 +728,9 @@ public final class Engine: @unchecked Sendable {
                 }
                 return fail(said)
             }
-            chats.update(s.id, claudeSessionId: parsed.sessionId ?? (startedOver ? nil : record.claudeSessionId), reply: reply, at: now)
+            chats.update(s.id, claudeSessionId: parsed.sessionId ?? (startedOver ? nil : record.claudeSessionId), reply: reply, at: now,
+                         model: parsed.model)
+            if let model = parsed.model { after.model = model }
             after.lastReply = reply
             after.lastReplyAt = now
             after.lastEventAt = now
@@ -655,12 +747,26 @@ public final class Engine: @unchecked Sendable {
         return run()
     }
 
-    private func runChat(resume: String?, input: Data) -> (ProcessResult, StreamOutcome) {
+    private func runChat(_ chatId: String, resume: String?, model: String?, input: Data) -> (ProcessResult, StreamOutcome, RunHandle) {
         let c = Constants.ClaudeCLI.self
-        let args = [c.printFlag] + (resume.map { [c.resumeFlag, $0] } ?? []) + c.headlessFlags
-            + [Constants.Chat.allowedToolsFlag] + Constants.Chat.allowedTools + chatArguments
-        let r = runner.run(args, cwd: chatFolder, stdin: input, timeout: Constants.Timeouts.headlessRun)
-        return (r, Engine.parseStream(r.stdout))
+        var args: [String] = [c.printFlag]
+        if let resume { args += [c.resumeFlag, resume] }
+        args += c.headlessFlags
+        args += [Constants.Chat.allowedToolsFlag] + Constants.Chat.allowedTools
+        args += chatArguments
+        if let model { args += [c.modelFlag, model] }
+        let handle = RunHandle()
+        lock.withLock { runs[chatId] = handle }
+        defer { lock.withLock { if runs[chatId] === handle { runs[chatId] = nil } } }
+        let r = runner.run(args, cwd: chatFolder, stdin: input, timeout: Constants.Timeouts.headlessRun, handle: handle)
+        return (r, Engine.parseStream(r.stdout), handle)
+    }
+
+    /// Claude Code could not use the model the run asked for.
+    static func modelUnavailable(_ r: ProcessResult, _ parsed: StreamOutcome) -> Bool {
+        guard r.status != 0 || parsed.isError else { return false }
+        let said = (r.stdoutText + r.stderrText + (parsed.result ?? "")).lowercased()
+        return Constants.Chat.modelUnavailablePhrases.contains { said.contains($0) }
     }
 
     /// Claude Code no longer has the conversation a chat continues.
@@ -688,6 +794,8 @@ public final class Engine: @unchecked Sendable {
 
     struct StreamOutcome {
         var sessionId: String?
+        /// The model of the last top-level answer (not one Claude Code wrote itself).
+        var model: String?
         var text: String?
         var result: String?
         var isError = false
@@ -701,10 +809,15 @@ public final class Engine: @unchecked Sendable {
             guard let m = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
             switch m["type"] as? String {
             case "assistant" where m["parent_tool_use_id"] == nil || m["parent_tool_use_id"] is NSNull:
-                let blocks = (m["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+                let message = m["message"] as? [String: Any]
+                if let model = message?["model"] as? String, model != Constants.Transcript.syntheticModel { o.model = model }
+                let blocks = message?["content"] as? [[String: Any]] ?? []
                 parts += blocks.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }
+            case "system" where m["subtype"] as? String == "init":
+                // Known from the start, so a run stopped before its result still names its conversation.
+                if o.sessionId == nil { o.sessionId = (m["session_id"] as? String)?.lowercased() }
             case "result":
-                o.sessionId = (m["session_id"] as? String)?.lowercased()
+                o.sessionId = (m["session_id"] as? String)?.lowercased() ?? o.sessionId
                 o.result = m["result"] as? String
                 o.isError = m["is_error"] as? Bool ?? false
             default: break

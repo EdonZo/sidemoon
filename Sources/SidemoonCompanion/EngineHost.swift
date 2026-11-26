@@ -22,6 +22,8 @@ public protocol CompanionEngine: AnyObject, Sendable {
     func homeFolderRefused() -> Bool
     /// A new, empty chat with this name, listed at once. Returns its id; its first message is sent like any other.
     func newChat(name: String) -> String
+    /// Stops what is going on for this one session (`Engine.stop`). Blocking (it may run `claude stop`).
+    func stop(_ sessionId: String) -> Engine.StopOutcome
 }
 
 /// Runs the stage 1 Engine inside the app process, so no `sidemoon serve` is needed.
@@ -74,4 +76,6 @@ public final class InProcessEngine: CompanionEngine, @unchecked Sendable {
     public func homeFolderRefused() -> Bool { engine.registry.homeFolderMemory.refused }
 
     public func newChat(name: String) -> String { engine.newChat(name: name) }
+
+    public func stop(_ sessionId: String) -> Engine.StopOutcome { engine.stop(sessionId) }
 }
