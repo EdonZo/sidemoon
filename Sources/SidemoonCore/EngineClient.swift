@@ -38,6 +38,7 @@ public struct EngineClient: Sendable {
     public func send(_ req: SendRequest) throws -> SendResult {
         var m: [String: Any] = ["op": Constants.Ops.send, "session": req.session, "wait": req.wait]
         if let i = req.imagePath { m["image"] = i }
+        if !req.imagePaths.isEmpty { m["images"] = req.imagePaths }
         if let t = req.text { m["text"] = t }
         let budget = req.wait ? Constants.Timeouts.replyWait + Constants.Timeouts.backgroundStopWait
             + Constants.Timeouts.backgroundResumeVerify + Constants.Timeouts.cliCommand : Constants.Timeouts.headlessRun

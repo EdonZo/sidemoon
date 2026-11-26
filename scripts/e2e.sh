@@ -19,6 +19,8 @@ HOME_SESSION_NAME=$NAME_PREFIX-home
 HOME_PROMPT="Reply with only the word READY."
 SCRATCH_TEMPLATE=$NAME_PREFIX.XXXXXX
 SETTING_SOURCES=project
+# Where the chats run, inside the support folder (Constants.Paths.chatFolderName).
+CHAT_FOLDER=Chat
 # The variables the scenarios read (E2E.Variable and Constants.Paths.supportDirectoryOverrideVariable).
 SUPPORT_VARIABLE=SIDEMOON_SUPPORT_DIR
 RUN_VARIABLE=SIDEMOON_E2E_RUN
@@ -50,7 +52,8 @@ mcp-without-channel|mcpWithoutChannel|no|Helper loaded without the channel flag:
 attachments|imageAndFile|no|A capture with one word and a dropped text file reach the session
 retry|retryAfterFailure|yes|A failed send then Retry succeeds; no Retry for a refusal
 session-list|sessionListTruth|yes|Session list reachability matches what Claude Code says
-create|createSession|no|New session from the companion: started in a fresh folder, answered, then a second message to it'
+create|createSession|no|New session from the companion: started in a fresh folder, answered, then a second message to it
+general|generalChat|no|General chat: a capture and a follow-up as claude -p runs in one conversation, nothing left behind'
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -158,7 +161,8 @@ cleanup() {
             kill "$pid" 2> /dev/null && echo "  ended terminal session process $pid"
         fi
     done
-    for dir in "$RUN"/projects/*; do
+    # General and the other chats run in the support folder's chat folder (Constants.Paths.chatFolderName).
+    for dir in "$RUN"/projects/* "$SUPPORT/$CHAT_FOLDER"; do
         [ -d "$dir" ] || continue
         claude purge -y "$dir" > /dev/null 2>&1
         folder=$HOME/.claude/projects/$(printf '%s' "$dir" | sed 's/[^A-Za-z0-9]/-/g')

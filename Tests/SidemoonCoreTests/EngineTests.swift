@@ -43,6 +43,16 @@ final class FakeRunner: ClaudeRunner, @unchecked Sendable {
     var recorded: [[String]] { lock.withLock { calls } }
 }
 
+/// Runs `work` a moment later on a thread of its own. A global dispatch queue was used before, and under a full
+/// parallel test run its worker could wait behind tests that block their threads polling the engine, so the change
+/// came too late and the send timed out after a minute (seen now and then).
+func onOwnThread(after seconds: TimeInterval, _ work: @escaping @Sendable () -> Void) {
+    Thread.detachNewThread {
+        Thread.sleep(forTimeInterval: seconds)
+        work()
+    }
+}
+
 func agents(status: String, state: String, running: Bool = true, cwd: String = "/tmp/proj") -> String {
     #"[{"id":"0b8e8a52",\#(running ? #""pid":2147483000,"# : "")"sessionId":"\#(sid)","kind":"background","name":"t","cwd":"\#(cwd)","status":"\#(status)","state":"\#(state)"}]"#
 }
@@ -169,7 +179,7 @@ final class LockedCount: @unchecked Sendable {
         #expect(e.registry.session(sid)?.state == .idle)
         #expect(e.registry.session(sid)?.routes == [.background])
         // The resumed process shows up running again.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         #expect(e.send(SendRequest(session: sid, text: "hi")).ok)
         let calls = runner.recorded.filter { $0.first != "agents" }
         // Stopped, then resumed with the message and a note that its background work was stopped.
@@ -184,7 +194,7 @@ final class LockedCount: @unchecked Sendable {
         let e = engine(runner, state: "idle")
         #expect(e.registry.session(sid)?.state == .idle)
         #expect(e.registry.session(sid)?.routes == [.background])
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         #expect(e.send(SendRequest(session: sid, text: "hi")).ok)
         // Nothing was left running, so the message goes as written.
         let calls = runner.recorded.filter { $0.first != "agents" }
@@ -220,7 +230,7 @@ final class LockedCount: @unchecked Sendable {
         e.refreshAgents()
         #expect(e.registry.session(sid)?.state == .idle)
         // The resumed process shows up running again.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         #expect(e.send(SendRequest(session: sid, text: "hi")).ok)
         let calls = runner.recorded.filter { $0.first != "agents" }
         #expect(calls.first == ["stop", "0b8e8a52"])
@@ -275,7 +285,7 @@ final class LockedCount: @unchecked Sendable {
                                 resumeOutput: "backgrounded · 0b8e8a52 · t\n")
         let e = engine(runner, state: "idle")
         // The resumed process shows up running again.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
+        onOwnThread(after: 0.2) { runner.agentsJSON = agents(status: "busy", state: "working") }
         let r = e.send(SendRequest(session: sid, text: "hi"))
         #expect(r.ok)
         #expect(r.route == .background)

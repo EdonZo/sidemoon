@@ -20,6 +20,8 @@ public protocol CompanionEngine: AnyObject, Sendable {
     func startSession(_ request: NewSessionRequest) -> NewSessionResult
     /// Claude Code on this Mac has refused to reopen a background session in the home folder (`HomeFolderMemory`).
     func homeFolderRefused() -> Bool
+    /// A new, empty chat with this name, listed at once. Returns its id; its first message is sent like any other.
+    func newChat(name: String) -> String
 }
 
 /// Runs the stage 1 Engine inside the app process, so no `sidemoon serve` is needed.
@@ -70,4 +72,6 @@ public final class InProcessEngine: CompanionEngine, @unchecked Sendable {
     public func startSession(_ request: NewSessionRequest) -> NewSessionResult { engine.startSession(request) }
 
     public func homeFolderRefused() -> Bool { engine.registry.homeFolderMemory.refused }
+
+    public func newChat(name: String) -> String { engine.newChat(name: name) }
 }

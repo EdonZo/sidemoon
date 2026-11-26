@@ -44,7 +44,7 @@ struct NewSessionView: View {
         let starting = form.isStarting
         VStack(alignment: .leading, spacing: Design.Space.xl) {
             HStack(spacing: Design.Space.m) {
-                ReadoutText(copy.heading, color: .signal)
+                ReadoutText(form.inFolder ? copy.heading : copy.chatHeading, color: .signal)
                 Spacer(minLength: 0)
                 if !starting {
                     Button { model.closeNewSession() } label: {
@@ -58,7 +58,7 @@ struct NewSessionView: View {
                     .help(Design.Copy.cancel)
                 }
             }
-            folders(form)
+            if form.inFolder { folders(form) }
             VStack(alignment: .leading, spacing: Design.Space.s) {
                 ReadoutText(copy.message)
                 TextField(copy.messagePlaceholder, text: $model.newSessionMessage)
@@ -74,6 +74,12 @@ struct NewSessionView: View {
                     .background(RoundedRectangle(cornerRadius: Design.Radius.control).fill(messageFocused ? Color.sent : Color.paper2))
                     .overlay(RoundedRectangle(cornerRadius: Design.Radius.control)
                         .strokeBorder(messageFocused && model.hasKeyboard ? Color.signal : Color.clear, lineWidth: Design.Bubble.focusRing))
+            }
+            if !form.inFolder {
+                Text(copy.chatNote)
+                    .font(.proseSmall)
+                    .foregroundStyle(Color.mute)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let problem = form.problem { problemCard(problem, detail: form.problemDetail) }
             if starting {
@@ -108,6 +114,23 @@ struct NewSessionView: View {
             FormButton(title: Design.Copy.cancel, primary: false) { model.closeNewSession() }
         }
         ReadoutText(copy.returnStarts)
+        if !model.newSession.isStarting { folderToggle }
+    }
+
+    /// The secondary way: a Claude Code session in one of the user's folders. And back to a plain chat.
+    private var folderToggle: some View {
+        let inFolder = model.newSession.inFolder
+        return Button { model.setNewSessionInFolder(!inFolder) } label: {
+            HStack(spacing: Design.Space.xs) {
+                Image(systemName: inFolder ? "bubble.left" : "folder")
+                    .font(.system(size: Design.Bubble.rowActionIcon, weight: .medium))
+                ReadoutText(inFolder ? copy.noFolder : copy.workInFolder, color: .ink)
+            }
+            .foregroundStyle(Color.ink)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
+        .help(inFolder ? copy.chatNote : copy.workInFolderHelp)
     }
 
     private func start() {

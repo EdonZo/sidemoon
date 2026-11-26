@@ -251,8 +251,10 @@ struct BubbleView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: Design.Space.s) {
                         // The cross takes it back before anything is sent.
-                        if model.heldCapture != nil {
-                            AttachmentChip(name: CompanionConstants.Messages.captureAttachmentName, onRemove: actions.cancelNote)
+                        // Each capture in the order taken; its cross takes that one back.
+                        let captures = model.heldCaptures
+                        ForEach(Array(zip(captures.urls, captures.names)), id: \.0) { url, name in
+                            AttachmentChip(name: name) { model.removeHeldCapture(url) }
                         }
                         ForEach(model.heldFiles, id: \.self) { file in
                             AttachmentChip(name: file.lastPathComponent) { model.removeHeldFile(file) }
@@ -439,6 +441,18 @@ struct BubbleView: View {
                     }
                 }
                 .help(copy.openInTerminalHelp)
+            case .attachInTerminal:
+                cardButton(commandCopied ? copy.openedInTerminal : copy.openInTerminal, primary: index == 0) {
+                    if case let .open(script) = model.attachInTerminal() {
+                        actions.openInTerminal(script)
+                        commandCopied = true
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .seconds(CompanionConstants.Timing.copiedConfirmation))
+                            commandCopied = false
+                        }
+                    }
+                }
+                .help(copy.attachInTerminalHelp)
             case .installTerminalCommand:
                 cardButton(copy.installCommand, primary: index == 0) {
                     actions.openSetup()
@@ -547,7 +561,7 @@ struct BubbleView: View {
                 }
                 ForEach(thread.suffix(shownEntries)) { entry in
                     ThreadEntryView(entry: entry, sessionName: model.targetTitle, layoutWidth: Design.Bubble.width,
-                                    onRetry: entry.canRetry ? { Task { await model.retry(entry.id) } } : nil).equatable()
+                                    onRetry: model.canRetry(entry) ? { Task { await model.retry(entry.id) } } : nil).equatable()
                 }
                 if working { WorkingRow(sessionName: model.targetTitle) }
             }
@@ -592,6 +606,13 @@ struct BubbleView: View {
                 Text(Design.Copy.emptyOrType)
                     .font(.proseSmall)
                     .foregroundStyle(Color.mute)
+                // A chat only looks and answers: said plainly before anything is sent.
+                if model.target?.kind == .chat {
+                    Text(Design.Copy.Chat.readOnlyNote)
+                        .font(.proseSmall)
+                        .foregroundStyle(Color.mute)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -806,7 +827,7 @@ struct ThreadEntryView: View, Equatable {
                 case .queued: ReadoutText(Design.Copy.queued, color: .signal)
                 case .failed, .refused:
                     ReadoutText(Design.Copy.notDelivered, color: .problem)
-                    if entry.canRetry, let onRetry {
+                    if let onRetry {
                         Button(action: onRetry) {
                             ReadoutText(Design.Copy.retry, color: .paper)
                                 .padding(.horizontal, Design.Space.m)
@@ -1234,7 +1255,8 @@ struct SessionRowView: View {
                     Spacer(minLength: Design.Space.m)
                     // The actions take the state's place, so a row never gets wider than the window. A hidden row
                     // is dimmed and shows Unhide instead.
-                    if !active && !row.hidden { status }
+                    // General has no actions (it cannot be hidden): its state stays.
+                    if !(active && row.canHide) && !row.hidden { status }
                 }
                 .contentShape(Rectangle())
             }
@@ -1256,7 +1278,7 @@ struct SessionRowView: View {
                     .help(Design.Copy.Hidden.openInTerminalHelp)
                     .accessibilityLabel(Design.Copy.Unreachable.openInTerminal)
                 }
-                actionPill(Design.Copy.Hidden.hide, help: Design.Copy.Hidden.hideHelp, action: hide)
+                if row.canHide { actionPill(Design.Copy.Hidden.hide, help: Design.Copy.Hidden.hideHelp, action: hide) }
             }
         }
         .padding(.horizontal, Design.Space.m)

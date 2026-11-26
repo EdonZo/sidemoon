@@ -95,6 +95,18 @@ public enum ActiveWindow {
         }
     }
 
+    /// The window to capture: the front-most ordinary window of the front-most app, and when that app has none
+    /// to offer (it is Sidemoon itself after one of its own dialogs, or an app with no window open), the
+    /// front-most ordinary window on screen that is not Sidemoon's. That is the window the user is looking at.
+    public static func target(_ windows: [WindowInfo], frontmostPID: pid_t?, excludedPID: pid_t,
+                              minimumSize: CGSize = CompanionConstants.Capture.minimumWindowSize) -> WindowInfo? {
+        if let pid = frontmostPID, let own = pick(windows, pid: pid, excludedPID: excludedPID, minimumSize: minimumSize) { return own }
+        return windows.first { w in
+            w.ownerPID != excludedPID && w.layer == CompanionConstants.Capture.normalWindowLayer
+                && w.bounds.width >= minimumSize.width && w.bounds.height >= minimumSize.height
+        }
+    }
+
     /// On-screen windows, front to back, desktop elements excluded.
     public static func onScreenWindows() -> [WindowInfo] {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -112,9 +124,9 @@ public struct ActiveWindowCaptureProvider: CaptureProvider {
     public init(frontmostPID: @escaping @MainActor @Sendable () -> pid_t?) { self.frontmostPID = frontmostPID }
 
     public func capture(into destination: URL) async throws -> CaptureOutcome {
-        guard let pid = await frontmostPID(),
-              let window = ActiveWindow.pick(ActiveWindow.onScreenWindows(), pid: pid,
-                                             excludedPID: ProcessInfo.processInfo.processIdentifier)
+        let frontmost = await frontmostPID()
+        guard let window = ActiveWindow.target(ActiveWindow.onScreenWindows(), frontmostPID: frontmost,
+                                               excludedPID: ProcessInfo.processInfo.processIdentifier)
         else { throw CaptureError.noActiveWindow }
         let status = try await runScreencapture(CompanionConstants.Capture.windowArguments + [String(window.id), destination.path])
         guard fileSize(destination) > 0 else {
@@ -137,33 +149,3 @@ public struct InjectedImageCapture: CaptureProvider {
     }
 }
 
-/// Temporary capture files, kept in an owner-only folder under the app's Application Support directory.
-public struct CaptureStore: Sendable {
-    public let directory: URL
-
-    public init(directory: URL = CompanionConstants.Capture.directory) { self.directory = directory }
-
-    public func prepare() throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: Constants.Permissions.directory])
-        chmod(directory.path, Constants.Permissions.directory)
-    }
-
-    public func newFileURL() -> URL {
-        directory.appendingPathComponent(
-            "\(CompanionConstants.Capture.filePrefix)\(UUID().uuidString.lowercased()).\(CompanionConstants.Capture.fileExtension)")
-    }
-
-    public func remove(_ url: URL) { try? FileManager.default.removeItem(at: url) }
-
-    /// Deletes captures left behind by a previous run that was killed mid-send.
-    public func purge() {
-        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        files.filter { $0.lastPathComponent.hasPrefix(CompanionConstants.Capture.filePrefix) }.forEach(remove)
-    }
-
-    public func files() -> [URL] {
-        ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.lastPathComponent.hasPrefix(CompanionConstants.Capture.filePrefix) }
-    }
-}

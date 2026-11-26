@@ -53,6 +53,7 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
             make("03", "quick question", "/Users/me", .homeFolder, age: 60),
             make("04", "billing-service", "/Users/me/Projects/billing-service", .loginNeeded, age: 90),
             make("05", "design-notes", "/Users/me/Projects/design-notes", .noTranscript, age: 120),
+            make("06", "general-scrolling", "/Users/me/Projects/general-scrolling", .waitingInTerminal, age: 150),
         ]
     }()
 
@@ -79,17 +80,33 @@ final class PreviewEngine: CompanionEngine, @unchecked Sendable {
 
     private let list: [Session]
     private let delay: TimeInterval
-    private let failure: DeliveryError?
+    private let failureLock = NSLock()
+    private var failureNow: DeliveryError?
+    /// Every send fails this way while set; a preview can clear it to let the next one through.
+    var failure: DeliveryError? {
+        get { failureLock.withLock { failureNow } }
+        set { failureLock.withLock { failureNow = newValue } }
+    }
     /// `failure`: every send fails this way at once, with Claude Code's words as the detail.
     init(sessions: [Session], delay: TimeInterval = PreviewEngine.answerDelay, failure: DeliveryError? = nil) {
         list = sessions
         self.delay = delay
-        self.failure = failure
+        self.failureNow = failure
     }
 
     func start() throws -> EngineStartOutcome { .running }
     func stop() {}
-    func sessions() -> [Session] { list }
+    func sessions() -> [Session] { list + chatsLock.withLock { started } }
+    private let chatsLock = NSLock()
+    private var started: [Session] = []
+    func newChat(name: String) -> String {
+        var s = Session(id: UUID().uuidString.lowercased())
+        s.kind = .chat
+        s.name = name
+        s.lastEventAt = Date()
+        chatsLock.withLock { started.append(s) }
+        return s.id
+    }
     func subscribe(_ handler: @escaping @Sendable (Session) -> Void) {}
     func send(_ request: SendRequest) -> SendResult {
         if let failure {
@@ -167,6 +184,14 @@ struct PreviewRelauncher: AppRelauncher {
 @MainActor
 enum Preview {
     static let settleTime: TimeInterval = 0.4
+    /// Set to render only the badge sheet (quick checks of the badge).
+    static let badgesOnlyVariable = "SIDEMOON_PREVIEW_BADGES_ONLY"
+    /// Set to render only the kept-captures previews (quick checks of failed sends).
+    static let keptOnlyVariable = "SIDEMOON_PREVIEW_KEPT_ONLY"
+    /// How long the preview's held captures wait before counting on: longer than the whole render.
+    static let heldStill: TimeInterval = 3600
+    /// The longest a preview waits for a send to finish.
+    static let sendSettleLimit: TimeInterval = 5
     static let largeMascot: CGFloat = 128
     static let sample = """
     # Next step
@@ -197,9 +222,46 @@ enum Preview {
     Nothing was sent to the site yet.
     """
 
+    /// The waiting badge on the mascot panel: counts 1, 2, the cap and one above it, at the smallest, standard and
+    /// largest size, at rest and fully swollen, each panel outlined so clipping shows, on a light and a dark desktop.
+    static func renderBadges(to dir: URL) {
+        let m = Design.Mascot.self
+        let counts = [1, 2, m.badgeMaxCount, m.badgeMaxCount + 1]
+        let zooms = [Design.Zoom.minimum, Design.Zoom.standard, Design.Zoom.maximum]
+        for dark in [false, true] {
+            for zoom in zooms {
+                Design.zoom = zoom
+                let panel = CompanionConstants.Layout.mascotSize
+                let sheet = VStack(alignment: .leading, spacing: Design.Space.l) {
+                    ForEach([CGFloat(1), m.badgePulseScale], id: \.self) { scale in
+                        HStack(spacing: Design.Space.l) {
+                            ForEach(counts, id: \.self) { count in
+                                MascotPanelContent(figure: MascotFigure(state: .idle, countdown: nil), badge: count, stillBadgeScale: scale)
+                                    .overlay(Rectangle().strokeBorder(Color.red.opacity(previewOutlineOpacity), lineWidth: 1))
+                                    .frame(width: panel, height: panel)
+                                    .clipped()
+                            }
+                        }
+                    }
+                }
+                .padding(Design.Space.xl)
+                .background(dark ? Color(white: previewDarkDesktop) : Color(white: previewLightDesktop))
+                snapshot(sheet, dark: dark, to: dir.appendingPathComponent("badge-\(zoom)-\(dark ? "dark" : "light").png"))
+            }
+        }
+        Design.zoom = Design.Zoom.standard
+    }
+    /// The panel outline in the badge sheet, and the two desktops behind it.
+    static let previewOutlineOpacity = 0.5
+    static let previewLightDesktop = 0.93
+    static let previewDarkDesktop = 0.12
+
     static func render(to directory: String) {
         let dir = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if ProcessInfo.processInfo.environment[keptOnlyVariable] != nil { renderKeptCaptures(to: dir); return }
+        renderBadges(to: dir)
+        if ProcessInfo.processInfo.environment[badgesOnlyVariable] != nil { return }
         var halfway = NoteCountdown()
         for _ in 0..<(halfway.totalTicks / 3) { halfway.tick() }
         let states: [MascotState] = [.idle, .capturing, .holding, .sending, .waiting, .reply, .error]
@@ -307,6 +369,8 @@ enum Preview {
         }
         renderReachability(to: dir)
         renderNewSessionAndHidden(to: dir)
+        renderChats(to: dir)
+        renderKeptCaptures(to: dir)
         // Terminal is always dark, whatever the system.
         let theme = Design.theme
         Design.theme = .terminal
@@ -355,7 +419,7 @@ enum Preview {
             let cases: [(String, ResumeBlocker, Bool, Bool)] = [
                 ("home", .homeFolder, true, true), ("untrusted", .untrustedFolder, false, true),
                 ("never-answered", .noTranscript, true, true), ("login", .loginNeeded, false, true),
-                ("install", .homeFolder, false, false),
+                ("install", .homeFolder, false, false), ("waiting-in-terminal", .waitingInTerminal, false, true),
             ]
             for (name, blocker, saved, installed) in cases {
                 let m = model(PreviewEngine(sessions: [PreviewEngine.session],
@@ -424,6 +488,36 @@ enum Preview {
                 .frame(width: Design.Bubble.width)
                 .background(Color.paper), dark: dark, to: dir.appendingPathComponent("settings-recording-\(look).png"))
 
+            // Three active-window captures waiting in one message, the countdown held still; then a pasted image
+            // waiting with the question typed so far.
+            let image = scratch.directory.appendingPathComponent("preview-source.png")
+            try? scratch.prepare()
+            try? Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+            let still: Sleeper = { _ in try? await Task.sleep(for: .seconds(Preview.heldStill)) }
+            let held = CompanionModel(engine: PreviewEngine(sessions: [PreviewEngine.session]), capture: InjectedImageCapture(source: image),
+                                      windowCapture: InjectedImageCapture(source: image), store: scratch,
+                                      defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard,
+                                      sleeper: still)
+            held.setTheme(theme)
+            held.startEngine()
+            held.dismissGuide()
+            held.selectTarget(session)
+            for _ in 0..<3 {
+                Task { await held.captureActiveWindowAndSend() }
+                settle()
+            }
+            bubbleSnapshot(held, actions: noop, dark: dark, to: dir.appendingPathComponent("held-captures-\(look).png"))
+            held.discardHeldCapture()
+            settle()
+            held.noteDraft = "What does this error mean?"
+            if let pasted = try? held.newCaptureFile() {
+                try? FileManager.default.copyItem(at: image, to: pasted)
+                Task { await held.pasteImage(at: pasted) }
+                settle()
+            }
+            bubbleSnapshot(held, actions: noop, dark: dark, to: dir.appendingPathComponent("pasted-image-\(look).png"))
+            held.discardHeldCapture()
+
             // A conversation with nothing in it yet.
             var quiet = PreviewEngine.session
             quiet.lastReply = nil
@@ -438,6 +532,120 @@ enum Preview {
 
     /// The "+" and a row's actions, the new-session form in each state, Undo after hiding, the list with hidden
     /// sessions shown, and the empty states, in each theme.
+    /// A failed message that kept its three screenshots, with Retry; then Retry after the screenshots were gone, with
+    /// words (sent alone, with the note) and without (nothing sent).
+    private static func renderKeptCaptures(to dir: URL) {
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(root: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        let image = scratch.root.appendingPathComponent("preview-source.png")
+        try? scratch.prepare()
+        try? Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(settleTime)) }
+        /// Runs until the conversation's last message is no longer on its way (a send goes through a few hops).
+        func settled(_ m: CompanionModel) {
+            let deadline = Date().addingTimeInterval(Preview.sendSettleLimit)
+            repeat { settle() } while Date() < deadline && m.thread.contains { $0.delivery == .sending || $0.delivery == .queued }
+        }
+        for (theme, dark) in [(Design.Theme.paper, false), (.terminal, true)] {
+            let look = theme.rawValue
+            for withWords in [true, false] {
+                let engine = PreviewEngine(sessions: [PreviewEngine.session], delay: 0,
+                                           failure: .channel("the channel server did not confirm delivery"))
+                let m = CompanionModel(engine: engine, capture: InjectedImageCapture(source: image),
+                                       windowCapture: InjectedImageCapture(source: image), store: scratch,
+                                       defaults: UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard,
+                                       sleeper: { _ in try? await Task.sleep(for: .seconds(Preview.heldStill)) })
+                m.setTheme(theme)
+                m.startEngine()
+                m.dismissGuide()
+                m.openBubble()
+                m.selectTarget(PreviewEngine.session.id)
+                for _ in 0..<3 {
+                    Task { await m.captureActiveWindowAndSend() }
+                    settle()
+                }
+                if withWords { m.noteDraft = "Which of these plans is cheaper?" }
+                m.submitHeldCapture()
+                settled(m)
+                if withWords {
+                    m.dismissError()
+                    bubbleSnapshot(m, actions: noop, dark: dark, to: dir.appendingPathComponent("kept-retry-\(look).png"))
+                }
+                // The screenshots are gone (a relaunch, say) when Retry is pressed.
+                scratch.files().forEach(scratch.remove)
+                engine.failure = nil
+                if let entry = m.thread.last(where: { $0.role == .you }) {
+                    Task { await m.retry(entry.id) }
+                    settled(m)
+                }
+                m.dismissError()
+                bubbleSnapshot(m, actions: noop, dark: dark,
+                               to: dir.appendingPathComponent("kept-gone-\(withWords ? "words" : "nothing")-\(look).png"))
+            }
+        }
+        Design.theme = .paper
+    }
+
+    /// General, chats and the new + form: General chosen with nothing said yet, the list with General first and two
+    /// chats, and the form as a chat and with "Work in a folder…" open. In each theme.
+    private static func renderChats(to dir: URL) {
+        let looks: [(Design.Theme, Bool)] = [(.paper, false), (.terminal, true)]
+        let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},
+                                 dropFiles: { _ in })
+        let scratch = CaptureStore(directory: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidemoon-preview-\(UUID().uuidString)", isDirectory: true))
+        func chat(_ id: String, _ name: String?, age: TimeInterval, reply: String? = nil) -> Session {
+            var s = Session(id: id)
+            s.kind = .chat
+            s.name = name
+            s.lastReply = reply
+            s.lastEventAt = Date().addingTimeInterval(-age)
+            return s
+        }
+        let general = chat(Constants.Chat.generalId, nil, age: 9000)
+        let chats = [
+            general,
+            chat("00000000-0000-4000-8000-0000000003c1", "what does this reddit post mean?", age: 40, reply: "It is sarcasm."),
+            chat("00000000-0000-4000-8000-0000000003c2", "check this invoice", age: 400, reply: "The total is right."),
+        ]
+        final class NoChooser: FolderChooser {
+            func chooseFolder(startingAt: String?) async -> String? { nil }
+        }
+        let chooser = NoChooser()
+        func model(_ sessions: [Session], theme: Design.Theme) -> CompanionModel {
+            let defaults = UserDefaults(suiteName: "sidemoon-preview-\(UUID().uuidString)") ?? .standard
+            let m = CompanionModel(engine: PreviewEngine(sessions: sessions), capture: ScreencaptureProvider(), store: scratch,
+                                   defaults: defaults)
+            m.homeFolder = "/Users/me"
+            m.folderChooser = chooser
+            m.setTheme(theme)
+            m.startEngine()
+            m.dismissGuide()
+            m.openBubble()
+            return m
+        }
+        for (theme, dark) in looks {
+            let look = theme.rawValue
+            // First launch: nothing chosen, so General, with nothing said yet.
+            let fresh = model([general] + PreviewEngine.several, theme: theme)
+            bubbleSnapshot(fresh, actions: noop, dark: dark, to: dir.appendingPathComponent("general-empty-\(look).png"))
+            // The list: General first, then the chats and sessions by activity.
+            let listed = model(chats + PreviewEngine.several, theme: theme)
+            listed.openSessionList()
+            bubbleSnapshot(listed, actions: noop, dark: dark, to: dir.appendingPathComponent("chats-list-\(look).png"))
+            // The + form: a chat, then with Work in a folder… open.
+            let form = model(chats + PreviewEngine.several, theme: theme)
+            form.openNewSession()
+            form.newSessionMessage = "What does this post mean?"
+            bubbleSnapshot(form, actions: noop, dark: dark, to: dir.appendingPathComponent("plus-chat-\(look).png"))
+            form.setNewSessionInFolder(true)
+            bubbleSnapshot(form, actions: noop, dark: dark, to: dir.appendingPathComponent("plus-folder-\(look).png"))
+        }
+        Design.theme = .paper
+    }
+
     private static func renderNewSessionAndHidden(to dir: URL) {
         let looks: [(Design.Theme, Bool)] = [(.paper, false), (.terminal, true), (.mono, false), (.mono, true)]
         let noop = BubbleActions(showMenu: {}, copyReply: {}, capture: {}, submitNote: {}, cancelNote: {}, close: {},

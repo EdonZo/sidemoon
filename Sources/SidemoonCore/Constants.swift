@@ -10,8 +10,18 @@ public enum Constants {
         /// it: the engine socket the hooks and the channel talk to, the channel config, saved conversations.
         public static var supportDirectory: URL {
             if let override = supportDirectoryOverride { return URL(fileURLWithPath: override, isDirectory: true) }
+            // Under a test runner nothing may fall back to the real folder, where the running app keeps the user's
+            // captures, conversations and socket: a folder of this test process's own is used instead.
+            if TestRunner.isActive {
+                return URL(fileURLWithPath: TestRunner.folderParent, isDirectory: true)
+                    .appendingPathComponent("\(TestRunner.folderPrefix)\(getpid())", isDirectory: true)
+            }
             return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(supportDirectoryInHome, isDirectory: true)
+        }
+        /// The real support folder, whatever process asks (tests use it to check they never touch it).
+        public static var realSupportDirectory: URL {
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(supportDirectoryInHome, isDirectory: true)
         }
         /// For the end-to-end tests only (scripts/e2e.sh), never set in normal use: an absolute folder that
         /// replaces the support directory, so a test engine, its hooks and its channel use their own socket and
@@ -44,6 +54,13 @@ public enum Constants {
         public static let homeFolderRefusalName = "home-folder-refused"
         public static var homeFolderRefusalPath: String { supportDirectory.appendingPathComponent(homeFolderRefusalName).path }
         public static var socketPath: String { supportDirectory.appendingPathComponent(socketName).path }
+        /// The folder General and the other chats run in: Sidemoon's own, inside the support folder, so no project's
+        /// configuration applies to them. Made when the first message is sent.
+        public static let chatFolderName = "Chat"
+        public static var chatFolder: String { supportDirectory.appendingPathComponent(chatFolderName, isDirectory: true).path }
+        /// The chats and the Claude Code conversations they continue (`ChatBook`).
+        public static let chatsName = "chats.json"
+        public static var chatsPath: String { supportDirectory.appendingPathComponent(chatsName).path }
 
         /// Default Claude Code user settings file (the installer only touches it when asked).
         public static var defaultClaudeSettings: String {
@@ -67,6 +84,19 @@ public enum Constants {
             return ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
         }
         public static let claudeExecutableName = "claude"
+    }
+
+    /// Whether this process is a test runner (`swift test`): then the support folder is never the real one.
+    public enum TestRunner {
+        /// The processes `swift test` runs tests in (Swift Testing, and XCTest).
+        public static let processNames: Set<String> = ["swiftpm-testing-helper", "xctest"]
+        public static let bundleExtension = "xctest"
+        /// The stand-in support folder's name, before the process id.
+        public static let folderPrefix = "sidemoon-test-"
+        /// Short on purpose: the engine socket lives in the support folder, and a socket path has a small length limit.
+        public static let folderParent = "/tmp"
+        public static let isActive: Bool = processNames.contains(ProcessInfo.processInfo.processName)
+            || Bundle.allBundles.contains { $0.bundleURL.pathExtension == bundleExtension }
     }
 
     public enum Permissions {
@@ -173,6 +203,9 @@ public enum Constants {
         /// `status` and `state` values in the agents listing.
         public static let busyStatus = "busy"
         public static let workingState = "working"
+        /// The listing's `state` for a session waiting on a person: a finished turn waiting for the next message, or,
+        /// for one that never answered, a question in its terminal before its first turn.
+        public static let blockedState = "blocked"
         /// Added to a message whose delivery stopped the session while it had background work running.
         public static let backgroundWorkNote = "[Note from Sidemoon: delivering this message restarted the session, which stopped "
             + "any background shells or agents it had running. Restart them if they are still needed.]"
@@ -214,6 +247,20 @@ public enum Constants {
         public static let untrustedFolderPhrases = ["workspace not trusted"]
         /// Added when Claude Code kept the message to deliver the next time the session starts.
         public static let messageSavedPhrases = ["your message is saved and will be delivered"]
+    }
+
+    /// General and the chats started with "+" (`ChatRecord`).
+    public enum Chat {
+        /// General's id, in session-id form. Fixed, so it is the same on every Mac and after every restart.
+        public static let generalId = "00000000-0000-4000-8000-00000000c4a7"
+        /// Files sent to a chat are copied here, inside the chat folder, where the run may read them.
+        public static let attachmentsFolderName = "attachments"
+        /// A chat only looks and answers: the one tool it is allowed without asking is reading. In a `-p` run
+        /// anything that would ask is refused, so it cannot change files or run commands.
+        public static let allowedToolsFlag = "--allowedTools"
+        public static let allowedTools = ["Read"]
+        /// Claude Code's words when the conversation a chat continues is gone; the chat then starts over.
+        public static let conversationGonePhrases = ["no conversation found"]
     }
 
     // MARK: Hooks

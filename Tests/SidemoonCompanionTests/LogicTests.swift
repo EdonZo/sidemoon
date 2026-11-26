@@ -269,6 +269,34 @@ private func session(_ id: String, name: String? = nil, cwd: String? = nil, stat
         #expect(ActiveWindow.pick([window(1, app, layer: 3)], pid: app, excludedPID: me) == nil)
     }
 
+    @Test func targetIsTheFrontmostAppsWindowWhenItHasOne() {
+        let list = [window(1, other), window(2, app)]
+        #expect(ActiveWindow.target(list, frontmostPID: app, excludedPID: me)?.id == 2)
+    }
+
+    /// Sidemoon itself is in front after one of its own dialogs, the front app has no window, or nothing reports as
+    /// front-most: the window the user sees is the front-most ordinary one that is not Sidemoon's.
+    @Test func targetFallsBackToTheFrontmostOrdinaryWindow() {
+        let list = [window(1, me), window(2, other, layer: 25), window(3, other, size: CGSize(width: 20, height: 20)),
+                    window(4, other), window(5, app)]
+        #expect(ActiveWindow.target(list, frontmostPID: me, excludedPID: me)?.id == 4)
+        #expect(ActiveWindow.target(list, frontmostPID: 999, excludedPID: me)?.id == 4)
+        #expect(ActiveWindow.target(list, frontmostPID: nil, excludedPID: me)?.id == 4)
+    }
+
+    /// A failure with no words of its own keeps the engine's reason under the message; the others keep their title.
+    @Test func aFailedMessageKeepsTheReason() {
+        #expect(CompanionError.delivery("image: cannot read /x.png").threadNote == "Sending failed: image: cannot read /x.png")
+        let long = String(repeating: "a", count: CompanionConstants.Messages.threadReasonCharacters + 40)
+        #expect(CompanionError.delivery(long).threadNote.hasSuffix("…"))
+        #expect(CompanionError.busy.threadNote == CompanionError.busy.title)
+    }
+
+    @Test func targetIsNilWhenOnlySidemoonHasWindows() {
+        #expect(ActiveWindow.target([window(1, me)], frontmostPID: me, excludedPID: me) == nil)
+        #expect(ActiveWindow.target([], frontmostPID: app, excludedPID: me) == nil)
+    }
+
     @Test func neverPicksOwnWindows() {
         #expect(ActiveWindow.pick([window(1, me)], pid: me, excludedPID: me) == nil)
     }
@@ -280,5 +308,58 @@ private func session(_ id: String, name: String? = nil, cwd: String? = nil, stat
         ]
         #expect(WindowInfo(entry) == WindowInfo(id: 42, ownerPID: 500, layer: 0, bounds: CGRect(x: 10, y: 20, width: 300, height: 200)))
         #expect(WindowInfo([kCGWindowNumber as String: 42]) == nil)
+    }
+}
+
+@Suite struct PasteContentTests {
+    @Test func decidesFromTheClipboardDescription() {
+        let file = URL(fileURLWithPath: "/Users/me/report.pdf")
+        // A screenshot copied with Command-Shift-Control-4.
+        #expect(PasteContent.of(types: ["public.png", "public.tiff"], fileURLs: []) == .image(type: "public.png"))
+        #expect(PasteContent.of(types: ["public.tiff"], fileURLs: []) == .image(type: "public.tiff"))
+        // Plain text, and rich text that carries a picture of itself, paste as text exactly as before.
+        #expect(PasteContent.of(types: ["public.utf8-plain-text"], fileURLs: []) == .text)
+        #expect(PasteContent.of(types: ["public.rtf", "public.utf8-plain-text", "public.tiff"], fileURLs: []) == .text)
+        // A browser's Copy Image adds HTML but no plain text: still an image.
+        #expect(PasteContent.of(types: ["public.html", "public.png"], fileURLs: []) == .image(type: "public.png"))
+        // Files copied in the Finder (their names come along as text).
+        #expect(PasteContent.of(types: ["public.file-url", "public.utf8-plain-text"], fileURLs: [file]) == .files([file]))
+        // Nothing known: left to the text field.
+        #expect(PasteContent.of(types: [], fileURLs: []) == .text)
+        #expect(PasteContent.of(types: ["com.example.private"], fileURLs: []) == .text)
+    }
+}
+
+@Suite struct PendingCapturesTests {
+    private let a = URL(fileURLWithPath: "/c/a.png"), b = URL(fileURLWithPath: "/c/b.png"), c = URL(fileURLWithPath: "/c/c.png")
+
+    @Test func addsInOrderUpToTheLimit() {
+        var p = PendingCaptures(limit: 2)
+        #expect(p.isEmpty && !p.isFull)
+        let first = p.add(a), second = p.add(b), overLimit = p.add(c), again = p.add(a)
+        #expect(first && second && !overLimit && !again)
+        #expect(p.urls == [a, b] && p.isFull)
+        #expect(PendingCaptures().limit == CompanionConstants.Capture.maxPerMessage)
+    }
+
+    @Test func removesOneAndKeepsTheOrder() {
+        var p = PendingCaptures()
+        [a, b, c].forEach { p.add($0) }
+        let removed = p.remove(b), twice = p.remove(b)
+        #expect(removed && !twice)
+        #expect(p.urls == [a, c])
+        p.removeAll()
+        #expect(p.isEmpty)
+    }
+
+    /// One capture is named and described as before; several are numbered and described in the plural.
+    @Test func namesAndDefaultText() {
+        var p = PendingCaptures()
+        p.add(a)
+        #expect(p.names == [CompanionConstants.Messages.captureAttachmentName])
+        #expect(p.defaultText == CompanionConstants.Messages.defaultCaptureText)
+        p.add(b)
+        #expect(p.names == ["Capture 1", "Capture 2"])
+        #expect(p.defaultText == CompanionConstants.Messages.defaultCapturesText)
     }
 }

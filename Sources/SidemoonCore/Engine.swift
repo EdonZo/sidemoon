@@ -14,6 +14,13 @@ public final class Engine: @unchecked Sendable {
     /// Arguments added to every `claude --bg` that starts a new session. Empty in the app; the end-to-end tests
     /// pass their own (project settings only, a small model, a name).
     let newSessionArguments: [String]
+    /// General and the chats started with "+".
+    public let chats: ChatBook
+    /// Where the chats run.
+    public let chatFolder: String
+    /// Arguments added to every chat run. Empty in the app (the user's default model); the end-to-end tests pass
+    /// their own (project settings only, a small model).
+    let chatArguments: [String]
 
     final class ChannelLink: @unchecked Sendable {
         let conn: LineConnection
@@ -37,12 +44,25 @@ public final class Engine: @unchecked Sendable {
 
     public init(socketPath: String = Constants.Paths.socketPath, runner: ClaudeRunner = SystemClaudeRunner(),
                 registry: SessionRegistry = SessionRegistry(homeFolderMemory: .supportFolder()),
-                pickupWait: TimeInterval = Constants.Timeouts.channelPickupWait, newSessionArguments: [String] = []) {
+                pickupWait: TimeInterval = Constants.Timeouts.channelPickupWait, newSessionArguments: [String] = [],
+                chats: ChatBook = .supportFolder(), chatFolder: String = Constants.Paths.chatFolder, chatArguments: [String] = []) {
         self.socketPath = socketPath
         self.runner = runner
         self.registry = registry
         self.pickupWait = pickupWait
         self.newSessionArguments = newSessionArguments
+        self.chats = chats
+        self.chatFolder = chatFolder
+        self.chatArguments = chatArguments
+        registry.hideRuns(in: chatFolder)
+        chats.all.forEach { registry.setChat($0.session) }
+    }
+
+    /// A new, empty chat, listed at once; its conversation starts with its first message. Returns its id.
+    public func newChat(name: String) -> String {
+        let record = chats.create(name: name)
+        registry.setChat(record.session)
+        return record.id
     }
 
     // MARK: Lifecycle
@@ -113,6 +133,7 @@ public final class Engine: @unchecked Sendable {
         case Constants.Ops.send:
             let req = SendRequest(session: msg["session"] as? String ?? "",
                                   imagePath: msg["image"] as? String,
+                                  imagePaths: msg["images"] as? [String] ?? [],
                                   text: msg["text"] as? String,
                                   wait: msg["wait"] as? Bool ?? false,
                                   filePaths: msg["files"] as? [String] ?? [])
@@ -193,12 +214,12 @@ public final class Engine: @unchecked Sendable {
         }
         let text = req.text?.trimmingCharacters(in: .whitespacesAndNewlines)
         let files = req.filePaths
-        guard req.imagePath != nil || !(text ?? "").isEmpty || !files.isEmpty else {
+        guard !req.allImagePaths.isEmpty || !(text ?? "").isEmpty || !files.isEmpty else {
             return .failure(.emptyMessage, sessionId: session.id)
         }
-        let image: ImageFile.Loaded?
+        let images: [ImageFile.Loaded]
         do {
-            image = try req.imagePath.map(ImageFile.load)
+            images = try req.allImagePaths.map(ImageFile.load)
             try files.forEach(ImageFile.checkFile)
         } catch let e as DeliveryError {
             return .failure(e, sessionId: session.id)
@@ -207,18 +228,21 @@ public final class Engine: @unchecked Sendable {
         let words = [text, req.styleNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
         let outgoing: String? = words.isEmpty ? nil : words
 
+        if session.kind == .chat {
+            return sendToChat(session, images: images, files: files, text: outgoing, wait: req.wait)
+        }
         if channelLink(for: session.id) != nil {
-            return sendViaChannel(session, image: image, files: files, text: outgoing, wait: req.wait)
+            return sendViaChannel(session, images: images, files: files, text: outgoing, wait: req.wait)
         }
         if session.kind == .background {
-            return sendViaBackground(session, image: image, files: files, text: outgoing, wait: req.wait)
+            return sendViaBackground(session, images: images, files: files, text: outgoing, wait: req.wait)
         }
         if session.state == .ended {
-            return sendHeadless(session, image: image, files: files, text: outgoing, wait: req.wait)
+            return sendHeadless(session, images: images, files: files, text: outgoing, wait: req.wait)
         }
         if session.kind == .unknown, refreshAgents() != nil, let fresh = registry.session(session.id), fresh.kind == .background {
             session = fresh
-            return sendViaBackground(session, image: image, files: files, text: outgoing, wait: req.wait)
+            return sendViaBackground(session, images: images, files: files, text: outgoing, wait: req.wait)
         }
         // Sidemoon's helper is there, but Claude Code does not pass on what it sends.
         if registry.session(session.id)?.channelDropped == true {
@@ -234,12 +258,12 @@ public final class Engine: @unchecked Sendable {
     // MARK: Route a: channel
 
     /// Copies the image and files to where the session can read them without a permission prompt.
-    private func stage(_ image: ImageFile.Loaded?, _ files: [String], for s: Session) -> Result<(image: String?, files: [String]), DeliveryError> {
-        guard image != nil || !files.isEmpty else { return .success((nil, [])) }
+    private func stage(_ images: [ImageFile.Loaded], _ files: [String], for s: Session) -> Result<(images: [String], files: [String]), DeliveryError> {
+        guard !images.isEmpty || !files.isEmpty else { return .success(([], [])) }
         guard let dir = ImageFile.scratchpad(for: s) else { return .failure(.noScratchpad) }
         do {
-            let imagePath = try image.map { try ImageFile.place($0, inScratchpad: dir) }
-            return .success((imagePath, try files.map { try ImageFile.placeFile($0, inScratchpad: dir) }))
+            let imagePaths = try images.map { try ImageFile.place($0, inScratchpad: dir) }
+            return .success((imagePaths, try files.map { try ImageFile.placeFile($0, inScratchpad: dir) }))
         } catch let e as DeliveryError {
             return .failure(e)
         } catch {
@@ -247,15 +271,15 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
-    private func sendViaChannel(_ s: Session, image: ImageFile.Loaded?, files: [String], text: String?, wait: Bool) -> SendResult {
+    private func sendViaChannel(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
         guard let link = channelLink(for: s.id) else { return .failure(.channel("channel disconnected"), sessionId: s.id, route: .channel) }
-        let imagePath: String?, filePaths: [String]
-        switch stage(image, files, for: s) {
-        case let .success(staged): (imagePath, filePaths) = staged
+        let imagePaths: [String], filePaths: [String]
+        switch stage(images, files, for: s) {
+        case let .success(staged): (imagePaths, filePaths) = staged
         case let .failure(e): return .failure(e, sessionId: s.id, route: .channel)
         }
         let deliveryId = UUID().uuidString.lowercased()
-        let content = ImageFile.messageText(text: text, imagePath: imagePath, filePaths: filePaths)
+        let content = ImageFile.messageText(text: text, imagePaths: imagePaths, filePaths: filePaths)
         let token = registry.expectStop(sessionId: s.id) { e in
             // Skip the Stop of a turn that was already running when the message arrived.
             guard let path = e.transcriptPath, TranscriptReader.contains(path, deliveryId) else { return true }
@@ -284,7 +308,7 @@ public final class Engine: @unchecked Sendable {
                 + "but the session showed no sign of it within \(Int(pickupWait))s of being idle"
             return r
         }
-        return finish(s.id, route: .channel, token: token, wait: wait, marker: deliveryId, detail: imagePath.map { "image at \($0)" })
+        return finish(s.id, route: .channel, token: token, wait: wait, marker: deliveryId, detail: Engine.imageDetail(imagePaths))
     }
 
     /// Whether the session took in a channel delivery: its marker in the session's transcript, or a prompt
@@ -330,7 +354,7 @@ public final class Engine: @unchecked Sendable {
         refreshAgents()?.first { $0.sessionId == sessionId }
     }
 
-    private func sendViaBackground(_ s: Session, image: ImageFile.Loaded?, files: [String], text: String?, wait: Bool) -> SendResult {
+    private func sendViaBackground(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
         func fail(_ m: String) -> SendResult { .failure(.background(m), sessionId: s.id, route: .background) }
         guard let a = agent(s.id), a.kind == SessionKind.background.rawValue else {
             return fail("`claude agents` no longer lists this session as a background session")
@@ -345,22 +369,31 @@ public final class Engine: @unchecked Sendable {
         // A session that is already stopped is not stopped here, so Claude Code's own answer is safe to wait for;
         // it reopens a stopped session that never answered.
         let answered = a.isRunning ? registry.hasAnswered(s.id, transcriptHint: current.transcriptPath ?? a.transcriptPath) : nil
+        // Blocked before its first answer: it waits on a question in its terminal (the listing just read said so, and
+        // the registry judged its transcript). Resuming it would only start a new session.
+        let blocked = ResumeCheck.isBlocked(a)
+        if blocked, current.blocker == .waitingInTerminal {
+            var r = SendResult.failure(.cannotResume(.waitingInTerminal, messageSaved: false), sessionId: s.id, route: .background)
+            r.detail = "checked before resuming: \(ResumeBlocker.waitingInTerminal.description) (\(cwd))"
+            return r
+        }
         // The home folder only blocks where Claude Code has refused it before, and only a running session.
         let inHome = ResumeCheck.isHomeFolder(cwd, home: registry.home)
         let homeRefused = a.isRunning && registry.homeFolderMemory.refused
-        if let blocker = ResumeCheck.blocker(cwd: cwd, home: registry.home, answered: answered, homeFolderRefused: homeRefused) {
+        if let blocker = ResumeCheck.blocker(cwd: cwd, home: registry.home, answered: answered, homeFolderRefused: homeRefused,
+                                             blockedInTerminal: blocked) {
             registry.setBlocker(sessionId: s.id, blocker)
             var r = SendResult.failure(.cannotResume(blocker, messageSaved: false), sessionId: s.id, route: .background)
             r.detail = "checked before stopping the session: \(blocker.description) (\(cwd))"
             return r
         }
 
-        let imagePath: String?, filePaths: [String]
-        switch stage(image, files, for: current) {
-        case let .success(staged): (imagePath, filePaths) = staged
+        let imagePaths: [String], filePaths: [String]
+        switch stage(images, files, for: current) {
+        case let .success(staged): (imagePaths, filePaths) = staged
         case let .failure(e): return .failure(e, sessionId: s.id, route: .background)
         }
-        var prompt = ImageFile.messageText(text: text, imagePath: imagePath, filePaths: filePaths)
+        var prompt = ImageFile.messageText(text: text, imagePaths: imagePaths, filePaths: filePaths)
         // The stop below ends whatever the finished turn left running, so the session is told.
         if a.isRunning, a.status == Constants.ClaudeCLI.busyStatus { prompt += "\n\n" + Constants.ClaudeCLI.backgroundWorkNote }
 
@@ -436,7 +469,12 @@ public final class Engine: @unchecked Sendable {
         }
         // Claude Code reopened a home-folder session here: a refusal remembered from before no longer holds.
         if inHome { registry.homeFolderResume(refused: false) }
-        return finish(s.id, route: .background, token: token, wait: wait, marker: nil, detail: imagePath.map { "image at \($0)" })
+        return finish(s.id, route: .background, token: token, wait: wait, marker: nil, detail: Engine.imageDetail(imagePaths))
+    }
+
+    /// Where the images were put, for the result's detail.
+    static func imageDetail(_ paths: [String]) -> String? {
+        paths.isEmpty ? nil : (paths.count == 1 ? "image at " : "images at ") + paths.joined(separator: ", ")
     }
 
     /// The short id in `backgrounded · <id> · <name>`.
@@ -469,7 +507,9 @@ public final class Engine: @unchecked Sendable {
 
         let prompt = [text, req.styleNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
         let cli = Constants.ClaudeCLI.self
-        let args = [cli.backgroundFlag] + newSessionArguments + (req.name.map { [cli.nameFlag, $0] } ?? [])
+        // Arguments given to the engine that name the session already (the end-to-end tests) keep their name.
+        let named = newSessionArguments.contains(cli.nameFlag)
+        let args = [cli.backgroundFlag] + newSessionArguments + (named ? [] : req.name.map { [cli.nameFlag, $0] } ?? [])
             + [cli.endOfOptions, prompt]
         let r = runner.run(args, cwd: folder, stdin: nil, timeout: Constants.Timeouts.newSessionStart)
         let output = (r.stdoutText + r.stderrText).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -498,24 +538,30 @@ public final class Engine: @unchecked Sendable {
 
     // MARK: Route c: headless
 
-    private func sendHeadless(_ s: Session, image: ImageFile.Loaded?, files: [String], text: String?, wait: Bool) -> SendResult {
+    /// One user message for `--input-format stream-json`: the images inline, then the words, which name the files
+    /// by path.
+    static func headlessInput(images: [ImageFile.Loaded], text: String?, files: [String]) -> Data? {
+        var content: [[String: Any]] = []
+        for image in images {
+            content.append(["type": "image", "source": ["type": "base64", "media_type": image.mediaType,
+                                                        "data": image.data.base64EncodedString()]])
+        }
+        let words = ImageFile.messageText(text: text, imagePaths: [], filePaths: files)
+        if !words.isEmpty { content.append(["type": "text", "text": words]) }
+        let message: [String: Any] = ["type": "user", "message": ["role": "user", "content": content]]
+        guard var encoded = try? JSONSerialization.data(withJSONObject: message) else { return nil }
+        encoded.append(UInt8(ascii: "\n"))
+        return encoded
+    }
+
+    private func sendHeadless(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
         @Sendable func fail(_ m: String) -> SendResult { .failure(.headless(m), sessionId: s.id, route: .headless) }
         if let a = agent(s.id), a.isRunning { return fail("`claude agents` shows this session running; it may be open elsewhere") }
         guard registry.session(s.id)?.state == .ended else { return fail("the session is no longer known to have ended") }
         guard let cwd = s.cwd else { return fail("the session's working directory is unknown") }
 
-        var content: [[String: Any]] = []
-        if let image {
-            content.append(["type": "image", "source": ["type": "base64", "media_type": image.mediaType,
-                                                        "data": image.data.base64EncodedString()]])
-        }
         // The image goes inline; files are referenced where they are, since an ended session has no live scratchpad.
-        let words = ImageFile.messageText(text: text, imagePath: nil, filePaths: files)
-        if !words.isEmpty { content.append(["type": "text", "text": words]) }
-        let message: [String: Any] = ["type": "user", "message": ["role": "user", "content": content]]
-        guard var encoded = try? JSONSerialization.data(withJSONObject: message) else { return fail("could not encode the message") }
-        encoded.append(UInt8(ascii: "\n"))
-        let input = encoded
+        guard let input = Engine.headlessInput(images: images, text: text, files: files) else { return fail("could not encode the message") }
         let args = [Constants.ClaudeCLI.printFlag, Constants.ClaudeCLI.resumeFlag, s.id] + Constants.ClaudeCLI.headlessFlags
 
         let run: @Sendable () -> SendResult = { [self] in
@@ -535,6 +581,109 @@ public final class Engine: @unchecked Sendable {
             return SendResult(ok: true, sessionId: s.id, route: .headless, reply: nil, error: nil, detail: "running")
         }
         return run()
+    }
+
+    // MARK: Route d: a chat
+
+    /// Chats with a run under way. One run at a time per chat: a second message is refused as busy, and the
+    /// companion sends it once the first has answered, as for any busy session.
+    private var runningChats: Set<String> = []
+
+    /// One `claude -p` run in the chat folder that continues the chat's conversation (`--resume`), or starts it,
+    /// with the images inline and the files copied into the chat folder where the run may read them. Only reading
+    /// is allowed (`Constants.Chat.allowedTools`). When Claude Code no longer has the conversation, a fresh one starts
+    /// and the result says so. Nothing is left running afterwards.
+    private func sendToChat(_ s: Session, images: [ImageFile.Loaded], files: [String], text: String?, wait: Bool) -> SendResult {
+        @Sendable func fail(_ m: String) -> SendResult { .failure(.headless(m), sessionId: s.id, route: .headless) }
+        guard let record = chats.chat(s.id) else { return .failure(.unknownSession(s.id)) }
+        guard runner.isInstalled else { return fail("the claude command was not found") }
+        let started = lock.withLock { runningChats.insert(s.id).inserted }
+        guard started else { return .failure(.busy(s.id), sessionId: s.id, route: .headless) }
+        let placed: [String]
+        do {
+            try ChatFolder.prepare(chatFolder)
+            placed = try files.map { try placeInChatFolder($0) }
+        } catch {
+            lock.withLock { _ = runningChats.remove(s.id) }
+            return fail("could not prepare the chat folder: \(error)")
+        }
+        guard let input = Engine.headlessInput(images: images, text: text, files: placed) else {
+            lock.withLock { _ = runningChats.remove(s.id) }
+            return fail("could not encode the message")
+        }
+        var working = registry.session(s.id) ?? record.session
+        working.state = .working
+        registry.setChat(working)
+
+        let run: @Sendable () -> SendResult = { [self] in
+            defer { lock.withLock { _ = runningChats.remove(s.id) } }
+            var (r, parsed) = runChat(resume: record.claudeSessionId, input: input)
+            var startedOver = false
+            if record.claudeSessionId != nil, Engine.conversationGone(r, parsed) {
+                (r, parsed) = runChat(resume: nil, input: input)
+                startedOver = true
+            }
+            let output = (r.stdoutText + r.stderrText).trimmingCharacters(in: .whitespacesAndNewlines)
+            let now = Date()
+            var after = registry.session(s.id) ?? record.session
+            after.state = .idle
+            guard r.status == 0, !parsed.isError, let reply = parsed.text ?? parsed.result else {
+                registry.setChat(after)
+                let said = "claude exited \(r.status)\(r.timedOut ? " (timed out)" : ""): "
+                    + String((parsed.result ?? output).prefix(Constants.Limits.failureDetailCharacters))
+                if let refusal = ResumeCheck.classify(parsed.result ?? output), refusal.blocker == .loginNeeded {
+                    var failed = SendResult.failure(.cannotResume(.loginNeeded, messageSaved: false), sessionId: s.id, route: .headless)
+                    failed.detail = said
+                    return failed
+                }
+                return fail(said)
+            }
+            chats.update(s.id, claudeSessionId: parsed.sessionId ?? (startedOver ? nil : record.claudeSessionId), reply: reply, at: now)
+            after.lastReply = reply
+            after.lastReplyAt = now
+            after.lastEventAt = now
+            registry.setChat(after)
+            var result = SendResult(ok: true, sessionId: s.id, route: .headless, reply: reply, error: nil,
+                                    detail: parsed.sessionId.map { "claude session \($0)" })
+            result.startedOver = startedOver
+            return result
+        }
+        guard wait else {
+            DispatchQueue.global().async { _ = run() }
+            return SendResult(ok: true, sessionId: s.id, route: .headless, reply: nil, error: nil, detail: "running")
+        }
+        return run()
+    }
+
+    private func runChat(resume: String?, input: Data) -> (ProcessResult, StreamOutcome) {
+        let c = Constants.ClaudeCLI.self
+        let args = [c.printFlag] + (resume.map { [c.resumeFlag, $0] } ?? []) + c.headlessFlags
+            + [Constants.Chat.allowedToolsFlag] + Constants.Chat.allowedTools + chatArguments
+        let r = runner.run(args, cwd: chatFolder, stdin: input, timeout: Constants.Timeouts.headlessRun)
+        return (r, Engine.parseStream(r.stdout))
+    }
+
+    /// Claude Code no longer has the conversation a chat continues.
+    static func conversationGone(_ r: ProcessResult, _ parsed: StreamOutcome) -> Bool {
+        guard r.status != 0 || parsed.isError else { return false }
+        let said = (r.stdoutText + r.stderrText + (parsed.result ?? "")).lowercased()
+        return Constants.Chat.conversationGonePhrases.contains { said.contains($0) }
+    }
+
+    /// Copies a file sent to a chat into the chat folder (owner only), keeping a readable version of its name.
+    private func placeInChatFolder(_ path: String) throws -> String {
+        try ImageFile.checkFile(path)
+        let dir = (chatFolder as NSString).appendingPathComponent(Constants.Chat.attachmentsFolderName)
+        try ChatFolder.prepare(dir)
+        guard let data = FileManager.default.contents(atPath: path) else { throw DeliveryError.file("cannot read \(path)") }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let name = String((path as NSString).lastPathComponent.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
+        let target = (dir as NSString).appendingPathComponent("\(UUID().uuidString.lowercased().prefix(Constants.Limits.fileIdLength))-\(name)")
+        guard FileManager.default.createFile(atPath: target, contents: data,
+                                             attributes: [.posixPermissions: Constants.Permissions.imageFile]) else {
+            throw DeliveryError.file("cannot copy \(path) into the chat folder")
+        }
+        return target
     }
 
     struct StreamOutcome {

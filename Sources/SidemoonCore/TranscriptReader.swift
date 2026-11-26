@@ -179,6 +179,25 @@ public enum TranscriptReader {
         }
     }
 
+    /// Whether the session has no transcript at all, judged more widely than `locate` does: for a session that never
+    /// ran a turn, Claude Code has not even made the folder for its working directory, so `locate` cannot be sure.
+    /// True only when the projects folder can be read, holds no transcript for the session in any folder, and is
+    /// seen to be where this Claude Code keeps its transcripts: one of `evidence` (the transcript paths of other
+    /// sessions `claude agents` lists) exists directly in a folder under it. Without that (`CLAUDE_CONFIG_DIR`
+    /// elsewhere, say) it is false, and nothing is concluded.
+    public static func isAbsent(_ sessionId: String, evidence: [String],
+                                projects: String = Constants.Paths.claudeProjectsDirectory) -> Bool {
+        let fm = FileManager.default
+        guard let folders = try? fm.contentsOfDirectory(atPath: projects) else { return false }
+        let name = "\(sessionId).\(Constants.Paths.transcriptExtension)"
+        guard !folders.contains(where: { fm.fileExists(atPath: "\(projects)/\($0)/\(name)") }) else { return false }
+        let root = URL(fileURLWithPath: projects).standardizedFileURL.path
+        return evidence.contains { path in
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            return url.deletingLastPathComponent().deletingLastPathComponent().path == root && fm.fileExists(atPath: url.path)
+        }
+    }
+
     /// True when `needle` occurs in the transcript tail.
     public static func contains(_ path: String, _ needle: String) -> Bool {
         guard let data = readTailData(path) else { return false }

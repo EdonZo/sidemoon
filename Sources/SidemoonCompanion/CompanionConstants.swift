@@ -53,8 +53,8 @@ public enum CompanionConstants {
         public static let legacyBundleIdentifier = "dev.tagalong.companion"
         public static let name = "Sidemoon"
         public static let executableName = "Sidemoon"
-        public static let version = "1.0.6"
-        public static let build = "11"
+        public static let version = "1.0.7"
+        public static let build = "12"
         public static let minimumSystemVersion = "14.0"
         /// `SidemoonApp --print-info-plist` writes the bundle's Info.plist to stdout and exits.
         public static let printInfoPlistFlag = "--print-info-plist"
@@ -205,11 +205,23 @@ public enum CompanionConstants {
     }
 
     public enum Messages {
+        /// How much of the engine's reason is kept under a failed message in the thread.
+        public static let threadReasonCharacters = 160
         public static let defaultCaptureText = "Here is a screenshot of what I see right now."
+        /// Sent with several captures when no note is typed.
+        public static let defaultCapturesText = "Here are screenshots of what I see, in the order I took them."
+        /// The text sent with captures and no note: one, or several.
+        public static func defaultCaptureText(count: Int) -> String { count > 1 ? defaultCapturesText : defaultCaptureText }
         /// Sent with dropped files when no note is typed.
         public static let defaultFilesText = "Here are the files I want you to look at."
         /// How a capture is named in the thread.
         public static let captureAttachmentName = "Screen capture"
+        /// Several captures are named shorter and numbered, so a few chips fit side by side.
+        public static let numberedCaptureName = "Capture"
+        /// How each of several captures is named, in the order taken; one keeps the plain name.
+        public static func captureAttachmentName(number: Int, of count: Int) -> String {
+            count > 1 ? "\(numberedCaptureName) \(number)" : captureAttachmentName
+        }
         public static let foldersNotSent = "Folders cannot be sent. Drop the files inside instead."
         /// The short mark put on every message when short replies are on. The full note explains it.
         public static let replyStyleTag = "[via Sidemoon]"
@@ -299,6 +311,14 @@ public enum CompanionConstants {
         public static let noteCountdownTick: TimeInterval = 0.1
     }
 
+    /// Chats (General, and those started with "+").
+    public enum Chat {
+        /// A new chat is named after the start of its first message, cut at a word to at most this many characters.
+        public static let nameCharacters = 32
+        /// Added where the name was cut.
+        public static let nameEllipsis = "…"
+    }
+
     /// Starting a new background session from the companion.
     public enum NewSession {
         /// Folders offered before "Choose folder…".
@@ -318,6 +338,19 @@ public enum CompanionConstants {
         public static let seenRefresh: TimeInterval = 24 * 60 * 60
     }
 
+    /// Command-V in the composer: what on the clipboard is taken as an attachment instead of text.
+    public enum Paste {
+        /// Image data, in order of preference. A screenshot copied with Command-Shift-Control-4 puts both on the
+        /// clipboard; PNG is used as it is, the others are turned into PNG first (the engine sends PNG, JPEG, GIF, WebP).
+        public static let imageTypes = ["public.png", "public.tiff"]
+        /// The one that needs no conversion.
+        public static let pngType = "public.png"
+        /// Plain text in any of these is pasted as text, even when an image comes with it (rich text from some apps
+        /// carries a picture of itself). HTML or RTF alone does not count: a browser's Copy Image adds an HTML tag.
+        public static let textTypes: Set<String> = ["public.utf8-plain-text", "public.utf16-plain-text", "public.plain-text",
+                                                     "NSStringPboardType"]
+    }
+
     public enum Capture {
         public static let tool = "/usr/sbin/screencapture"
         /// -i interactive region selection (Escape cancels), -x no sound.
@@ -329,6 +362,19 @@ public enum CompanionConstants {
         /// Smaller windows (tool strips, popovers) are never taken for the window the user is working in.
         public static let minimumWindowSize = CGSize(width: 100, height: 60)
         public static let directoryName = "Captures"
+        /// Each running Sidemoon keeps its captures in a folder of its own, named this, its process id and start time.
+        public static let runFolderPrefix = "run-"
+        /// A run folder whose owner cannot be judged is kept this long, then removed by a later launch.
+        public static let unjudgedMaxAge: TimeInterval = 7 * 24 * 60 * 60
+        /// A loose capture from a version before run folders is removed once this old: such a version may still be
+        /// running and waiting to send it (a message may wait for a busy session up to `Timing.busyWaitLimit`).
+        public static let legacyMaxAge: TimeInterval = 2 * 60 * 60
+        /// Captures one message can carry. Pressing the capture shortcut again while they wait adds one more,
+        /// up to this many; a press beyond it is ignored and nothing is sent early.
+        public static let maxPerMessage = 6
+        /// Failed messages that keep their captures for Retry. The oldest beyond this lose theirs (deleted at once):
+        /// a later Retry then sends only the typed words, or nothing.
+        public static let maxKeptMessages = 3
         public static let filePrefix = "capture-"
         public static let fileExtension = "png"
         public static var directory: URL {

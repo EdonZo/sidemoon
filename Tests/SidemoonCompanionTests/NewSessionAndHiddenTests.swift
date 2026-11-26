@@ -77,6 +77,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
 @Suite struct NewSessionFormTests {
     @Test func startsOnlyWithAFolderAndAMessageAndOnlyOnce() {
         var form = NewSessionForm()
+        form.inFolder = true
         #expect(!form.canStart(note: nil))
         form.message = "  look at the tests  "
         #expect(!form.canStart(note: nil))
@@ -97,6 +98,15 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         // Another folder: the old error no longer applies.
         form.choose("/p/b")
         #expect(form.problem == nil && form.phase == .editing)
+    }
+
+    /// Without a name Claude Code names the session after its whole first prompt, Sidemoon's note included.
+    @Test func aNewSessionIsNamedAfterItsFolder() {
+        #expect(NewSessionForm.defaultName(for: "/Users/me/Projects/reading-notes") == "reading-notes")
+        #expect(NewSessionForm.defaultName(for: "/Users/me/Projects/reading-notes/") == "reading-notes")
+        #expect(NewSessionForm.defaultName(for: "/p/my folder") == "my folder")
+        #expect(NewSessionForm.defaultName(for: "/") == nil)
+        #expect(NewSessionForm.defaultName(for: "") == nil)
     }
 
     @Test func engineErrorsBecomePlainProblems() {
@@ -194,6 +204,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         let (m, d) = model(engine)
         m.startEngine()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         #expect(m.isCreatingSession && m.newSession.folder == "/p/api")
         #expect(!m.canStartNewSession)
         m.newSessionMessage = "Fix the failing test"
@@ -213,6 +224,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         // The first message carries the short-replies note, as any message does; the next one the tag.
         let request = engine.started.first
         #expect(request?.folder == "/p/api" && request?.text == "Fix the failing test")
+        #expect(request?.name == "api")
         #expect(request?.styleNote == CompanionConstants.Messages.replyStyleNote)
         await m.sendMessage("and then?")
         #expect(engine.sent.last?.styleNote == CompanionConstants.Messages.replyStyleTag)
@@ -231,6 +243,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         let (m, _) = model(engine)
         m.startEngine()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         m.chooseNewSessionFolder("/p/new")
         m.newSessionMessage = "hello"
         engine.onStart = { [engine] _ in
@@ -245,6 +258,34 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(!m.awaitingFirstAnswer.contains(fresh))
     }
 
+    /// Started, but Claude Code holds it on a question in its terminal: the user is told, with Open in Terminal,
+    /// instead of waiting for an answer that cannot come.
+    @Test func aNewSessionWaitingInTerminalSaysSo() async {
+        let engine = FakeEngine()
+        let (m, _) = model(engine)
+        m.startEngine()
+        m.openNewSession()
+        m.setNewSessionInFolder(true)
+        m.chooseNewSessionFolder("/p/new")
+        m.newSessionMessage = "hello"
+        engine.onStart = { [engine] _ in
+            engine.emit(session(fresh, age: 0, cwd: "/p/new"))
+            return NewSessionResult(sessionId: fresh, failure: nil, detail: nil)
+        }
+        await m.startNewSession()
+        #expect(m.awaitingFirstAnswer.contains(fresh) && m.currentError == nil)
+        // The next refresh of the session list sees it blocked before its first answer.
+        var waiting = session(fresh, age: 0, cwd: "/p/new")
+        waiting.blocker = .waitingInTerminal
+        engine.emit(waiting)
+        await settle { m.currentError != nil }
+        #expect(m.currentError == .cannotReach(.waitingInTerminal, messageSaved: false, detail: nil))
+        #expect(!m.awaitingFirstAnswer.contains(fresh) && !m.targetIsWorking)
+        #expect(m.remedies(for: m.currentError!) == [.attachInTerminal, .chooseAnotherSession])
+        m.claudePath = "claude"
+        #expect(m.attachInTerminal() == .open(script: TerminalReopen.attachScript(shortId: SessionID.short(fresh), claude: "claude")))
+    }
+
     @Test func aFailureKeepsTheFormAndChangesNothingElse() async {
         let engine = FakeEngine()
         engine.list = [session(first, age: 5, cwd: "/p/api")]
@@ -252,6 +293,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         m.startEngine()
         let before = m.targetId
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         m.newSessionMessage = "hi"
         engine.onStart = { _ in NewSessionResult(sessionId: nil, failure: .refused(.untrustedFolder), detail: "Workspace not trusted") }
         await m.startNewSession()
@@ -268,12 +310,14 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         let (m, _) = model(engine)
         m.startEngine()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         m.chooseNewSessionFolder(home)
         m.newSessionMessage = "hi"
         #expect(m.newSessionFolderNote == .homeRefused && !m.canStartNewSession)
         engine.homeRefused = false
         m.closeNewSession()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         m.chooseNewSessionFolder(home)
         m.newSessionMessage = "hi"
         #expect(m.newSessionFolderNote == .homeCaution && m.canStartNewSession)
@@ -289,6 +333,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         let (m, _) = model(engine)
         m.startEngine()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         #expect(!m.navigate(.enter) && !m.navigate(.left) && !m.navigate(.delete))
         m.chooseNewSessionFolder("/p/a")
         m.newSessionMessage = "hi"
@@ -322,6 +367,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         m.folderChooser = chooser
         m.startEngine()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         m.chooseNewSessionFolder("/p/a")
         await m.pickNewSessionFolder()
         #expect(chooser.asked == .some("/p/a"))
@@ -334,6 +380,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(m.rows.isEmpty && m.sessions.isEmpty)
         m.openSessionList()
         m.openNewSession()
+        m.setNewSessionInFolder(true)
         #expect(m.isCreatingSession && !m.isPickingSession && m.isExpanded)
         #expect(m.newSession.folder == nil)
     }
@@ -356,7 +403,8 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
 
 @MainActor
 @Suite struct HiddenModelTests {
-    @Test func hidingTheTargetMovesItAndUndoPutsItBack() async {
+    /// Hiding the target hides its row only: the target stays (`TargetRule`), and Undo puts the row back.
+    @Test func hidingTheTargetKeepsItAndUndoPutsItBack() async {
         let engine = FakeEngine()
         engine.list = [session(first, age: 1), session(second, age: 5)]
         let sleeper = ManualSleeper()
@@ -366,10 +414,10 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         m.openSessionList()
         m.hideSession(first)
         #expect(m.rows.map(\.id) == [second])
-        #expect(m.targetId == second)
+        #expect(m.targetId == first)
         #expect(m.recentlyHidden?.sessionId == first)
         #expect(d.data(forKey: CompanionConstants.Defaults.hiddenSessions) != nil)
-        #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == nil)
+        #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == first)
         m.undoHide()
         #expect(m.rows.map(\.id) == [first, second] && m.targetId == first && m.recentlyHidden == nil)
         #expect(d.string(forKey: CompanionConstants.Defaults.targetSession) == first)
@@ -395,8 +443,7 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         #expect(m.waitingCount == 1)
         m.hideSession(first)
         #expect(m.waitingCount == 0)
-        // A fresh model on the same settings: still hidden, and never picked by itself.
-        d.removeObject(forKey: CompanionConstants.Defaults.targetSession)
+        // A fresh model on the same settings: still hidden, and the choice kept.
         let (again, _) = model(engine, defaults: d)
         again.startEngine()
         #expect(again.hidden.contains(first) && again.targetId == second && again.waitingCount == 0)
@@ -484,5 +531,120 @@ private func settle(until condition: () -> Bool, timeout: TimeInterval = 2) asyn
         // Still known: kept, and seen now. Not known for longer than the grace period: forgotten.
         #expect(m.hidden.ids == [first])
         #expect(HiddenSessions(data: d.data(forKey: CompanionConstants.Defaults.hiddenSessions)).ids == [first])
+    }
+}
+
+// MARK: - Chats
+
+private func chat(_ id: String, name: String?, age: TimeInterval) -> Session {
+    var s = Session(id: id)
+    s.kind = .chat
+    s.name = name
+    s.lastEventAt = Date().addingTimeInterval(-age)
+    return s
+}
+
+@Suite struct ChatLogicTests {
+    @Test func aChatIsNamedAfterTheStartOfItsFirstMessage() {
+        #expect(ChatNaming.name(from: "  what does this   reddit\npost mean? ") == "what does this reddit post mean?")
+        let long = ChatNaming.name(from: "please read this long comment thread and tell me who is right about it")
+        #expect(long == "please read this long comment" + CompanionConstants.Chat.nameEllipsis)
+        #expect(long.count <= CompanionConstants.Chat.nameCharacters + CompanionConstants.Chat.nameEllipsis.count)
+        #expect(ChatNaming.name(from: String(repeating: "x", count: 50)).hasPrefix(String(repeating: "x", count: CompanionConstants.Chat.nameCharacters)))
+        #expect(ChatNaming.name(from: "   ") == Design.Copy.NewSession.chatHeading)
+    }
+
+    /// General first whatever its activity, named by Sidemoon, reachable, never hideable; chats follow by activity.
+    @Test func generalIsFirstAndChatsAreListedLikeSessions() {
+        let general = chat(TargetRule.general, name: nil, age: 9999)
+        let rows = SessionList.rows([session(first, age: 1), chat(second, name: "reddit post", age: 5), general], showEnded: false)
+        #expect(rows.map(\.id) == [TargetRule.general, first, second])
+        #expect(rows[0].title == Design.Copy.Chat.general && rows[0].reachable && rows[0].isChat && !rows[0].canHide)
+        #expect(rows[2].title == "reddit post" && rows[2].canHide && rows[2].folder == nil)
+        #expect(rows[2].stateText == Design.Copy.Chat.kind)
+        // Working, it is still reachable (the message waits its turn).
+        var busy = general
+        busy.state = .working
+        #expect(SessionList.reachability(busy) == .reachable)
+    }
+
+    @Test func theFormStartsAChatWithoutAFolder() {
+        var form = NewSessionForm()
+        form.message = "hi"
+        #expect(form.canStart(note: nil) && !form.inFolder)
+        form.setInFolder(true)
+        #expect(!form.canStart(note: nil))
+        form.choose("/p/a")
+        #expect(form.canStart(note: nil) && !form.canStart(note: .missing))
+    }
+
+    @Test func aNoteIsInsertedRightAfterItsMessage() {
+        var threads = Threads()
+        let mine = threads.append(ThreadEntry(role: .you, text: "q"), to: "s")
+        threads.append(ThreadEntry(role: .session, text: "a"), to: "s")
+        threads.insert(ThreadEntry(role: .session, text: "note"), after: mine, in: "s")
+        #expect(threads.thread(for: "s").map(\.text) == ["q", "note", "a"])
+    }
+}
+
+@MainActor
+@Suite struct ChatModelTests {
+    /// The "+" with no folder: a new chat named after the message, chosen, and the message sent to it.
+    @Test func plusStartsANewChatAndSendsTheFirstMessage() async {
+        let engine = FakeEngine()
+        engine.list = [chat(TargetRule.general, name: nil, age: 100), session(first, age: 5, cwd: "/p/api")]
+        let (m, d) = model(engine)
+        m.startEngine()
+        m.selectTarget(first)
+        m.openNewSession()
+        #expect(!m.newSession.inFolder)
+        m.newSessionMessage = "What does this post mean?"
+        #expect(m.canStartNewSession)
+        await m.startNewSession()
+        #expect(engine.chatNames == ["What does this post mean?"])
+        #expect(engine.started.isEmpty)
+        let id = try? #require(engine.sent.last?.session)
+        #expect(id != nil && id != first && id != TargetRule.general)
+        #expect(m.targetId == id && d.string(forKey: CompanionConstants.Defaults.targetSession) == id)
+        #expect(m.threads.thread(for: id).first?.text == "What does this post mean?")
+        #expect(!m.isCreatingSession)
+    }
+
+    /// With "Work in a folder…" open it is a session in that folder, as before.
+    @Test func workInAFolderStartsASessionThere() async {
+        let engine = FakeEngine()
+        engine.list = [session(first, age: 5, cwd: "/p/api")]
+        engine.onStart = { _ in NewSessionResult(sessionId: fresh, failure: nil, detail: nil) }
+        let (m, _) = model(engine)
+        m.startEngine()
+        m.openNewSession()
+        m.setNewSessionInFolder(true)
+        m.newSessionMessage = "Fix the test"
+        await m.startNewSession()
+        #expect(engine.started.first?.folder == "/p/api" && engine.chatNames.isEmpty)
+    }
+
+    /// Claude Code no longer had the conversation: said in the thread, before the answer.
+    @Test func startingOverIsSaidInTheThread() async {
+        let engine = FakeEngine()
+        engine.list = [chat(TargetRule.general, name: nil, age: 100)]
+        engine.reply = { r in
+            var result = SendResult(ok: true, sessionId: r.session, route: .headless, reply: "Fresh answer.", error: nil, detail: nil)
+            result.startedOver = true
+            return result
+        }
+        let (m, _) = model(engine)
+        m.startEngine()
+        await m.sendMessage("hello again")
+        #expect(m.thread.map(\.text) == ["hello again", Design.Copy.Chat.startedOver, "Fresh answer."])
+    }
+
+    /// A chat has no terminal: no Open in Terminal or resume command among the remedies.
+    @Test func aChatOffersNoTerminalRemedies() {
+        let engine = FakeEngine()
+        engine.list = [chat(TargetRule.general, name: nil, age: 100)]
+        let (m, _) = model(engine)
+        m.startEngine()
+        #expect(m.remedies(for: .cannotReach(.loginNeeded, messageSaved: false, detail: nil)) == [.runLogin, .chooseAnotherSession])
     }
 }

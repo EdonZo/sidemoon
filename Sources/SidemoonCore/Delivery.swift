@@ -3,21 +3,27 @@ import Foundation
 public struct SendRequest: Sendable {
     public var session: String
     public var imagePath: String?
+    /// More images, after `imagePath`, in the order they were taken. All of them go with the one message.
+    public var imagePaths: [String]
     public var text: String?
     public var wait: Bool
     /// Files to hand to the session along with the message. The originals are never modified or deleted.
     public var filePaths: [String]
     /// A request about how to answer this one message, added after the text. Not shown as the user's words.
     public var styleNote: String?
-    public init(session: String, imagePath: String? = nil, text: String? = nil, wait: Bool = false, filePaths: [String] = [],
-                styleNote: String? = nil) {
+    public init(session: String, imagePath: String? = nil, imagePaths: [String] = [], text: String? = nil, wait: Bool = false,
+                filePaths: [String] = [], styleNote: String? = nil) {
         self.session = session
         self.imagePath = imagePath
+        self.imagePaths = imagePaths
         self.text = text
         self.wait = wait
         self.filePaths = filePaths
         self.styleNote = styleNote
     }
+
+    /// Every image of the message, in order.
+    public var allImagePaths: [String] { (imagePath.map { [$0] } ?? []) + imagePaths }
 }
 
 public struct SendResult: Sendable {
@@ -29,6 +35,8 @@ public struct SendResult: Sendable {
     public var detail: String?
     /// The typed cause of a failure, for in-process callers. Not carried over the socket.
     public var failure: DeliveryError?
+    /// A chat whose earlier conversation Claude Code no longer had: this message started a fresh one.
+    public var startedOver = false
 
     static func failure(_ e: DeliveryError, sessionId: String? = nil, route: Route? = nil) -> SendResult {
         var r = SendResult(ok: false, sessionId: sessionId, route: route, reply: nil, error: e.description, detail: nil)
@@ -70,6 +78,11 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
     case emptyMessage
     case image(String)
     case file(String)
+    /// An image to send is not there (any more): its path. Kept apart from other image problems so the companion
+    /// can say so in plain words and never show the path.
+    case imageMissing(String)
+    /// A file to send is not there (any more), or cannot be read: its path.
+    case fileMissing(String)
     case noScratchpad
     case busy(String)
     case forked(original: String, copy: String?)
@@ -94,6 +107,8 @@ public enum DeliveryError: Error, CustomStringConvertible, Equatable, Sendable {
         case .emptyMessage: return "nothing to send: give an image, text, or both"
         case let .image(m): return "image: \(m)"
         case let .file(m): return "file: \(m)"
+        case let .imageMissing(p): return "image: not a readable regular file: \(p)"
+        case let .fileMissing(p): return "file: not a readable regular file: \(p)"
         case .noScratchpad: return "no scratchpad_dir is known for this session yet (it arrives with its next hook event), so the image has nowhere it can be read without a permission prompt"
         case let .busy(s): return "busy: session \(s) is working; refusing to interrupt it"
         case let .forked(o, c): return "resume forked a copy (\(c ?? "unknown id")) instead of continuing \(o); the copy was stopped and nothing was delivered to \(o)"
@@ -122,6 +137,11 @@ public enum ResumeBlocker: String, Sendable, Codable, CaseIterable, CustomString
     case noTranscript
     /// The Claude login it runs under is missing or expired.
     case loginNeeded
+    /// It has never answered and Claude Code lists it as blocked: it is waiting for someone to answer a question
+    /// in its terminal before its first turn (seen with Claude Code 2.1.330: the "New MCP server found in this
+    /// project" dialog, asked once per project). Resuming it cannot continue a conversation that never began, so
+    /// Claude Code starts a new session instead. Attaching to it in a terminal and answering lets it start.
+    case waitingInTerminal
 
     public var description: String {
         switch self {
@@ -129,6 +149,7 @@ public enum ResumeBlocker: String, Sendable, Codable, CaseIterable, CustomString
         case .untrustedFolder: return "the session's working directory is not trusted"
         case .noTranscript: return "the session has no finished answer to resume from"
         case .loginNeeded: return "claude code needs a login"
+        case .waitingInTerminal: return "the session is waiting on a question in its terminal and has not started yet"
         }
     }
 }
@@ -148,12 +169,17 @@ public enum ResumeCheck {
     /// What would make a resume fail, from what can be seen without trying. `answered` is whether the
     /// session has finished an answer (nil: unknown, which never blocks). `homeFolderRefused`: Claude Code on
     /// this Mac has refused to reopen a home-folder session (`HomeFolderMemory`). Only then does the home folder
-    /// block; on other Macs Claude Code reopens such sessions.
-    public static func blocker(cwd: String?, home: String, answered: Bool?, homeFolderRefused: Bool) -> ResumeBlocker? {
+    /// block; on other Macs Claude Code reopens such sessions. `blockedInTerminal`: `claude agents` lists the
+    /// session as blocked, which for one that never answered means a question in its terminal holds up its start.
+    public static func blocker(cwd: String?, home: String, answered: Bool?, homeFolderRefused: Bool,
+                               blockedInTerminal: Bool = false) -> ResumeBlocker? {
         if homeFolderRefused, let cwd, isHomeFolder(cwd, home: home) { return .homeFolder }
-        if answered == false { return .noTranscript }
+        if answered == false { return blockedInTerminal ? .waitingInTerminal : .noTranscript }
         return nil
     }
+
+    /// Whether `claude agents` lists the session as waiting on a person (its `state`).
+    public static func isBlocked(_ agent: AgentInfo) -> Bool { agent.state == Constants.ClaudeCLI.blockedState }
 
     /// Reads Claude Code's output from a resume that exited with an error. Nil when it says nothing known.
     public static func classify(_ output: String) -> (blocker: ResumeBlocker, messageSaved: Bool)? {
@@ -220,7 +246,7 @@ enum ImageFile {
     static func load(_ path: String) throws -> Loaded {
         let url = URL(fileURLWithPath: path)
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attrs[.type] as? FileAttributeType == .typeRegular else { throw DeliveryError.image("not a readable regular file: \(path)") }
+              attrs[.type] as? FileAttributeType == .typeRegular else { throw DeliveryError.imageMissing(path) }
         guard let size = attrs[.size] as? Int, size > 0, size <= Constants.Limits.maxImageBytes else {
             throw DeliveryError.image("size must be between 1 byte and \(Constants.Limits.maxImageBytes) bytes")
         }
@@ -246,7 +272,7 @@ enum ImageFile {
     /// Checks that a dropped file can be sent: a readable regular file within the size limit.
     static func checkFile(_ path: String) throws {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              attrs[.type] as? FileAttributeType == .typeRegular else { throw DeliveryError.file("not a readable regular file: \(path)") }
+              attrs[.type] as? FileAttributeType == .typeRegular else { throw DeliveryError.fileMissing(path) }
         guard let size = attrs[.size] as? Int, size <= Constants.Limits.maxFileBytes else {
             throw DeliveryError.file("\((path as NSString).lastPathComponent) is larger than \(Constants.Limits.maxFileBytes) bytes")
         }
@@ -302,11 +328,18 @@ enum ImageFile {
         return nil
     }
 
-    /// The message text for routes that reference the image and files by path.
-    static func messageText(text: String?, imagePath: String?, filePaths: [String] = []) -> String {
+    /// The message text for routes that reference the images and files by path. One image keeps the line it always
+    /// had; several are numbered in the order they were taken, so the session reads them in that order.
+    static func messageText(text: String?, imagePaths: [String], filePaths: [String] = []) -> String {
         var parts: [String] = []
         if let text, !text.isEmpty { parts.append(text) }
-        if let imagePath { parts.append("[Screenshot from Sidemoon: \(imagePath) - read this image file to see it.]") }
+        if imagePaths.count == 1, let only = imagePaths.first {
+            parts.append("[Screenshot from Sidemoon: \(only) - read this image file to see it.]")
+        } else {
+            parts += imagePaths.enumerated().map { index, path in
+                "[Screenshot \(index + 1) of \(imagePaths.count) from Sidemoon: \(path) - read this image file to see it.]"
+            }
+        }
         parts += filePaths.map { "[File from Sidemoon: \($0) - read this file.]" }
         return parts.joined(separator: "\n\n")
     }

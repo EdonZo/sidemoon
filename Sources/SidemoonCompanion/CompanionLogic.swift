@@ -28,6 +28,20 @@ public enum CompanionError: Equatable, Sendable {
     case notPickedUp(fallback: Route?)
     /// The session's folder was moved or deleted, so Claude Code cannot reopen the session there.
     case folderGone(String)
+    /// A screenshot to send was no longer there. `detail` (with its path) is only for a bug report.
+    case captureMissing(detail: String?)
+    /// A file to send was no longer there, or could not be read. `detail` (with its path) is only for a bug report.
+    case fileMissing(detail: String?)
+
+    /// What stays under a message that failed, in the thread. A failure with no words of its own keeps the
+    /// engine's reason there, shortened: the error card is replaced by the next thing that happens, and without
+    /// this "Sending failed" would be all that is left to go on.
+    public var threadNote: String {
+        guard case let .delivery(reason) = self else { return title }
+        let limit = CompanionConstants.Messages.threadReasonCharacters
+        let short = reason.count > limit ? String(reason.prefix(limit)) + "…" : reason
+        return "\(title): \(short)"
+    }
 
     public var title: String {
         switch self {
@@ -35,6 +49,8 @@ public enum CompanionError: Equatable, Sendable {
         case let .cannotReach(blocker, _, _, _): return Design.Copy.Unreachable.title(blocker)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelTitle
         case .folderGone: return Design.Copy.Unreachable.folderGoneTitle
+        case .captureMissing: return Design.Copy.Captures.missingTitle
+        case .fileMissing: return Design.Copy.Captures.fileMissingTitle
         case .noTarget: return "No session chosen"
         case .engineConflict: return "Another Sidemoon engine is running"
         case .engineFailed: return "The Sidemoon engine could not start"
@@ -56,6 +72,8 @@ public enum CompanionError: Equatable, Sendable {
             return Design.Copy.Unreachable.advice(blocker, messageSaved: saved, stoppedFirst: stopped)
         case .needsLauncher: return Design.Copy.Unreachable.noChannelAdvice
         case let .folderGone(folder): return Design.Copy.Unreachable.folderGoneAdvice(folder)
+        case .captureMissing: return Design.Copy.Captures.missingAdvice
+        case .fileMissing: return Design.Copy.Captures.fileMissingAdvice
         case let .notPickedUp(fallback): return Design.Copy.Unreachable.notPickedUpAdvice(retryGoesInBackground: fallback == .background)
         case .noTarget:
             return "Open the menu and choose which Claude Code session should get your screenshots."
@@ -96,6 +114,7 @@ public enum CompanionError: Equatable, Sendable {
         case .homeFolder, .untrustedFolder: return [.copyResumeCommand, .chooseAnotherSession]
         case .loginNeeded: return [.runLogin, .copyResumeCommand, .chooseAnotherSession]
         case .noTranscript: return [.chooseAnotherSession]
+        case .waitingInTerminal: return [.attachInTerminal, .chooseAnotherSession]
         }
     }
 
@@ -105,13 +124,18 @@ public enum CompanionError: Equatable, Sendable {
         if case .cannotReach = self { return false }
         if self == .needsLauncher { return false }
         if case .folderGone = self { return false }
+        // Sending again cannot bring back what is gone.
+        if case .captureMissing = self { return false }
+        if case .fileMissing = self { return false }
         return true
     }
 
     /// The technical reason behind the plain words, for a bug report; nil when there is nothing more to say.
     public var detail: String? {
-        if case let .cannotReach(_, _, _, detail) = self { return detail }
-        return nil
+        switch self {
+        case let .cannotReach(_, _, _, detail), let .captureMissing(detail), let .fileMissing(detail): return detail
+        default: return nil
+        }
     }
 
     /// Maps an engine result to a companion error. Only called for failed results.
@@ -127,6 +151,9 @@ public enum CompanionError: Equatable, Sendable {
         case .replyTimeout?: return .replyTimeout
         case .forked?: return .forked
         case let .channelIgnored(fallback)?: return .notPickedUp(fallback: fallback)
+        // Never the path: plain words, the technical text for a bug report.
+        case .imageMissing?: return .captureMissing(detail: [result.error, result.detail].compactMap { $0 }.joined(separator: "\n"))
+        case .fileMissing?: return .fileMissing(detail: [result.error, result.detail].compactMap { $0 }.joined(separator: "\n"))
         default: return .delivery(result.error ?? "The engine did not say why.")
         }
     }
@@ -143,6 +170,8 @@ public enum Remedy: Equatable, Sendable, Hashable {
     case runLogin
     /// Turn on Setup's "Connect every claude", so the next plain `claude` typed in a terminal can be reached.
     case connectEveryClaude
+    /// Show the background session itself in Terminal (`claude attach <short id>`), where it waits on a question.
+    case attachInTerminal
 }
 
 /// The "Try it" guide: three things to do once, each ticked when the user has really done it.
@@ -279,6 +308,30 @@ public struct CompanionStatus: Equatable, Sendable {
     }
 }
 
+// MARK: - Paste
+
+/// What Command-V in the composer does with what is on the clipboard.
+public enum PasteContent: Equatable, Sendable {
+    /// Pasted into the text field as usual.
+    case text
+    /// Files copied in the Finder: added to the message like dropped files.
+    case files([URL])
+    /// Image data (a screenshot copied to the clipboard): written to a file and added like a capture. `type` is the
+    /// clipboard type to read it from.
+    case image(type: String)
+
+    /// Decided from a description of the clipboard, so it can be tested without one. `types`: its type identifiers;
+    /// `fileURLs`: the file URLs it holds. Files come first (the Finder adds their names as text); then text, which
+    /// is pasted exactly as before; an image only when no text comes with it.
+    public static func of(types: [String], fileURLs: [URL]) -> PasteContent {
+        let p = CompanionConstants.Paste.self
+        if !fileURLs.isEmpty { return .files(fileURLs) }
+        if types.contains(where: p.textTypes.contains) { return .text }
+        if let image = p.imageTypes.first(where: types.contains) { return .image(type: image) }
+        return .text
+    }
+}
+
 // MARK: - Held capture (note grace period)
 
 /// Waits for a duration. Injected so tests drive the countdown without real waiting.
@@ -315,6 +368,45 @@ public struct NoteCountdown: Equatable, Sendable {
     public mutating func tick() { elapsedTicks = min(totalTicks, elapsedTicks + 1) }
 }
 
+/// The captures waiting to go out in one message, in the order they were taken. Each press of a capture shortcut
+/// while they wait adds one, up to `limit`.
+public struct PendingCaptures: Equatable, Sendable {
+    public private(set) var urls: [URL] = []
+    public let limit: Int
+
+    public init(limit: Int = CompanionConstants.Capture.maxPerMessage) { self.limit = limit }
+
+    public var isEmpty: Bool { urls.isEmpty }
+    public var count: Int { urls.count }
+    public var isFull: Bool { urls.count >= limit }
+
+    /// Adds a capture at the end. False (nothing changes) when full or already there.
+    @discardableResult
+    public mutating func add(_ url: URL) -> Bool {
+        guard !isFull, !urls.contains(url) else { return false }
+        urls.append(url)
+        return true
+    }
+
+    /// Takes one out, keeping the order of the others. False when it was not there.
+    @discardableResult
+    public mutating func remove(_ url: URL) -> Bool {
+        guard let index = urls.firstIndex(of: url) else { return false }
+        urls.remove(at: index)
+        return true
+    }
+
+    public mutating func removeAll() { urls = [] }
+
+    /// How each capture is named on its chip and in the thread, in order.
+    public var names: [String] {
+        urls.indices.map { CompanionConstants.Messages.captureAttachmentName(number: $0 + 1, of: urls.count) }
+    }
+
+    /// The text that goes with them when nothing is typed.
+    public var defaultText: String { CompanionConstants.Messages.defaultCaptureText(count: urls.count) }
+}
+
 /// What happens to a held capture.
 public enum HeldCaptureDecision: Equatable, Sendable {
     /// Send it; nil or empty note means the default message.
@@ -342,6 +434,10 @@ public struct SessionRow: Identifiable, Equatable, Sendable {
     public var hidden = false
     /// A `claude --bg` session: "Open in Terminal" attaches to it.
     public var isBackground = false
+    /// General or another chat: no folder, nothing to open in Terminal.
+    public var isChat = false
+    /// Everything but General can be hidden.
+    public var canHide: Bool { TargetRule.canHide(id) }
     /// Whether a message can get to it at all. A busy session still counts: messages wait for it.
     public var reachable: Bool { reachability == .reachable }
     /// Why Claude Code would refuse it; nil when nothing is known to stand in the way.
@@ -373,18 +469,57 @@ public enum Reachability: Equatable, Sendable {
     case folderGone
 }
 
+/// Where messages go. A message only ever goes to the session shown as the target, and the target changes only
+/// when the user picks another session or starts one: never on its own, whatever becomes of the chosen session
+/// (unreachable, ended, hidden, gone, after an error or a restart). General is chosen without the user only when
+/// nothing was ever chosen.
+public enum TargetRule {
+    public static var general: String { Constants.Chat.generalId }
+
+    /// The target when the companion starts: the saved choice, else General.
+    public static func initial(saved: String?) -> String { saved ?? general }
+
+    /// General is always there: it cannot be hidden.
+    public static func canHide(_ id: String) -> Bool { id != general }
+}
+
+/// The name of a new chat: the start of its first message.
+public enum ChatNaming {
+    /// The first words of the message, on one line, cut at a word to `CompanionConstants.Chat.nameCharacters`.
+    public static func name(from message: String) -> String {
+        let limit = CompanionConstants.Chat.nameCharacters
+        let words = message.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        var name = ""
+        for word in words {
+            let next = name.isEmpty ? word : name + " " + word
+            if next.count > limit {
+                if name.isEmpty { name = String(word.prefix(limit)) }
+                return name + CompanionConstants.Chat.nameEllipsis
+            }
+            name = next
+        }
+        return name.isEmpty ? Design.Copy.NewSession.chatHeading : name
+    }
+}
+
 public enum SessionList {
-    /// Name, else the folder it runs in, else its short id.
+    /// General's own name; else its name, else the folder it runs in, else its short id.
     public static func displayName(_ s: Session) -> String {
+        if s.id == TargetRule.general { return Design.Copy.Chat.general }
         if let name = s.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty { return name }
         if let folder = folderName(s) { return folder }
         return SessionID.short(s.id)
     }
 
     public static func folderName(_ s: Session) -> String? {
-        guard let cwd = s.cwd, !cwd.isEmpty else { return nil }
+        guard s.kind != .chat, let cwd = s.cwd, !cwd.isEmpty else { return nil }
         let last = (cwd as NSString).lastPathComponent
         return last.isEmpty ? cwd : last
+    }
+
+    /// A chat says it is one while it is ready; working is working for any session.
+    public static func stateText(_ s: Session) -> String {
+        s.kind == .chat && s.state != .working ? Design.Copy.Chat.kind : stateText(s.state)
     }
 
     public static func stateText(_ state: SessionState) -> String {
@@ -405,7 +540,7 @@ public enum SessionList {
     /// The channel reaches a session wherever it runs; any other route reopens it in its folder, so a session whose
     /// folder is gone is out of reach, and a background session is when Claude Code would refuse to reopen it.
     public static func reachability(_ s: Session, checks: PathChecks = .everythingExists) -> Reachability {
-        if s.channelConnected { return .reachable }
+        if s.channelConnected || s.kind == .chat { return .reachable }
         if let cwd = s.cwd, !cwd.isEmpty, !checks.folderExists(cwd) { return .folderGone }
         if s.kind == .background, let blocker = s.blocker { return .blocked(blocker) }
         if !s.routes.isEmpty || s.kind == .background { return .reachable }
@@ -425,15 +560,18 @@ public enum SessionList {
                             checks: PathChecks = .everythingExists) -> [SessionRow] {
         sessions
             .filter { (showEnded || $0.state != .ended) && (showHidden || !hidden.contains($0.id)) }
+            // General first, then the most recently active.
             .sorted { a, b in
+                if (a.id == TargetRule.general) != (b.id == TargetRule.general) { return a.id == TargetRule.general }
                 let ta = a.activityAt ?? .distantPast, tb = b.activityAt ?? .distantPast
                 return ta != tb ? ta > tb : a.id < b.id
             }
             .map { s in
-                var row = SessionRow(id: s.id, title: displayName(s), folder: folderName(s), stateText: stateText(s.state),
+                var row = SessionRow(id: s.id, title: displayName(s), folder: folderName(s), stateText: stateText(s),
                                      reachability: reachability(s, checks: checks), ended: s.state == .ended, state: s.state)
                 row.hidden = hidden.contains(s.id)
                 row.isBackground = s.kind == .background
+                row.isChat = s.kind == .chat
                 return row
             }
     }

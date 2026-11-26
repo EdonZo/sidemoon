@@ -97,6 +97,10 @@ public final class CompanionModel {
     /// before that, the way to install it is.
     public func remedies(for error: CompanionError) -> [Remedy] {
         var remedies = error.remedies.map { $0 == .copyResumeCommand && !terminalCommandInstalled ? .installTerminalCommand : $0 }
+        // A chat has no terminal to reopen it in.
+        if target?.kind == .chat {
+            remedies.removeAll { [.copyResumeCommand, .installTerminalCommand, .attachInTerminal].contains($0) }
+        }
         if error == .needsLauncher, !connectsEveryClaude, let last = remedies.indices.last {
             // Before "Choose another session", which stays the last way out.
             remedies.insert(.connectEveryClaude, at: last)
@@ -110,6 +114,14 @@ public final class CompanionModel {
         let id = errorSessionId ?? targetId
         let session = sessions.first { $0.id == id }
         let plan = TerminalReopen.plan(sessionId: id, folder: session?.cwd, launcher: launcherPath, checks: pathChecks)
+        if case let .folderGone(folder) = plan { status.handle(.failed(.folderGone(folder))) }
+        return plan
+    }
+
+    /// "Open in Terminal" for a background session the error is about that waits on a question: Claude Code's own
+    /// `claude attach`, which shows the session with its question. A gone folder is explained in place of the error.
+    public func attachInTerminal() -> TerminalReopen.Plan {
+        let plan = terminalPlan(for: errorSessionId ?? targetId ?? "")
         if case let .folderGone(folder) = plan { status.handle(.failed(.folderGone(folder))) }
         return plan
     }
@@ -175,7 +187,7 @@ public final class CompanionModel {
     public func sendTestMessage() async {
         guard preflight() else { return }
         let text = CompanionConstants.Guide.testMessage
-        await deliver(to: targetId, text: text, shown: text, imagePath: nil, files: [], attachments: [])
+        await deliver(to: targetId, text: text, shown: text, imagePaths: [], files: [], attachments: [])
     }
     /// True while the note field is showing (the second hotkey).
     public private(set) var isEditingNote = false
@@ -183,14 +195,15 @@ public final class CompanionModel {
         // Typing anything while a held capture counts down stops the countdown for good.
         didSet { if !noteDraft.isEmpty, noteCountdown != nil { stopCountdown() } }
     }
-    /// The active-window capture waiting for an optional note; nil when nothing is held.
-    public private(set) var heldCapture: URL?
+    /// The captures waiting for an optional note, in the order taken; empty when none is held. A capture shortcut
+    /// pressed while they wait adds another one to the same message.
+    public private(set) var heldCaptures = PendingCaptures()
     /// Counts down to sending the held capture without a note; nil once the user typed or nothing is held.
     public private(set) var noteCountdown: NoteCountdown?
     /// Dropped files waiting for an optional note; empty when none are held. Never moved or deleted.
     public private(set) var heldFiles: [URL] = []
     /// True while a capture or dropped files wait in the note window.
-    public var isHoldingCapture: Bool { heldCapture != nil || !heldFiles.isEmpty }
+    public var isHoldingCapture: Bool { !heldCaptures.isEmpty || !heldFiles.isEmpty }
     /// The running conversation with each session.
     public private(set) var threads = Threads() {
         didSet { if archive != nil { scheduleSave() } }
@@ -220,6 +233,7 @@ public final class CompanionModel {
 
     /// Empties every conversation, on screen and on disk.
     public func clearThreads() {
+        discardKeptCaptures()
         threads = Threads()
         unreadSessions = []
         flushThreads()
@@ -427,6 +441,10 @@ public final class CompanionModel {
     @ObservationIgnored private var activeSends: Set<String> = []
     /// The files that were held when the last hold was resolved.
     @ObservationIgnored private var resolvedFiles: [URL] = []
+    /// The captures that were held when the last hold was resolved, in order.
+    @ObservationIgnored private var resolvedCaptures: [URL] = []
+    /// A capture is being added to the held ones right now.
+    @ObservationIgnored private var isAddingCapture = false
     /// The session the user chose, as saved. The target can differ from it while Sidemoon picks one by itself.
     @ObservationIgnored private var savedTarget: String?
     /// The target was picked by Sidemoon, not by the user, and is not saved.
@@ -435,7 +453,7 @@ public final class CompanionModel {
     @ObservationIgnored private var userHasActed = false
 
     public init(engine: CompanionEngine, capture: CaptureProvider, windowCapture: CaptureProvider? = nil,
-                store: CaptureStore = CaptureStore(), defaults: UserDefaults = .standard,
+                store: CaptureStore, defaults: UserDefaults = .standard,
                 archive: ThreadArchive? = nil, sleeper: @escaping Sleeper = Sleepers.system,
                 pathChecks: PathChecks = .everythingExists) {
         self.engine = engine
@@ -451,7 +469,9 @@ public final class CompanionModel {
         self.defaults = defaults
         self.sleeper = sleeper
         let savedChoice = defaults.string(forKey: CompanionConstants.Defaults.targetSession)
-        self.targetId = savedChoice
+        // The user's choice, whatever has become of it; General only when nothing was ever chosen (`TargetRule`).
+        self.targetId = TargetRule.initial(saved: savedChoice)
+        self.targetIsAutomatic = savedChoice == nil
         self.savedTarget = savedChoice
         self.hidden = HiddenSessions(data: defaults.data(forKey: CompanionConstants.Defaults.hiddenSessions))
         self.isGuideOpen = !defaults.bool(forKey: CompanionConstants.Defaults.guideClosed)
@@ -539,7 +559,6 @@ public final class CompanionModel {
     private func reloadSessions() {
         sessions = engine.sessions()
         pruneHidden()
-        chooseDefaultTarget()
         for s in sessions { if let r = s.lastReply { threads.appendReply(r, to: s.id, stamp: s.lastReplyAt) } }
         if let t = target {
             knownTargetReply = t.lastReply
@@ -552,7 +571,6 @@ public final class CompanionModel {
     func apply(_ session: Session) {
         let previous = sessions.first { $0.id == session.id }
         if let i = sessions.firstIndex(where: { $0.id == session.id }) { sessions[i] = session } else { sessions.append(session) }
-        chooseDefaultTarget()
         // Every session's replies are kept, so its thread is there when the user switches to it.
         var newAnswer = false
         if let reply = session.lastReply {
@@ -571,6 +589,12 @@ public final class CompanionModel {
         }
         // A session Sidemoon started: from here its own state, or its answer, says whether it is working.
         if awaitingFirstAnswer.contains(session.id), newAnswer || session.state != .idle { awaitingFirstAnswer.remove(session.id) }
+        // Or it never got going: Claude Code asks something in its terminal first. Waiting for its answer would be
+        // waiting forever, so the user is told, with the way to answer it.
+        if awaitingFirstAnswer.contains(session.id), session.blocker == .waitingInTerminal {
+            awaitingFirstAnswer.remove(session.id)
+            if session.id == targetId { status.handle(.failed(.cannotReach(.waitingInTerminal, messageSaved: false, detail: nil))) }
+        }
         guard session.id == targetId else { return }
         if session.state == .working, knownTargetState != .working { status.handle(.targetStartedWorking) }
         knownTargetState = session.state
@@ -590,24 +614,6 @@ public final class CompanionModel {
     }
 
     // MARK: Target
-
-    /// Until the user chooses or sends, the target is the saved choice when it can be reached, else the most
-    /// recently active session that can. A pick of Sidemoon's own is not saved, so the user's choice comes
-    /// back as soon as that session shows up again.
-    private func chooseDefaultTarget() {
-        guard !userHasActed else { return }
-        let all = SessionList.rows(sessions, showEnded: true, hidden: hidden.ids, checks: pathChecks)
-        // A hidden session is not in `all`, so it never counts as reachable here.
-        func reachable(_ id: String?) -> Bool { all.contains { $0.id == id && $0.reachable } }
-        if let saved = savedTarget, reachable(saved) {
-            if targetId != saved { switchTarget(to: saved, automatic: false) }
-            return
-        }
-        // Nothing listed yet, or already on a session that can be reached.
-        guard !all.isEmpty, !reachable(targetId),
-              let pick = SessionList.defaultTarget(sessions, hidden: hidden.ids, checks: pathChecks), pick != targetId else { return }
-        switchTarget(to: pick, automatic: true)
-    }
 
     /// The user's choice from the session list. A session Claude Code would refuse, or a terminal session started
     /// without sidemoon-claude, does not become the target: the reason and what to do about it are shown instead.
@@ -671,18 +677,6 @@ public final class CompanionModel {
         }
     }
 
-    /// No target: nothing is chosen, and nothing waits for one.
-    private func clearTarget() {
-        discardHeldCapture()
-        targetId = nil
-        targetIsAutomatic = true
-        knownTargetReply = nil
-        knownTargetState = nil
-        latestReply = nil
-        latestReplyAt = nil
-        status.unseenReply = false
-    }
-
     // MARK: Hidden sessions
 
     /// Sessions hidden from the list. Only Sidemoon's list changes: nothing is run against the session.
@@ -709,26 +703,16 @@ public final class CompanionModel {
         saveHidden()
     }
 
-    /// Hides a session from the list. Hiding the target moves the target to the default choice. "Undo" shows for
-    /// `Hidden.undoSeconds`.
+    /// Hides a session from the list. The target stays what it is even when it is the one hidden: messages only
+    /// ever go where the header says, and that changes only when the user picks another. General cannot be hidden.
+    /// "Undo" shows for `Hidden.undoSeconds`.
     public func hideSession(_ id: String) {
-        guard !hidden.contains(id) else { return }
+        guard !hidden.contains(id), TargetRule.canHide(id) else { return }
         let wasTarget = id == targetId
         let rowIds = rows.map(\.id)
         recentlyHidden = HiddenUndo(sessionId: id, wasTarget: wasTarget, targetWasAutomatic: targetIsAutomatic)
         hidden.hide(id)
         saveHidden()
-        if wasTarget {
-            if savedTarget == id {
-                savedTarget = nil
-                defaults.removeObject(forKey: CompanionConstants.Defaults.targetSession)
-            }
-            if let pick = SessionList.defaultTarget(sessions, hidden: hidden.ids, checks: pathChecks) {
-                switchTarget(to: pick, automatic: true)
-            } else {
-                clearTarget()
-            }
-        }
         // The arrow keys stay on the row that took its place.
         if highlightedSession == id, let index = rowIds.firstIndex(of: id) {
             let remaining = rows.map(\.id)
@@ -750,9 +734,6 @@ public final class CompanionModel {
         recentlyHidden = nil
         hidden.unhide(undo.sessionId)
         saveHidden()
-        if undo.wasTarget, sessions.contains(where: { $0.id == undo.sessionId }) {
-            switchTarget(to: undo.sessionId, automatic: undo.targetWasAutomatic)
-        }
     }
 
     /// Puts a hidden session back in the list (the Unhide button, or the session coming back by itself).
@@ -797,7 +778,10 @@ public final class CompanionModel {
         FolderNote.of(newSession.folder, home: homeFolder, homeRefused: homeFolderRefused, checks: pathChecks)
     }
 
-    public var canStartNewSession: Bool { newSession.canStart(note: newSessionFolderNote) }
+    public var canStartNewSession: Bool { newSession.canStart(note: newSession.inFolder ? newSessionFolderNote : nil) }
+
+    /// "Work in a folder…", or back to a chat.
+    public func setNewSessionInFolder(_ on: Bool) { newSession.setInFolder(on) }
 
     /// Opens the form, with the last folder used (or the most recent one) chosen.
     public func openNewSession() {
@@ -834,11 +818,13 @@ public final class CompanionModel {
     /// like any other. On failure the form says why and keeps what was typed.
     public func startNewSession() async {
         guard engineState == .running else { preflight(); return }
+        guard newSession.inFolder else { await startNewChat(); return }
         guard newSession.begin(note: newSessionFolderNote), let folder = newSession.folder else { return }
         userHasActed = true
         let text = newSession.trimmedMessage
         let request = NewSessionRequest(folder: folder, text: text,
-                                        styleNote: shortReplies ? CompanionConstants.Messages.replyStyleNote : nil)
+                                        styleNote: shortReplies ? CompanionConstants.Messages.replyStyleNote : nil,
+                                        name: NewSessionForm.defaultName(for: folder))
         let engine = self.engine
         let result = await Task.detached { engine.startSession(request) }.value
         guard result.ok, let id = result.sessionId else {
@@ -859,6 +845,21 @@ public final class CompanionModel {
         closeSessionList()
         selectTarget(id)
         requestComposerFocus()
+    }
+
+    /// The "+" without a folder: a new chat, named after its first message, becomes the target, and the message is
+    /// sent to it like any other.
+    private func startNewChat() async {
+        guard newSession.canStart(note: nil) else { return }
+        let text = newSession.trimmedMessage
+        let id = engine.newChat(name: ChatNaming.name(from: text))
+        sessions = engine.sessions()
+        isCreatingSession = false
+        newSession = NewSessionForm()
+        closeSessionList()
+        selectTarget(id)
+        requestComposerFocus()
+        await deliverTyped(to: id, text)
     }
 
     /// Shows the session as working until its own state or its answer takes over, at most the reply timeout.
@@ -940,15 +941,25 @@ public final class CompanionModel {
     /// Region capture, then send to the target and wait for its reply. Escape sends nothing.
     /// With `hold`, the capture waits in the note window first, so it can still be undone.
     public func captureAndSend(note: String? = nil, hold: Bool = false) async {
+        // Something waits to be sent: this capture joins it.
+        if heldDecision != nil { await addCapture(with: captureProvider); return }
         if hold, isEditingNote { isExpanded = true; return }
         await capture(with: captureProvider, note: note, holdForNote: hold)
     }
 
-    /// Takes one waiting file back out; removing the last one cancels the send.
+    /// Takes one waiting file back out; removing the last thing waiting cancels the send.
     public func removeHeldFile(_ url: URL) {
         guard heldFiles.contains(url) else { return }
-        if heldFiles.count == 1 { discardHeldCapture(); return }
+        if heldFiles.count + heldCaptures.count == 1 { discardHeldCapture(); return }
         heldFiles.removeAll { $0 == url }
+    }
+
+    /// Takes one waiting capture back out (its file is deleted); removing the last thing waiting cancels the send.
+    public func removeHeldCapture(_ url: URL) {
+        guard heldCaptures.urls.contains(url) else { return }
+        if heldFiles.count + heldCaptures.count == 1 { discardHeldCapture(); return }
+        heldCaptures.remove(url)
+        store.remove(url)
     }
 
     /// Captures the front-most window of the user's app first (while it is still front-most), then holds it
@@ -956,6 +967,8 @@ public final class CompanionModel {
     /// Return sends at once, Escape discards, and an untouched field sends it with the default message.
     /// Sends nothing when there is no such window. Returns once the capture is sent or discarded.
     public func captureActiveWindowAndSend() async {
+        // Something waits to be sent: this capture joins it (scrolling a long page and pressing again).
+        if heldDecision != nil, let windowCaptureProvider { await addCapture(with: windowCaptureProvider); return }
         // One capture at a time, including a region note being written.
         if isEditingNote { isExpanded = true; return }
         guard let windowCaptureProvider else {
@@ -976,21 +989,53 @@ public final class CompanionModel {
         resolveHeldCapture(.discard)
     }
 
-    private func hold(capture: URL?, files: [URL]) async -> HeldCaptureDecision {
+    /// Holds captures and files for a note. `countsDown`: an untouched field sends them when the grace period is
+    /// over (a shortcut or a drop). A paste does not: what is typed so far stays, and Return sends.
+    private func hold(captures: [URL], files: [URL], countsDown: Bool = true) async -> HeldCaptureDecision {
         status.handle(.captureHeld)
-        heldCapture = capture
+        heldCaptures = PendingCaptures()
+        captures.forEach { heldCaptures.add($0) }
         heldFiles = files
         // What is waiting to be sent takes the place of the session list and the settings.
         closeSessionList()
         closeSettings()
-        noteDraft = ""
-        noteCountdown = NoteCountdown()
+        if countsDown { noteDraft = "" }
+        noteCountdown = countsDown ? NoteCountdown() : nil
         isEditingNote = true
         openBubble()
         return await withCheckedContinuation { continuation in
             heldDecision = continuation
-            startCountdown()
+            if noteCountdown != nil { startCountdown() }
         }
+    }
+
+    /// Another capture while some wait: it joins the same message, after the others. The countdown pauses while it
+    /// is taken (a region takes a moment to pick) and then starts again from the full time, so there is time to
+    /// scroll and capture again. Full, or already taking one: nothing happens, and nothing is sent early. A capture
+    /// that fails or is cancelled here leaves what waits as it was.
+    private func addCapture(with provider: CaptureProvider) async {
+        isExpanded = true
+        guard !heldCaptures.isFull, !isAddingCapture else { return }
+        isAddingCapture = true
+        defer { isAddingCapture = false }
+        let wasCounting = noteCountdown != nil
+        stopCountdown()
+        let file = store.newFileURL()
+        var added = false
+        do {
+            try store.prepare()
+            // Sent or discarded meanwhile: this capture is not part of anything any more.
+            if case let .captured(url) = try await provider.capture(into: file), heldDecision != nil {
+                added = heldCaptures.add(url)
+            }
+        } catch {}
+        if !added { store.remove(file) }
+        if heldDecision != nil, wasCounting, noteDraft.isEmpty { restartCountdown() }
+    }
+
+    private func restartCountdown() {
+        noteCountdown = NoteCountdown()
+        startCountdown()
     }
 
     private func startCountdown() {
@@ -1022,23 +1067,25 @@ public final class CompanionModel {
 
     private func resolveHeldCapture(_ decision: HeldCaptureDecision) {
         guard let continuation = heldDecision else { return }
-        let capture = heldCapture
+        let captures = heldCaptures.urls
         heldDecision = nil
-        heldCapture = nil
+        heldCaptures.removeAll()
+        resolvedCaptures = captures
         resolvedFiles = heldFiles
         heldFiles = []
         stopCountdown()
         isEditingNote = false
         noteDraft = ""
         if decision == .discard {
-            // Only the temporary capture is deleted; dropped files belong to the user.
-            if let capture { store.remove(capture) }
+            // Only the temporary captures are deleted; dropped files belong to the user.
+            captures.forEach(store.remove)
             status.handle(.heldCaptureDiscarded)
         }
         continuation.resume(returning: decision)
     }
 
     private func capture(with provider: CaptureProvider, note: String?, holdForNote hold: Bool = false) async {
+        if heldDecision != nil { await addCapture(with: provider); return }
         guard preflight() else { return }
         status.handle(.captureBegan)
         let file = store.newFileURL()
@@ -1049,11 +1096,9 @@ public final class CompanionModel {
                 store.remove(file)
                 status.handle(.captureCancelled)
             case let .captured(url):
-                guard hold else { await send(imageAt: url, note: note); return }
-                switch await self.hold(capture: url, files: []) {
-                case let .send(typed): await send(imageAt: url, note: typed)
-                case .discard: store.remove(url)
-                }
+                guard hold else { await sendCaptures([url], files: [], note: note); return }
+                // Discarding deletes every held capture; sending takes whatever waited by then.
+                if case let .send(typed) = await self.hold(captures: [url], files: []) { await sendResolved(note: typed) }
             }
         } catch let error as CaptureError where error == .noActiveWindow {
             store.remove(file)
@@ -1067,27 +1112,125 @@ public final class CompanionModel {
     /// Sends an image file to the target and waits for the reply off the main thread.
     /// The file is deleted afterwards, whatever the outcome.
     public func send(imageAt url: URL, note: String?) async {
-        defer { store.remove(url) }
+        await sendCaptures([url], files: [], note: note)
+    }
+
+    /// Sends what was held when the hold was resolved: every capture in the order taken, the files, the note.
+    private func sendResolved(note: String?) async {
+        let captures = resolvedCaptures, files = resolvedFiles
+        resolvedCaptures = []
+        resolvedFiles = []
+        await sendCaptures(captures, files: files, note: note)
+    }
+
+    /// One message with captures and files (never touched). Without a note the default words go along; the thread
+    /// then shows only the attachments. The captures are deleted once the message is delivered, or when it failed in a
+    /// way sending again cannot fix. A failure that Retry can fix keeps them with the failed entry (`kept`), so Retry
+    /// sends the same message again.
+    private func sendCaptures(_ captures: [URL], files: [URL], note: String?) async {
         let typed = note.flatMap { $0.isEmpty ? nil : $0 }
-        let sent = await deliver(to: targetId, text: typed ?? CompanionConstants.Messages.defaultCaptureText, shown: typed ?? "",
-                                 imagePath: url.path, files: [], attachments: [CompanionConstants.Messages.captureAttachmentName])
-        if sent { tickGuide { $0.sentCapture = true } }
+        let fallback = captures.isEmpty ? CompanionConstants.Messages.defaultFilesText
+            : CompanionConstants.Messages.defaultCaptureText(count: captures.count)
+        let names = captures.indices.map { CompanionConstants.Messages.captureAttachmentName(number: $0 + 1, of: captures.count) }
+        let session = targetId
+        let outcome = await deliver(to: session, text: typed ?? fallback, shown: typed ?? "", imagePaths: captures.map(\.path),
+                                    files: files, attachments: names + files.map(\.lastPathComponent))
+        if outcome.delivered, !captures.isEmpty { tickGuide { $0.sentCapture = true } }
+        if !outcome.delivered, !captures.isEmpty, outcome.error?.canRetry == true, let entry = outcome.entry, let session {
+            keep(KeptMessage(session: session, captures: captures, files: files, note: typed), for: entry)
+        } else {
+            captures.forEach(store.remove)
+        }
+    }
+
+    // MARK: Captures kept for Retry
+
+    /// A message with captures that failed in a way Retry can fix: what it carried, so Retry sends it again as it was.
+    struct KeptMessage: Equatable {
+        let session: String
+        /// In the order taken. In this run's capture folder; deleted with the message.
+        let captures: [URL]
+        /// The user's own files, never touched.
+        let files: [URL]
+        /// What the user typed; nil when only the default words went along.
+        let note: String?
+    }
+
+    /// The failed messages whose captures are kept, by thread entry, oldest first. In memory only: after a restart
+    /// the entries show as failed without Retry, and the next launch's cleanup removes the files.
+    @ObservationIgnored private var kept: [(entry: UUID, message: KeptMessage)] = []
+    /// The thread entries whose captures are kept, for the view's Retry.
+    public private(set) var keptEntries: Set<UUID> = []
+
+    private func keep(_ message: KeptMessage, for entry: UUID) {
+        kept.append((entry, message))
+        keptEntries.insert(entry)
+        // Screenshots must not pile up: the oldest beyond the limit lose theirs.
+        while kept.count > CompanionConstants.Capture.maxKeptMessages { dropKept(kept[0].entry) }
+    }
+
+    /// Forgets a failed message's kept captures and deletes them.
+    private func dropKept(_ entry: UUID) {
+        guard let index = kept.firstIndex(where: { $0.entry == entry }) else { return }
+        kept[index].message.captures.forEach(store.remove)
+        kept.remove(at: index)
+        keptEntries.remove(entry)
+    }
+
+    /// Deletes every kept capture: the conversations are cleared, or the app quits.
+    public func discardKeptCaptures() {
+        for item in kept { item.message.captures.forEach(store.remove) }
+        kept = []
+        keptEntries = []
+    }
+
+    /// Whether a thread entry offers Retry: a typed message, or a message whose captures are kept.
+    public func canRetry(_ entry: ThreadEntry) -> Bool {
+        if entry.canRetry { return true }
+        guard entry.role == .you, case .failed = entry.delivery else { return false }
+        return keptEntries.contains(entry.id)
     }
 
     /// A typed message to a session that has answered before is a reply: the guide's last step.
     private func deliverTyped(to session: String?, _ text: String) async {
         let isReply = threads.thread(for: session).contains { $0.role == .session }
-        let sent = await deliver(to: session, text: text, shown: text, imagePath: nil, files: [], attachments: [])
-        if sent, isReply { tickGuide { $0.replied = true } }
+        let sent = await deliver(to: session, text: text, shown: text, imagePaths: [], files: [], attachments: [])
+        if sent.delivered, isReply { tickGuide { $0.replied = true } }
     }
 
-    /// Sends a typed question or reply to the target and waits for its answer.
-    /// Sends a message that was not delivered once more, in place of the failed one.
+    /// Sends a message that was not delivered once more, in place of the failed one: the same text, and when its
+    /// captures were kept, the same captures in the same order and the same files. Captures that are gone are never
+    /// referred to: the typed words go alone with a note saying so, and with no words nothing is sent.
     public func retry(_ id: UUID) async {
         guard let session = targetId, let entry = threads.thread(for: session).first(where: { $0.id == id }),
-              entry.canRetry, preflight() else { return }
+              canRetry(entry), preflight() else { return }
+        guard let index = kept.firstIndex(where: { $0.entry == id }) else {
+            threads.remove(entry: id, in: session)
+            await deliverTyped(to: session, entry.text)
+            return
+        }
+        let message = kept.remove(at: index).message
+        keptEntries.remove(id)
+        let present = message.captures.filter(store.exists)
+        if present.count == message.captures.count {
+            threads.remove(entry: id, in: session)
+            await sendCaptures(message.captures, files: message.files, note: message.note)
+            return
+        }
+        present.forEach(store.remove)
+        guard let note = message.note else {
+            // Nothing typed: there is nothing left to send. Said where the message is, and Retry is gone.
+            threads.setDelivery(.refused(Design.Copy.Captures.goneNothingSent), entry: id, in: session)
+            status.handle(.failed(.captureMissing(detail: nil)))
+            return
+        }
         threads.remove(entry: id, in: session)
-        await deliverTyped(to: session, entry.text)
+        let files = message.files.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let outcome = await deliver(to: session, text: note, shown: note, imagePaths: [], files: files,
+                                    attachments: files.map(\.lastPathComponent))
+        if let sent = outcome.entry {
+            threads.insert(ThreadEntry(role: .session, text: Design.Copy.Captures.goneSentWords), after: sent, in: session)
+        }
     }
 
     public func sendMessage(_ text: String) async {
@@ -1109,6 +1252,37 @@ public final class CompanionModel {
     /// Files dropped on the companion. They wait in the note window like an active-window capture:
     /// type to add a question, or they are sent on their own. The files are never moved or deleted.
     public func dropFiles(_ urls: [URL]) async {
+        await holdFiles(urls, countsDown: true)
+    }
+
+    /// Command-V in the composer with files on the clipboard: they join what waits, or wait with what is typed so
+    /// far until Return sends them. Never moved or deleted.
+    public func pasteFiles(_ urls: [URL]) async {
+        await holdFiles(urls, countsDown: false)
+    }
+
+    /// Command-V in the composer with an image on the clipboard, already written to a file in the capture store
+    /// (`newCaptureFile`): it is a capture like any other from here, deleted once sent or discarded. It joins what
+    /// waits, or waits with what is typed so far until Return sends it.
+    public func pasteImage(at url: URL) async {
+        if heldDecision != nil {
+            if !heldCaptures.add(url) { store.remove(url) }
+            isExpanded = true
+            return
+        }
+        // A note written for a region capture (the note shortcut) keeps its turn.
+        guard !isEditingNote, preflight() else { store.remove(url); return }
+        status.handle(.captureBegan)
+        if case let .send(note) = await hold(captures: [url], files: [], countsDown: false) { await sendResolved(note: note) }
+    }
+
+    /// Where a pasted image is written before `pasteImage(at:)`: the capture store, so it is cleaned up like a capture.
+    public func newCaptureFile() throws -> URL {
+        try store.prepare()
+        return store.newFileURL()
+    }
+
+    private func holdFiles(_ urls: [URL], countsDown: Bool) async {
         let files = urls.filter { url in
             var isDirectory: ObjCBool = false
             return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
@@ -1117,27 +1291,18 @@ public final class CompanionModel {
             if !urls.isEmpty { status.handle(.failed(.delivery(CompanionConstants.Messages.foldersNotSent))) }
             return
         }
-        if !heldFiles.isEmpty {
-            // More files while some are waiting: add them and start the wait again.
+        if heldDecision != nil {
+            // More files while something is waiting: add them and start the wait again.
             heldFiles += files.filter { !heldFiles.contains($0) }
-            if noteCountdown != nil {
-                noteCountdown = NoteCountdown()
-                startCountdown()
-            }
+            if noteCountdown != nil { restartCountdown() }
+            isExpanded = true
             return
         }
         // One thing at a time: a capture or a note already in progress keeps its turn.
         if isEditingNote { isExpanded = true; return }
         guard preflight() else { return }
         status.handle(.captureBegan)
-        switch await hold(capture: nil, files: files) {
-        case let .send(note):
-            let sent = resolvedFiles
-            await deliver(to: targetId, text: note ?? CompanionConstants.Messages.defaultFilesText, shown: note ?? "", imagePath: nil,
-                          files: sent, attachments: sent.map(\.lastPathComponent))
-        case .discard:
-            break
-        }
+        if case let .send(note) = await hold(captures: [], files: files, countsDown: countsDown) { await sendResolved(note: note) }
     }
 
     /// What rides along with the next message to a session: the full note the first time and every so
@@ -1149,15 +1314,22 @@ public final class CompanionModel {
             ? CompanionConstants.Messages.replyStyleNote : CompanionConstants.Messages.replyStyleTag
     }
 
+    /// What became of one send: whether it was delivered (a late reply counts), the thread entry it made, and why
+    /// it failed.
+    struct DeliveryOutcome {
+        var delivered: Bool
+        var entry: UUID?
+        var error: CompanionError?
+    }
+
     /// One send to the target: recorded in the thread, delivered off the main thread, reply awaited.
     /// `shown` is what the thread displays, which is empty when only the default message went along.
-    /// Returns whether the message was delivered.
     @discardableResult
-    private func deliver(to session: String?, text: String, shown: String, imagePath: String?, files: [URL],
-                         attachments: [String]) async -> Bool {
+    private func deliver(to session: String?, text: String, shown: String, imagePaths: [String], files: [URL],
+                         attachments: [String]) async -> DeliveryOutcome {
         // The session this message is for was fixed by the caller: the user may switch to another one
         // while it travels, or even before this runs.
-        guard let targetId = session else { status.handle(.failed(.noTarget)); return false }
+        guard let targetId = session else { status.handle(.failed(.noTarget)); return DeliveryOutcome(delivered: false, error: .noTarget) }
         // From here on an error is about this session.
         errorSessionId = nil
         status.handle(.sendBegan)
@@ -1174,7 +1346,7 @@ public final class CompanionModel {
             activeSends.remove(targetId)
             inFlight[targetId, default: 1] -= 1
         }
-        let request = SendRequest(session: targetId, imagePath: imagePath, text: text, wait: true, filePaths: files.map(\.path),
+        let request = SendRequest(session: targetId, imagePaths: imagePaths, text: text, wait: true, filePaths: files.map(\.path),
                                   styleNote: shortReplies ? nextStyleNote(for: targetId) : nil)
         let engine = self.engine
         var result = await Task.detached { engine.send(request) }.value
@@ -1194,19 +1366,24 @@ public final class CompanionModel {
         }
         if result.ok {
             threads.setDelivery(.delivered, entry: entry, in: targetId)
+            // Said before its answer, which may be in already.
+            if result.startedOver {
+                threads.insert(ThreadEntry(role: .session, text: Design.Copy.Chat.startedOver), after: entry, in: targetId)
+            }
             if let reply = result.reply { threads.appendReply(reply, to: targetId) }
         } else {
             // A reply that is merely late still means the message arrived.
             let error = CompanionError.from(result)
-            let failed: ThreadEntry.Delivery = error.canRetry ? .failed(error.title) : .refused(error.title)
+            let failed: ThreadEntry.Delivery = error.canRetry ? .failed(error.threadNote) : .refused(error.threadNote)
             threads.setDelivery(error == .replyTimeout ? .delivered : failed, entry: entry, in: targetId)
         }
         sessions = engine.sessions()
         // The user moved to another session meanwhile: its thread has the outcome, and it is marked.
         let delivered = result.ok || CompanionError.from(result) == .replyTimeout
+        let outcome = DeliveryOutcome(delivered: delivered, entry: entry, error: result.ok ? nil : CompanionError.from(result))
         guard targetId == self.targetId else {
             unreadSessions.insert(targetId)
-            return delivered
+            return outcome
         }
         if result.ok {
             if let reply = result.reply {
@@ -1221,6 +1398,6 @@ public final class CompanionModel {
         }
         // Another message to this session is still on its way.
         if (inFlight[targetId] ?? 0) > 1, !status.activity.isBusy, currentError == nil { status.activity = .sending }
-        return delivered
+        return outcome
     }
 }
