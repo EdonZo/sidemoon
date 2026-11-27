@@ -118,7 +118,8 @@ public final class Engine: @unchecked Sendable {
         case Constants.Ops.hook:
             guard let payload = msg["payload"] as? String else { return }
             let pid = (msg["pid"] as? NSNumber)?.int32Value
-            if let e = HookEvent(json: Data(payload.utf8), claudePid: pid) {
+            // The `claude agents` screen runs hooks too, but there is nothing in it to send to.
+            if let e = HookEvent(json: Data(payload.utf8), claudePid: pid), !AgentsScreen.isAgentsScreen(pid: e.claudePid) {
                 registry.apply(e)
                 syncChannels()
             }

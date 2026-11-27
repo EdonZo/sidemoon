@@ -22,6 +22,8 @@ struct BubbleActions {
     var openInTerminal: (String) -> Void = { _ in }
     /// Opens Setup and turns on "Connect every claude".
     var connectEveryClaude: () -> Void = {}
+    /// Moves the window by its header: called as the drag goes, then once with `ended` true.
+    var dragWindow: (_ ended: Bool) -> Void = { _ in }
 }
 
 /// Collects the file URLs of a drop as their providers deliver them.
@@ -71,7 +73,7 @@ struct BubbleView: View {
                 header
                 hairline
                 if let error = model.currentError { errorRow(error); hairline }
-                else if model.needsConnection {
+                else if model.needsConnection, model.target?.kind != .chat {
                     setupRow(Design.Copy.notConnectedTitle, Design.Copy.notConnectedAdvice); hairline
                 } else if model.setupPending {
                     setupRow(Design.Copy.setupPendingTitle, Design.Copy.setupPendingAdvice); hairline
@@ -219,7 +221,13 @@ struct BubbleView: View {
             } else {
                 stateText
             }
-            Spacer(minLength: Design.Space.xs)
+            // The empty part of the header moves the window, like a title bar.
+            Color.clear
+                .frame(minWidth: Design.Space.xs, maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: Design.Bubble.headerDragThreshold, coordinateSpace: .global)
+                    .onChanged { _ in actions.dragWindow(false) }
+                    .onEnded { _ in actions.dragWindow(true) })
             let capturing = model.status.activity == .capturing || model.status.activity == .holding
             // Starting a session is one click from anywhere, not only from the session list.
             iconButton("plus", help: Design.Copy.NewSession.plusHelp, disabled: false) { model.openNewSession() }
@@ -358,6 +366,9 @@ struct BubbleView: View {
                     .alignmentGuide(.firstTextBaseline) { $0[.bottom] + Design.Space.xxs }
                 VStack(alignment: .leading, spacing: Design.Space.s) {
                     VStack(alignment: .leading, spacing: Design.Space.xxs) {
+                        if let about = model.errorSessionTitle {
+                            ReadoutText(about, color: .problem)
+                        }
                         Text(error.title)
                             .font(.text(Design.TypeScale.body, weight: .semibold))
                             .foregroundStyle(Color.ink)

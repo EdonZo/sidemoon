@@ -129,7 +129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 showSetup()
                 setupWindow?.setup.setConnectsEveryClaude(true)
                 syncConnection()
-            }))
+            },
+            dragWindow: { [unowned self] ended in panels.dragByHeader(ended: ended) }))
 
         // A copy outside Applications never registers itself to open at login: the setting would point at it.
         model.loginItem = location.maySetUp ? SystemLoginItem() : nil

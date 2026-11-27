@@ -182,6 +182,8 @@ public enum Design {
 
     /// Bubble structure.
     public enum Bubble {
+        /// The header's empty space moves the window; this little move first tells a drag from a click.
+        public static let headerDragThreshold: CGFloat = 3
         /// The dashed outline of a message that was cancelled and never sent.
         public static let cancelledDash: [CGFloat] = [4, 3]
         public static let cancelledOutline: CGFloat = 1.2
@@ -393,7 +395,8 @@ public enum Design {
         public static let notConnectedTitle = "Not connected to Claude Code yet"
         public static let setupPendingTitle = "Setup is not finished"
         public static let setupPendingAdvice = "Screen capture is not allowed yet, so screenshots cannot be sent. Open Setup to finish."
-        public static let notConnectedAdvice = "You can send to a session, but its answers will not come back here until you connect."
+        public static let notConnectedAdvice = "You can send to this session, but its answers will not come back here until you "
+            + "connect. The General chat works without connecting."
         public static let menuRetryEngine = "Retry Engine"
         public static var menuQuit: String { "Quit \(CompanionConstants.App.name)" }
         public static func menuHotKeyTaken(_ key: String) -> String { "\(key) is taken by another app" }
@@ -495,8 +498,9 @@ public enum Design {
                 let why: String
                 switch blocker {
                 case .homeFolder:
-                    why = "It was started in your home folder, and Claude Code only opens a session there from a terminal. "
-                        + "Open it in Terminal with the button below and carry on there."
+                    why = "It was started in your home folder, and Claude Code won't let Sidemoon pick up a session from there. "
+                        + "To keep going: 1. Click Open in Terminal below. 2. Carry on in that Terminal window. "
+                        + "For new work, click + at the top to start a session Sidemoon can reach."
                 case .untrustedFolder:
                     why = "Claude Code has not been told it may work in this session's folder. Reopen the session in a terminal "
                         + "with the button below and answer yes when it asks, then try again."
@@ -638,8 +642,9 @@ public enum Design {
 
             public static let connectTitle = "Connect to Claude Code"
             public static func connectExplain(_ file: String) -> String {
-                "Connect adds a few lines to \(file), so Claude Code tells Sidemoon when a session starts, answers or ends. "
-                    + "A backup copy of that file is saved next to it first. Nothing else in it changes."
+                "The General chat works without this. Connect is for your own Claude Code sessions: it adds a few lines to "
+                    + "\(file), so Claude Code tells Sidemoon when a session starts, answers or ends, and their answers show up "
+                    + "here. A backup copy of that file is saved next to it first. Nothing else in it changes."
             }
             public static func connected(_ file: String) -> String {
                 "Connected through \(file). Disconnect removes only Sidemoon's lines, after another backup."

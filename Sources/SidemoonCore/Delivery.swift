@@ -305,7 +305,8 @@ enum ImageFile {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         if !fm.fileExists(atPath: dir, isDirectory: &isDir) {
-            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: false,
+            // macOS empties the temp folder at restart, taking the session's folder with it: make the path again.
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
                                     attributes: [.posixPermissions: Constants.Permissions.directory])
         }
         guard let real = realpath(dir, nil) else { throw DeliveryError.image("scratchpad does not exist: \(dir)") }
@@ -326,6 +327,8 @@ enum ImageFile {
     /// inferred from observed payloads, so it is only used when that session directory already exists.
     static func scratchpad(for s: Session) -> String? {
         if let known = s.scratchpadDir { return known }
+        // Seen before Sidemoon or the Mac restarted.
+        if let remembered = ScratchpadMemory.recall(s.id) { return remembered }
         let fm = FileManager.default
         for prefix in Constants.Paths.scratchpadRootPrefixes {
             let root = prefix + String(getuid())

@@ -587,6 +587,12 @@ public final class CompanionModel {
     /// The model the target answers with, for the header; nil when not known yet.
     public var targetModel: String? { target.flatMap { SessionList.modelLabel($0, chatModel: chatModel) } }
     public var indicator: Indicator { status.indicator }
+    /// The session an error is about, when that is not the one in the header (one picked from the list that
+    /// cannot be reached); nil when the error is about the header's session.
+    public var errorSessionTitle: String? {
+        guard currentError != nil, let id = errorSessionId, id != targetId else { return nil }
+        return sessions.first { $0.id == id }.map(SessionList.displayName) ?? SessionID.short(id)
+    }
     public var currentError: CompanionError? {
         if case let .failed(e) = status.activity { return e }
         return nil

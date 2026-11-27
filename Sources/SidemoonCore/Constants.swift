@@ -61,6 +61,9 @@ public enum Constants {
         /// The chats and the Claude Code conversations they continue (`ChatBook`).
         public static let chatsName = "chats.json"
         public static var chatsPath: String { supportDirectory.appendingPathComponent(chatsName).path }
+        /// Each session's scratchpad, remembered across restarts (`ScratchpadMemory`).
+        public static let scratchpadsName = "scratchpads.json"
+        public static var scratchpadsPath: String { supportDirectory.appendingPathComponent(scratchpadsName).path }
 
         /// Default Claude Code user settings file (the installer only touches it when asked).
         public static var defaultClaudeSettings: String {
@@ -130,6 +133,8 @@ public enum Constants {
         public static let maxFileBytes = 50 << 20
         /// Characters of a random id put in front of a copied file's name to keep copies apart.
         public static let fileIdLength = 8
+        /// How many sessions' scratchpads are remembered; the oldest are forgotten first.
+        public static let rememberedScratchpads = 200
         public static let maxTranscriptTailBytes = 4 << 20
         /// Read first when only the last record matters; the full tail is the fallback.
         public static let turnProbeTailBytes = 256 << 10
@@ -203,7 +208,13 @@ public enum Constants {
     // MARK: Claude Code CLI
 
     public enum ClaudeCLI {
-        public static let agentsArgs = ["agents", "--json", "--all"]
+        /// The subcommand of Claude Code's agents screen, which runs hooks but is not a session.
+        public static let agentsSubcommand = "agents"
+        /// A one-off answer: what follows is a prompt, never a subcommand.
+        public static let printFlags = ["-p", "--print"]
+        /// Claude Code started as a script by a runtime: the script's path comes before the subcommand.
+        public static let scriptExtensions = [".js", ".mjs", ".cjs"]
+        public static let agentsArgs = [agentsSubcommand, "--json", "--all"]
         /// `status` and `state` values in the agents listing.
         public static let busyStatus = "busy"
         public static let workingState = "working"
