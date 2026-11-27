@@ -251,8 +251,12 @@ private func refused(_ blocker: ResumeBlocker, saved: Bool = false) -> @Sendable
         #expect(m.targetId == first)
         #expect(m.currentError == .cannotReach(.homeFolder, messageSaved: false, detail: nil))
         #expect(!m.isPickingSession)
+        // The header still shows the first session, so the error says which session it is about.
+        #expect(m.errorSessionTitle == m.sessions.first { $0.id == second }.map(SessionList.displayName))
+        #expect(m.errorSessionTitle != nil)
         // A reachable one is chosen as before.
         m.dismissError()
+        #expect(m.errorSessionTitle == nil)
         m.pickSession(first)
         #expect(m.currentError == nil)
     }

@@ -347,6 +347,25 @@ final class PanelController {
         return EdgeSnap.defaultFrame(size: size, visible: main, margin: margin)
     }
 
+    /// Where a drag by the bubble's header started: the pointer and the mascot, which the bubble follows.
+    private var headerDragStart: (pointer: CGPoint, mascot: CGPoint)?
+
+    /// Dragging the bubble's header moves the companion, mascot and bubble together, and snaps it to the edge
+    /// when let go, as dragging the mascot does.
+    func dragByHeader(ended: Bool) {
+        let pointer = NSEvent.mouseLocation
+        if ended {
+            if headerDragStart != nil { snapMascot() }
+            headerDragStart = nil
+            return
+        }
+        guard let start = headerDragStart else {
+            headerDragStart = (pointer, mascot.frame.origin)
+            return
+        }
+        dragMascot(to: CGPoint(x: start.mascot.x + pointer.x - start.pointer.x, y: start.mascot.y + pointer.y - start.pointer.y))
+    }
+
     private func dragMascot(to origin: CGPoint) {
         mascot.setFrameOrigin(origin)
         if bubble.isVisible { placeBubble() }

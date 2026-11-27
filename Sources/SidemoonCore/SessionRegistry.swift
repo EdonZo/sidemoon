@@ -199,6 +199,7 @@ public final class SessionRegistry: @unchecked Sendable {
             s.cwd = e.cwd ?? s.cwd
             s.transcriptPath = e.transcriptPath ?? s.transcriptPath
             s.scratchpadDir = e.scratchpadDir ?? s.scratchpadDir
+            if let dir = e.scratchpadDir { ScratchpadMemory.remember(e.sessionId, scratchpad: dir) }
             s.lastEventName = e.eventName
             s.lastEventAt = e.receivedAt
             // The session ran somewhere just now, so what a refused resume taught no longer holds. The home
